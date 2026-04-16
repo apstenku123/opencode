@@ -250,6 +250,20 @@ export const Info = z
       .object({
         auto: z.boolean().optional().describe("Enable automatic compaction when context is full (default: true)"),
         prune: z.boolean().optional().describe("Enable pruning of old tool outputs (default: true)"),
+        tail_turns: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Number of recent user turns, including their following assistant/tool responses, to keep verbatim during compaction (default: 2)",
+          ),
+        tail_tokens: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Token budget for retained recent turn spans during compaction"),
         reserved: z
           .number()
           .int()
