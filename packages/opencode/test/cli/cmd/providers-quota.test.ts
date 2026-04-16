@@ -1,10 +1,12 @@
-// @ts-nocheck
-// SKIPPED: depends on port/copilot-plan providers.ts exports not yet ported.
-// Revisit after unify branch aligns providers CLI (accountStatus, jsonMigration,
-// ProvidersAccountsCommand, ProvidersRouteDebugCommand, copilotAlias*, proxy*, etc.).
+// TODO(unify): re-enable once the circular import in src/session/llm.ts is resolved.
+// Providers CLI exports are restored, but importing `@/cli/cmd/providers` transitively
+// pulls in session/llm.ts which hits `ReferenceError: Cannot access 'OUTPUT_TOKEN_MAX'
+// before initialization` (TDZ cycle between session/llm.ts and @/provider →
+// ProviderTransform). Unrelated to the providers.ts CLI restore landed on unify.
 import * as prompts from "@clack/prompts"
-import { afterEach, describe as _describe, expect, spyOn, test } from "bun:test"
-const describe = _describe.skip
+import { afterEach, describe as _describe, expect, spyOn, test as _test } from "bun:test"
+const describe: typeof _describe = _describe.skip as any
+const test: typeof _test = _test.skip as any
 import {
   accountStatus,
   ACCOUNT_STATUS_SCHEMA_VERSION,
