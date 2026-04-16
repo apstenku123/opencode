@@ -11,7 +11,9 @@ import { classifyPlan, fetchQuota } from "./quota"
 import { MessageV2 } from "@/session/message-v2"
 import { Auth } from "@/auth"
 import { Config } from "@/config"
-import { AppRuntime } from "@/effect/app-runtime"
+// NOTE: AppRuntime is lazy-loaded inside CopilotAuthPlugin to avoid a
+// module-init cycle (message-v2 → @/provider → plugin/index → this file →
+// app-runtime → prompt.ts, which then reads MessageV2.* before it's populated).
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { list, migrate, outcome as migrationOutcome, summarizeMigration, type CopilotAuth } from "./auth"
 import {
@@ -666,6 +668,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   const sdk = input.client
   await Effect.runPromise(migrate().pipe(Effect.provide(Auth.defaultLayer), Effect.provide(AppFileSystem.defaultLayer))).catch(() => [])
   const premium = new Map<string, Set<string>>()
+  const { AppRuntime } = await import("@/effect/app-runtime")
   const cfg = copilotRuntimeConfig(
     await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.get())).catch(() => undefined),
   )

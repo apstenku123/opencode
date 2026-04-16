@@ -27,7 +27,6 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 
 export namespace LLM {
   const log = Log.create({ service: "llm" })
-  export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
   type Result = Awaited<ReturnType<typeof streamText>>
 
   export type StreamInput = {

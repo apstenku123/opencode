@@ -1,10 +1,4 @@
-// TODO(unify): re-enable once the circular import in src/session/llm.ts is resolved.
-// The Session.Interface autobest methods land, but loading session.ts → llm.ts hits
-// `ReferenceError: Cannot access 'OUTPUT_TOKEN_MAX' before initialization` (TDZ cycle
-// between session/llm.ts and @/provider → ProviderTransform). Same failure hits
-// test/session/autobest-history.test.ts today, so not specific to this file.
-import { describe as _describe, expect, test } from "bun:test"
-const describe: typeof _describe = _describe.skip as any
+import { describe, expect, test } from "bun:test"
 import path from "path"
 import { Session as SessionNs } from "../../src/session"
 import { last, read, readByType } from "../../src/history"
