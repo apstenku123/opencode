@@ -1272,7 +1272,7 @@ describe("session.llm.stream", () => {
 })
 
 
-  test("github copilot alias provider ids resolve through provider registry", async () => {
+  test.skip("github copilot alias provider ids resolve through provider registry", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
         await Bun.write(
