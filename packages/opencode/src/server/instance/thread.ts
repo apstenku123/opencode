@@ -100,8 +100,7 @@ export const ThreadRoutes = () =>
       async (c) => {
         const param = c.req.valid("param")
         const body = c.req.valid("json")
-        // TODO(unify): svc.setAutobestEnabled is a pending port from copilot-plan branch
-        return c.json({ enabled: await AppRuntime.runPromise(Session.Service.use((svc: any) => svc.setAutobestEnabled({ sessionID: param.threadID, enabled: body.enabled, ts: body.ts }))) })
+        return c.json({ enabled: await AppRuntime.runPromise(Session.Service.use((svc) => svc.setAutobestEnabled({ sessionID: param.threadID, enabled: body.enabled, ts: body.ts }))) })
       },
     )
     .post(
@@ -117,8 +116,7 @@ export const ThreadRoutes = () =>
       async (c) => {
         const param = c.req.valid("param")
         const body = c.req.valid("json")
-        // TODO(unify): svc.applyAutobest is a pending port from copilot-plan branch
-        const out: any = await AppRuntime.runPromise(Session.Service.use((svc: any) => svc.applyAutobest({ sessionID: param.threadID, candidates: body.candidates, ts: body.ts })))
+        const out = await AppRuntime.runPromise(Session.Service.use((svc) => svc.applyAutobest({ sessionID: param.threadID, candidates: body.candidates, ts: body.ts })))
         return c.json({ active: out.decision.active ?? null, changed: out.decision.changed, selected: out.decision.selected ?? null, candidates: out.decision.candidates })
       },
     )

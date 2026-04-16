@@ -29,11 +29,9 @@ export namespace SessionAutobestObserver {
       const session = yield* Session.Service
       const off = yield* bus.subscribeCallback(SessionStatus.Event.Idle, (evt) => {
         void Effect.runPromise(
-          // @ts-expect-error TODO(unify): Effect R channel drift pending Session.Interface autobest port
           Effect.gen(function* () {
             const sessionID = evt.properties.sessionID
-            // TODO(unify): pending Session.Interface autobest port
-            const enabled = yield* (session as any).getAutobestEnabled(sessionID)
+            const enabled = yield* session.getAutobestEnabled(sessionID)
             if (!enabled) return
             const msg = yield* session.findMessage(sessionID, (item) => item.info.role === "assistant")
             if (Option.isNone(msg)) return
@@ -45,8 +43,7 @@ export namespace SessionAutobestObserver {
             if (!text) return
             const picks = extract(text)
             if (!picks.length) return
-            // TODO(unify): pending Session.Interface autobest port
-            yield* (session as any).applyAutobest({ sessionID, candidates: picks, ts: Date.now() })
+            yield* session.applyAutobest({ sessionID, candidates: picks, ts: Date.now() })
           }),
         )
       })
