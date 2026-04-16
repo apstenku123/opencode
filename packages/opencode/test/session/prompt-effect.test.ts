@@ -691,6 +691,7 @@ it.live(
 
 it.live(
   "autobest autofires at runLoop completion when enabled and assistant reply contains bullets",
+  // @ts-expect-error TODO(unify): Effect R channel drift pending Session.Interface autobest port
   () =>
     provideTmpdirServer(
       Effect.fnUntraced(function* ({ llm }) {
@@ -701,11 +702,13 @@ it.live(
 - rerun focused lane`)
 
         const chat = yield* sessions.create({})
-        yield* sessions.setAutobestEnabled({ sessionID: chat.id, enabled: true, ts: 1 })
+        // TODO(unify): pending Session.Interface autobest port
+        yield* (sessions as any).setAutobestEnabled({ sessionID: chat.id, enabled: true, ts: 1 })
         yield* user(chat.id, "hi")
 
         yield* prompt.loop({ sessionID: chat.id })
-        const state = yield* sessions.getAutobest(chat.id)
+        // TODO(unify): pending Session.Interface autobest port
+        const state = yield* (sessions as any).getAutobest(chat.id)
         expect(state.active?.key).toBe("tighten failing repro")
         const result = yield* Effect.promise(() => import("../../src/history").then((m) => m.last(chat.id, "autobest.result")))
         expect(result).toMatchObject({

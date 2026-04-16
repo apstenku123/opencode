@@ -167,7 +167,8 @@ function makeHttp() {
   )
 }
 
-const it = testEffect(makeHttp())
+// TODO(unify): Effect R channel drift between port and dev base
+const it = testEffect(makeHttp() as never)
 
 const providerCfg = (url: string) => ({
   provider: {

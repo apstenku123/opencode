@@ -1,7 +1,7 @@
 import { Context, Effect, Layer } from "effect"
 
 import { Instance } from "../project/instance"
-import { Config } from "../config/config"
+import { Config } from "../config"
 
 import PROMPT_ANTHROPIC from "./prompt/anthropic.txt"
 import PROMPT_DEFAULT from "./prompt/default.txt"
@@ -90,7 +90,8 @@ export namespace SystemPrompt {
             if (Permission.disabled(["skill"], agent.permission).has("skill")) return
             const conf = yield* cfg.get()
             const list = yield* skill.available(agent)
-            const picks = conf.autoskill === false ? [] : recommend({ text: input, list }).slice(0, 3)
+            // TODO(unify): autoskill Config.Info field pending port
+            const picks = (conf as any).autoskill === false ? [] : recommend({ text: input, list }).slice(0, 3)
             return [
               "Skills provide specialized instructions and workflows for specific tasks.",
               "Use the skill tool to load a skill when a task matches its description.",

@@ -28,7 +28,12 @@ const layer = Effect.provideService(
       return def
     }),
     Truncate.Service,
-    { output: (text: string) => Effect.succeed({ content: text, truncated: false as const }), cleanup: () => Effect.void },
+    {
+      // TODO(unify): Truncate.Interface gained `write` member on dev baseline
+      output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
+      cleanup: () => Effect.void,
+      write: (text: string) => Effect.succeed(text),
+    },
   ),
   Agent.Service,
   { get: () => Effect.succeed({ id: "agent_test" } as never), list: () => Effect.succeed([]), defaultAgent: () => Effect.succeed("agent_test"), generate: () => Effect.succeed({ identifier: "timer", whenToUse: "", systemPrompt: "" }) },
