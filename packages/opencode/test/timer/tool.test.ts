@@ -29,7 +29,6 @@ const layer = Effect.provideService(
     }),
     Truncate.Service,
     {
-      // TODO(unify): Truncate.Interface gained `write` member on dev baseline
       output: (text: string) => Effect.succeed({ content: text, truncated: false as const }),
       cleanup: () => Effect.void,
       write: (text: string) => Effect.succeed(text),

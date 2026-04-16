@@ -123,6 +123,10 @@ export const Info = z
       .boolean()
       .optional()
       .describe("@deprecated Use 'share' field instead. Share newly created sessions automatically"),
+    autoskill: z
+      .boolean()
+      .optional()
+      .describe("Enable automatic skill suggestions based on user prompt content. Defaults to true."),
     autoupdate: z
       .union([z.boolean(), z.literal("notify")])
       .optional()

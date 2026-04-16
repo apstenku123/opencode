@@ -98,9 +98,7 @@ export const AppLayer = Layer.mergeAll(
   SessionShare.defaultLayer,
 ).pipe(Layer.provideMerge(Observability.layer))
 
-// TODO(unify): one of the default layers surfaces `any` in its R channel due
-// to port/dev baseline drift; cast narrows it to the expected `never`.
-const rt = ManagedRuntime.make(AppLayer as typeof AppLayer extends Layer.Layer<infer A, infer E, any> ? Layer.Layer<A, E, never> : never, { memoMap })
+const rt = ManagedRuntime.make(AppLayer, { memoMap })
 type Runtime = Pick<typeof rt, "runSync" | "runPromise" | "runPromiseExit" | "runFork" | "runCallback" | "dispose">
 const wrap = (effect: Parameters<typeof rt.runSync>[0]) => attach(effect as never) as never
 
