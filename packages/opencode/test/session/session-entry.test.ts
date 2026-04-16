@@ -285,6 +285,28 @@ describe("session-entry step", () => {
       )
     })
 
+
+    test("records plan items as standalone entries", () => {
+      const next = SessionEntry.step(
+        { entries: [], pending: [] },
+        SessionEvent.Plan.create({
+          timestamp: time(1),
+          items: [
+            { step: "wire compat router", status: "completed" },
+            { step: "add request surfaces", status: "in_progress" },
+          ],
+        }),
+      )
+
+      expect(next.entries).toHaveLength(1)
+      expect(next.entries[0]?.type).toBe("plan")
+      if (next.entries[0]?.type !== "plan") return
+      expect(next.entries[0].items).toEqual([
+        { step: "wire compat router", status: "completed" },
+        { step: "add request surfaces", status: "in_progress" },
+      ])
+    })
+
     test("step.ended copies completion fields onto the pending assistant", () => {
       FastCheck.assert(
         FastCheck.property(FastCheck.integer({ min: 1, max: 1000 }), (n) => {

@@ -399,6 +399,27 @@ export namespace SessionEvent {
     }
   }
 
+  export class Plan extends Schema.Class<Plan>("Session.Event.Plan")({
+    ...Base,
+    type: Schema.Literal("plan"),
+    items: Schema.Array(
+      Schema.Struct({
+        step: Schema.String,
+        status: Schema.Union([Schema.Literal("pending"), Schema.Literal("in_progress"), Schema.Literal("completed")]),
+      }),
+    ),
+  }) {
+    static create(input: BaseInput & { items: { step: string; status: "pending" | "in_progress" | "completed" }[] }) {
+      return new Plan({
+        id: input.id ?? ID.create(),
+        type: "plan",
+        timestamp: input.timestamp ?? DateTime.makeUnsafe(Date.now()),
+        metadata: input.metadata,
+        items: input.items,
+      })
+    }
+  }
+
   export class Compacted extends Schema.Class<Compacted>("Session.Event.Compated")({
     ...Base,
     type: Schema.Literal("compacted"),
@@ -413,6 +434,51 @@ export namespace SessionEvent {
         metadata: input.metadata,
         auto: input.auto,
         overflow: input.overflow,
+      })
+    }
+  }
+
+
+  export class Autobest extends Schema.Class<Autobest>("Session.Event.Autobest")({
+    ...Base,
+    type: Schema.Literal("autobest"),
+    active: Schema.Struct({
+      key: Schema.String,
+      score: Schema.Number.pipe(Schema.optional),
+      source: Schema.String,
+      ts: Schema.Number,
+    }).pipe(Schema.optional),
+    selected: Schema.Struct({
+      key: Schema.String,
+      score: Schema.Number,
+      reason: Schema.Array(Schema.String).pipe(Schema.optional),
+    }).pipe(Schema.optional),
+    changed: Schema.Boolean,
+    candidates: Schema.Array(
+      Schema.Struct({
+        key: Schema.String,
+        score: Schema.Number,
+        reason: Schema.Array(Schema.String).pipe(Schema.optional),
+      }),
+    ),
+  }) {
+    static create(
+      input: BaseInput & {
+        active?: { key: string; score?: number; source: string; ts: number }
+        selected?: { key: string; score: number; reason?: string[] }
+        changed: boolean
+        candidates: { key: string; score: number; reason?: string[] }[]
+      },
+    ) {
+      return new Autobest({
+        id: input.id ?? ID.create(),
+        type: "autobest",
+        timestamp: input.timestamp ?? DateTime.makeUnsafe(Date.now()),
+        metadata: input.metadata,
+        active: input.active,
+        selected: input.selected,
+        changed: input.changed,
+        candidates: input.candidates,
       })
     }
   }
@@ -436,7 +502,9 @@ export namespace SessionEvent {
       Reasoning.Delta,
       Reasoning.Ended,
       Retried,
+      Plan,
       Compacted,
+      Autobest,
     ],
     {
       mode: "oneOf",

@@ -351,6 +351,30 @@ export const TuiRoutes = lazy(() =>
       },
     )
     .post(
+      "/timer-fired",
+      describeRoute({
+        summary: "Publish timer fired event",
+        description: "Publish a timer-fired event into the TUI bus.",
+        operationId: "tui.timerFired",
+        responses: {
+          200: {
+            description: "Timer-fired event published successfully",
+            content: {
+              "application/json": {
+                schema: resolver(z.boolean()),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator("json", TuiEvent.TimerFired.properties),
+      async (c) => {
+        await Bus.publish(TuiEvent.TimerFired, c.req.valid("json"))
+        return c.json(true)
+      },
+    )
+    .post(
       "/select-session",
       describeRoute({
         summary: "Select session",

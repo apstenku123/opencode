@@ -1,148 +1,775 @@
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+import type { Model } from "@opencode-ai/sdk/v2"
 import { Installation } from "@/installation"
-import { Auth } from "@/auth"
 import { iife } from "@/util/iife"
+import { Log } from "../../util/log"
 import { setTimeout as sleep } from "node:timers/promises"
-import { getCopilotSessionId, getCopilotMachineId } from "../copilot-ids"
-import { CopilotConnectionManager, type ResolvedConnection } from "../copilot-connections"
+import { Effect } from "effect"
+import { CopilotModels } from "./models"
+import { cooldown, eligible, feed, load, owner, reserve, reserveBatch, touch, usage, type Event, type Runtime } from "./runtime"
+import { classifyPlan, fetchQuota } from "./quota"
+import { MessageV2 } from "@/session/message-v2"
+import { Auth } from "@/auth"
+import { Config } from "@/config/config"
+import { AppFileSystem } from "@opencode-ai/shared/filesystem"
+import { list, migrate, outcome as migrationOutcome, summarizeMigration, type CopilotAuth } from "./auth"
+import {
+  Store,
+  byPlan,
+  clear,
+  discover,
+  empty,
+  hasModel,
+  rotate,
+  routed,
+  machine,
+  mark,
+  next,
+  proxy,
+  staleDiscovery,
+  upsert,
+  type State,
+} from "./connections"
 
-const CLIENT_ID = "Ov23ctDVkRmgkPke0Mmm"
+const log = Log.create({ service: "plugin.copilot" })
+
+async function readState() {
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const fs = yield* AppFileSystem.Service
+      return yield* new Store(fs).read()
+    }).pipe(Effect.provide(AppFileSystem.defaultLayer)),
+  ).catch(() => empty())
+}
+
+async function writeState(state: State) {
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const fs = yield* AppFileSystem.Service
+      yield* new Store(fs).write(state)
+    }).pipe(Effect.provide(AppFileSystem.defaultLayer)),
+  ).catch(() => undefined)
+}
+
+async function allAuths() {
+  return Effect.runPromise(Auth.Service.use((auth) => auth.all()).pipe(Effect.provide(Auth.defaultLayer))).then(list).catch(() => [])
+}
+
+export const CopilotRuntimeState = {
+  migration() {
+    return migrationOutcome.last
+  },
+  migrationSummary() {
+    return summarizeMigration(migrationOutcome.last)
+  },
+  current: undefined as Runtime | undefined,
+  info: {} as Record<string, { lane?: string; discovery: number; penalty: number; cooldown: boolean; selected?: boolean; selectedReason?: string[]; rejectedReason?: string[] }>,
+  usage() {
+    return usage(this.current)
+  },
+  feed() {
+    return feed(this.current).map((item) => ({ ...this.info[item.key], ...item }))
+  },
+}
+
+export type CopilotRuntimeEvent = Event
+
+const CLIENT_ID = "Ov23li8tweQw6odWQebz"
 // Add a small safety buffer when polling to avoid hitting the server
 // slightly too early due to clock skew / timer drift.
 const OAUTH_POLLING_SAFETY_MARGIN_MS = 3000 // 3 seconds
-function normalizeDomain(url: string) {
+export function normalizeDomain(url: string) {
   return url.replace(/^https?:\/\//, "").replace(/\/$/, "")
 }
 
-function getUrls(domain: string) {
+export function getUrls(domain: string) {
   return {
     DEVICE_CODE_URL: `https://${domain}/login/device/code`,
     ACCESS_TOKEN_URL: `https://${domain}/login/oauth/access_token`,
   }
 }
 
+export function base(enterpriseUrl?: string) {
+  return enterpriseUrl ? `https://copilot-api.${normalizeDomain(enterpriseUrl)}` : "https://api.githubcopilot.com"
+}
+
+export async function aliasModels(input: {
+  provider: { id: string; models: Record<string, Model> }
+  auth?: { type: string; refresh?: string; enterpriseUrl?: string }
+  auths: CopilotAuth[]
+  state: State
+  write(state: State): Promise<void>
+}) {
+  if (!input.provider.id.startsWith("github-copilot#")) return
+  if (!input.auth || input.auth.type !== "oauth" || !input.auth.refresh) return
+  const key = routeProvider(input.provider.id, input.auths, input.state)
+  const match = key ? input.auths.find((item) => item.key === key) : undefined
+  if (!match) return
+  const cfg = proxyConfig(input.state, match.key)
+  return CopilotModels.get(
+    base(match.enterpriseUrl),
+    {
+      Authorization: `Bearer ${match.refresh}`,
+      "User-Agent": `opencode/${Installation.VERSION}`,
+      ...proxyHeaders(cfg?.token),
+    },
+    input.provider.models,
+    cfg?.url,
+  )
+    .then(async (models) => {
+      const next = discover(input.state, match.key, {
+        models: Object.values(models).map((item) => item.api.id),
+        api: base(match.enterpriseUrl),
+        plan: input.state.connections[match.key]?.plan,
+        login: input.state.connections[match.key]?.login,
+        ok: true,
+      })
+      await input.write(next)
+      return models
+    })
+    .catch(async (error) => {
+      const next = discover(input.state, match.key, {
+        models: [],
+        api: base(match.enterpriseUrl),
+        plan: input.state.connections[match.key]?.plan,
+        login: input.state.connections[match.key]?.login,
+        ok: false,
+        err: error instanceof Error ? error.message : String(error),
+      })
+      await input.write(next)
+      return Object.fromEntries(Object.entries(input.provider.models).map(([id, model]) => [id, fix(model, base(match.enterpriseUrl))]))
+    })
+}
+
+// Check if a message is a synthetic user msg used to attach an image from a tool call
+export function imgMsg(msg: any): boolean {
+  if (msg?.role !== "user") return false
+
+  // Handle the 3 api formats
+
+  const content = msg.content
+  if (typeof content === "string") return content === MessageV2.SYNTHETIC_ATTACHMENT_PROMPT
+  if (!Array.isArray(content)) return false
+  return content.some(
+    (part: any) =>
+      (part?.type === "text" || part?.type === "input_text") && part.text === MessageV2.SYNTHETIC_ATTACHMENT_PROMPT,
+  )
+}
+
+export function fix(model: Model, url: string): Model {
+  return {
+    ...model,
+    api: {
+      ...model.api,
+      url,
+      npm: "@ai-sdk/github-copilot",
+    },
+  }
+}
+
+export function selectAccount(input: { auths: CopilotAuth[]; state: State; fallback: CopilotAuth; now?: number }) {
+  return next(input.auths, input.state, input.now) ?? input.fallback
+}
+
+export function model(body: unknown) {
+  if (!body || typeof body !== "object") return ""
+  return typeof (body as { model?: unknown }).model === "string" ? (body as { model: string }).model : ""
+}
+
+export function premiumState(state: Map<string, Set<string>>, key: string, modelId: string) {
+  const set = state.get(key) ?? new Set<string>()
+  state.set(key, set)
+  if (set.has(modelId)) return false
+  set.add(modelId)
+  return true
+}
+
+export function premiumRollback(state: Map<string, Set<string>>, key: string, modelId: string) {
+  state.get(key)?.delete(modelId)
+}
+
+export function syncAccount(state: State, auths: CopilotAuth[]) {
+  return auths.reduce((acc, item) => upsert(acc, item.key, { label: item.label }), state)
+}
+
+export function preferPlan(state: State, auths: CopilotAuth[], modelId: string) {
+  if (!modelId) return auths
+  const want = modelId.includes("edu") ? "edu" : modelId.includes("free") ? "free" : undefined
+  if (!want) return auths
+  const items = auths.filter((item) => byPlan(state, item.key) === want)
+  return items.length > 0 ? items : auths
+}
+
+export function policyPlan(modelId: string) {
+  const text = modelId.toLowerCase()
+  if (text.includes("edu")) return "edu"
+  if (text.includes("enterprise")) return "enterprise"
+  if (text.includes("business")) return "business"
+  if (text.includes("team")) return "team"
+  if (text.includes("personal") || text.includes("free")) return "free"
+  return undefined
+}
+
+export function recent429(state: State, key: string, now = Date.now(), max = 15 * 60 * 1000) {
+  const until = state.connections[key]?.exhaustedUntil
+  if (!until) return false
+  return until > now - max
+}
+
+export function recentDiscoveryError(state: State, key: string, now = Date.now(), max = 30 * 60 * 1000) {
+  const at = state.connections[key]?.lastDiscoveryErrorAt
+  if (!at) return false
+  return now - at <= max
+}
+
+export function discoveryRank(state: State, key: string, modelId: string) {
+  const item = state.connections[key]?.discovery
+  if (!item) return 0
+  if (!item.models.includes(modelId)) return 0
+  if (item.ok === false) return 1
+  if (staleDiscovery(state, key)) return 2
+  return 3
+}
+
+export function penalty(state: State, key: string, now = Date.now()) {
+  return {
+    recent429: recent429(state, key, now),
+    recentDiscoveryError: recentDiscoveryError(state, key, now),
+  }
+}
+
+export function score(state: State, key: string, modelId: string, now = Date.now()) {
+  const p = penalty(state, key, now)
+  return {
+    discovery: discoveryRank(state, key, modelId),
+    penalty: (p.recent429 ? 1 : 0) + (p.recentDiscoveryError ? 1 : 0),
+    ...p,
+  }
+}
+
+export function runtimeScore(input: { state: State; runtime?: Runtime; key: string; modelId: string; now?: number }) {
+  const now = input.now ?? Date.now()
+  const s = score(input.state, input.key, input.modelId, now)
+  return {
+    ...s,
+    load: load(input.runtime, input.key),
+    cooldown: cooldown(input.runtime, input.key, now),
+  }
+}
+
+export function weighted(state: State, auths: CopilotAuth[], modelId: string, now = Date.now()) {
+  return [...auths].sort((a, b) => {
+    const ar = score(state, a.key, modelId, now)
+    const br = score(state, b.key, modelId, now)
+    if (ar.discovery !== br.discovery) return br.discovery - ar.discovery
+    if (ar.penalty !== br.penalty) return ar.penalty - br.penalty
+    return 0
+  })
+}
+
+export function preferDiscovery(state: State, auths: CopilotAuth[], modelId: string, now = Date.now()) {
+  if (!modelId) return auths
+  const items = weighted(state, auths, modelId, now)
+  const rank = Math.max(...items.map((item) => discoveryRank(state, item.key, modelId)), 0)
+  if (rank <= 0) return items
+  const pool = items.filter((item) => discoveryRank(state, item.key, modelId) === rank)
+  const best = Math.min(
+    ...pool.map(
+      (item) => (recent429(state, item.key, now) ? 1 : 0) + (recentDiscoveryError(state, item.key, now) ? 1 : 0),
+    ),
+  )
+  return pool.filter(
+    (item) => (recent429(state, item.key, now) ? 1 : 0) + (recentDiscoveryError(state, item.key, now) ? 1 : 0) === best,
+  )
+}
+
+export function preferAccount(state: State, auths: CopilotAuth[]) {
+  const key = state.preferred
+  if (!key) return auths
+  const match = auths.find((item) => item.key === key)
+  if (!match) return auths
+  return [match, ...auths.filter((item) => item.key !== key)]
+}
+
+export function preferPolicy(state: State, auths: CopilotAuth[], modelId: string, now = Date.now()) {
+  const want = policyPlan(modelId)
+  const items = preferAccount(state, auths)
+  const live = items.filter((item) => {
+    const until = state.connections[item.key]?.exhaustedUntil
+    return !until || until <= now
+  })
+  const pool = live.length > 0 ? live : items
+  if (!want) return rotate(state, pool)
+  const lane = pool.filter((item) => byPlan(state, item.key) === want)
+  return rotate(state, lane.length > 0 ? lane : pool)
+}
+
+export function aliases(auths: CopilotAuth[], state: State) {
+  const by = (plan: string) => auths.find((item) => byPlan(state, item.key) === plan)?.key
+  return {
+    "github-copilot#edu": by("edu"),
+    "github-copilot#enterprise": by("enterprise") ?? by("business") ?? by("team"),
+    "github-copilot#personal": by("free"),
+    "github-copilot#free": by("free"),
+  }
+}
+
+export function routeAlias(auths: CopilotAuth[], state: State, key: string) {
+  const map = aliases(auths, state)
+  if (key in map) {
+    const next = map[key as keyof typeof map]
+    return next ?? key
+  }
+  return key
+}
+
+export type RouteDebug = {
+  key: string
+  alias?: string
+  lane?: string
+  discovery: number
+  recent429: boolean
+  recentDiscoveryError: boolean
+  penalty: number
+  load: number
+  cooldown: boolean
+  routeReason: string[]
+  selectedReason: string[]
+  rejectedReason: string[]
+  selected: boolean
+}
+
+export function batchOrder(input: {
+  auths: CopilotAuth[]
+  state: State
+  modelId: string
+  runtime?: Runtime
+  now?: number
+}) {
+  const now = input.now ?? Date.now()
+  return [...input.auths].sort((a, b) => {
+    const ar = runtimeScore({ state: input.state, runtime: input.runtime, key: a.key, modelId: input.modelId, now })
+    const br = runtimeScore({ state: input.state, runtime: input.runtime, key: b.key, modelId: input.modelId, now })
+    if (ar.cooldown !== br.cooldown) return Number(ar.cooldown) - Number(br.cooldown)
+    if (ar.discovery !== br.discovery) return br.discovery - ar.discovery
+    if (ar.penalty !== br.penalty) return ar.penalty - br.penalty
+    if (ar.load !== br.load) return ar.load - br.load
+    return 0
+  })
+}
+
+export function autobestBatch(input: {
+  auths: CopilotAuth[]
+  state: State
+  modelId: string
+  count: number
+  runtime?: Runtime
+  now?: number
+}) {
+  const now = input.now ?? Date.now()
+  const runtime = input.runtime
+    ? { ...input.runtime, pool: { ...input.runtime.pool }, last: { ...input.runtime.last } }
+    : undefined
+  const planned = preferPlan(input.state, input.auths, input.modelId)
+  const lane = preferPolicy(input.state, planned, input.modelId, now)
+  const pool = preferDiscovery(input.state, lane, input.modelId, now)
+  const out: string[] = []
+  for (let i = 0; i < input.count; i++) {
+    const live = runtime ? eligible(runtime, pool) : pool
+    const pick = batchOrder({ auths: live, state: input.state, modelId: input.modelId, runtime, now })[0]
+    if (!pick) break
+    out.push(pick.key)
+    if (runtime) runtime.pool[pick.key] = load(runtime, pick.key) + 1
+  }
+  return out
+}
+
+export function routeDebug(input: {
+  auths: CopilotAuth[]
+  state: State
+  modelId: string
+  providerID?: string
+  runtime?: Runtime
+  now?: number
+}) {
+  const now = input.now ?? Date.now()
+  const alias = input.providerID ? routeAlias(input.auths, input.state, input.providerID) : undefined
+  const lane = policyPlan(input.modelId)
+  const items = weighted(
+    input.state,
+    preferPolicy(input.state, preferPlan(input.state, input.auths, input.modelId), input.modelId, now),
+    input.modelId,
+    now,
+  )
+  const selected = items[0]?.key
+  const top = items[0]
+    ? runtimeScore({ state: input.state, runtime: input.runtime, key: items[0].key, modelId: input.modelId, now })
+    : undefined
+  return items.map((item) => {
+    const s = runtimeScore({ state: input.state, runtime: input.runtime, key: item.key, modelId: input.modelId, now })
+    const routeReason = [
+      alias && item.key === alias ? `alias:${input.providerID}` : undefined,
+      lane && byPlan(input.state, item.key) === lane ? `lane:${lane}` : undefined,
+      s.discovery > 0 ? `discovery:${s.discovery}` : undefined,
+      s.recent429 ? "penalty:recent429" : undefined,
+      s.recentDiscoveryError ? "penalty:recentDiscoveryError" : undefined,
+    ].filter(Boolean) as string[]
+    const rejectedReason = [
+      selected !== item.key && top && s.discovery < top.discovery ? "lowerDiscoveryRank" : undefined,
+      selected !== item.key && top && s.penalty > top.penalty ? "higherPenalty" : undefined,
+      alias && item.key !== alias ? "aliasMismatch" : undefined,
+      lane && byPlan(input.state, item.key) !== lane ? "laneMismatch" : undefined,
+    ].filter(Boolean) as string[]
+    return {
+      key: item.key,
+      alias,
+      lane,
+      discovery: s.discovery,
+      recent429: s.recent429,
+      recentDiscoveryError: s.recentDiscoveryError,
+      penalty: s.penalty,
+      load: s.load,
+      cooldown: s.cooldown,
+      routeReason,
+      selectedReason: item.key === selected ? routeReason : [],
+      rejectedReason,
+      selected: item.key === selected,
+    }
+  })
+}
+
+export function routeAccount(input: {
+  auths: CopilotAuth[]
+  state: State
+  modelId: string
+  providerID?: string
+  fallback: CopilotAuth
+  runtime?: Runtime
+  now?: number
+}) {
+  const alias = input.providerID ? routeAlias(input.auths, input.state, input.providerID) : undefined
+  if (alias) {
+    const match = input.auths.find((item) => item.key === alias)
+    if (match) return match
+  }
+  const now = input.now ?? Date.now()
+  const planned = preferPlan(input.state, input.auths, input.modelId)
+  const lane = preferPolicy(input.state, planned, input.modelId, now)
+  const pool = preferDiscovery(input.state, lane, input.modelId, now)
+  const live = input.runtime ? eligible(input.runtime, pool) : pool
+  return (
+    batchOrder({ auths: live, state: input.state, modelId: input.modelId, runtime: input.runtime, now })[0] ??
+    selectAccount({ auths: live, state: input.state, fallback: input.fallback, now })
+  )
+}
+
+export async function refreshAccount(input: { state: State; key: string; token: string; enterpriseUrl?: string }) {
+  try {
+    const quota = await fetchQuota(input.token, input.enterpriseUrl, proxy(input.state, input.key))
+    return upsert(input.state, input.key, {
+      login: quota.login,
+      plan: classifyPlan(quota),
+      lastTestedAt: Date.now(),
+    })
+  } catch {
+    return upsert(input.state, input.key, { lastTestedAt: Date.now() })
+  }
+}
+
+export function proxyConfig(state: State, key: string) {
+  const item = proxy(state, key)
+  if (!item.url) return
+  return item
+}
+
+export function proxyHeaders(token?: string): Record<string, string> {
+  return token ? { "x-copilot-proxy-token": token } : {}
+}
+
+export function copilotRuntimeConfig(config?: { provider?: Record<string, { options?: Record<string, unknown> }> }) {
+  const opts = config?.provider?.["github-copilot"]?.options
+  const limit = Number(process.env.OPENCODE_COPILOT_RUNTIME_LIMIT ?? opts?.runtimeLimit ?? 1)
+  const minIntervalMs = Number(process.env.OPENCODE_COPILOT_RUNTIME_MIN_INTERVAL_MS ?? opts?.runtimeMinIntervalMs ?? 0)
+  return {
+    limit: Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 1,
+    minIntervalMs: Number.isFinite(minIntervalMs) && minIntervalMs >= 0 ? Math.trunc(minIntervalMs) : 0,
+  }
+}
+
+export function routeUrl(url: RequestInfo | URL, cfg?: { url?: string }) {
+  if (!cfg?.url) return url
+  const raw = url instanceof URL ? url.href : url.toString()
+  return new URL(raw, cfg.url).href
+}
+
+export async function routedFetch(
+  request: RequestInfo | URL,
+  init: RequestInit | undefined,
+  cfg?: { url?: string; token?: string },
+) {
+  const headers = { ...(init?.headers as Record<string, string>), ...proxyHeaders(cfg?.token) }
+  return fetch(routeUrl(request, cfg), { ...init, headers })
+}
+
+export function protocol(input: {
+  init?: RequestInit
+  token: string
+  machineId: string
+  sessionId: string
+  premium: boolean
+  vision: boolean
+  agent: boolean
+}) {
+  const os = process.platform === "darwin" ? "MacOS" : process.platform === "win32" ? "Windows" : "Linux"
+  const arch = process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : process.arch
+  const headers: Record<string, string> = {
+    ...(input.init?.headers as Record<string, string>),
+    "x-initiator": input.agent ? "agent" : input.premium ? "user" : "agent",
+    "X-Interaction-Type": input.agent
+      ? "conversation-subagent"
+      : input.premium
+        ? "conversation-user"
+        : "conversation-agent",
+    "User-Agent": `opencode/${Installation.VERSION} (${process.platform} ${process.version}) copilot-compat/1.0.14`,
+    Authorization: `Bearer ${input.token}`,
+    "Openai-Intent": "conversation-agent",
+    "Copilot-Integration-Id": "copilot-developer-cli",
+    "X-GitHub-Api-Version": "2026-01-09",
+    "X-Interaction-Id": crypto.randomUUID(),
+    "X-Agent-Task-Id": crypto.randomUUID(),
+    "X-Stainless-Retry-Count": "0",
+    "X-Stainless-Lang": "js",
+    "X-Stainless-Package-Version": "5.20.1",
+    "X-Stainless-OS": os,
+    "X-Stainless-Arch": arch,
+    "X-Stainless-Runtime": "node",
+    "X-Stainless-Runtime-Version": process.version,
+    "X-Client-Session-Id": input.sessionId,
+    "X-Client-Machine-Id": input.machineId,
+  }
+  if (input.vision) headers["Copilot-Vision-Request"] = "true"
+  delete headers["x-api-key"]
+  delete headers["authorization"]
+  return headers
+}
+
+export function routeProvider(providerID: string | undefined, auths: CopilotAuth[], state: State) {
+  if (!providerID) return undefined
+  if (!providerID.startsWith("github-copilot#")) return undefined
+  return routeAlias(auths, state, providerID)
+}
+
+export async function dispatch(input: {
+  providerID?: string
+  getAuth: () => Promise<Auth.Info>
+  auths: CopilotAuth[]
+  read: () => Promise<State>
+  write: (state: State) => Promise<void>
+  premium: Map<string, Set<string>>
+  runtime: Runtime
+  request: RequestInfo | URL
+  init?: RequestInit
+  isVision: boolean
+  isAgent: boolean
+  modelId: string
+}) {
+  const info = await input.getAuth()
+  if (info.type !== "oauth") return fetch(input.request, input.init)
+  const loaded = await input.read()
+  const state = syncAccount(loaded, input.auths)
+  const fallback: CopilotAuth = {
+    key: "github-copilot",
+    label: "Primary",
+    refresh: info.refresh,
+    access: info.access,
+    expires: info.expires,
+    accountId: info.accountId,
+    enterpriseUrl: info.enterpriseUrl,
+  }
+  const live = routeAccount({
+    auths: input.auths,
+    state,
+    modelId: input.modelId,
+    providerID: input.providerID,
+    fallback,
+    runtime: input.runtime,
+  })
+  const held =
+    !input.providerID && input.auths.length > 1
+      ? reserveBatch(input.runtime, autobestBatch({
+          auths: input.auths,
+          state,
+          modelId: input.modelId,
+          count: input.runtime.limit,
+        }))
+      : undefined
+  const slot = held?.held.find((item) => item.key === live.key && item.held)
+  if (held) {
+    held.held.filter((item) => item !== slot).forEach((item) => item.release())
+  }
+  const pick = slot ?? reserve(input.runtime, live.key)
+  const isPremium = input.modelId ? premiumState(input.premium, live.key, input.modelId) : !input.isAgent
+  const fresh = await refreshAccount({ state, key: live.key, token: live.refresh, enterpriseUrl: live.enterpriseUrl })
+  const [nextState, machineId] = machine(routed(fresh, live.key), live.key)
+  await input.write(nextState)
+  const s = runtimeScore({ state: nextState, runtime: input.runtime, key: live.key, modelId: input.modelId })
+  const debug = routeDebug({
+    auths: input.auths,
+    state: nextState,
+    modelId: input.modelId,
+    providerID: input.providerID,
+    runtime: input.runtime,
+  })
+  debug.forEach((item) => {
+    CopilotRuntimeState.info[item.key] = {
+      lane: item.lane,
+      discovery: item.discovery,
+      penalty: item.penalty,
+      cooldown: item.cooldown,
+      selected: item.selected,
+      selectedReason: item.selectedReason,
+      rejectedReason: item.rejectedReason,
+    }
+  })
+  const headers = protocol({
+    init: input.init,
+    token: live.refresh,
+    machineId,
+    sessionId: crypto.randomUUID(),
+    premium: isPremium,
+    vision: input.isVision,
+    agent: input.isAgent,
+  })
+  const cfg = proxyConfig(nextState, live.key)
+  const res = await routedFetch(input.request, { ...input.init, headers }, cfg)
+  if (res.status === 429) {
+    pick.release()
+    await input.write(mark(nextState, live.key, Date.now() + 11 * 60 * 1000))
+    if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
+    return res
+  }
+  if (res.status === 401) {
+    pick.release()
+    if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
+    return res
+  }
+  if (res.ok) {
+    await input.write(clear(nextState, live.key))
+  }
+  pick.release()
+  touch(input.runtime, live.key)
+  return res
+}
+
 export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   const sdk = input.client
-
-  // Multi-account connection manager with round-robin and failover.
-  const connectionManager = new CopilotConnectionManager()
-
-  // Per-account per-model premium tracking matching codex_git's account_pool.rs:
-  // Only the FIRST request to each model per account in a session gets
-  // x-initiator: "user" (premium). All subsequent requests get "agent" (free).
-  const premiumSentModels = new Map<string, Set<string>>() // accountKey -> Set<modelId>
-
-  function checkAndMarkPremium(accountKey: string, modelId: string): boolean {
-    let models = premiumSentModels.get(accountKey)
-    if (!models) {
-      models = new Set()
-      premiumSentModels.set(accountKey, models)
-    }
-    if (models.has(modelId)) return false
-    models.add(modelId)
-    return true
-  }
-
-  function rollbackPremium(accountKey: string, modelId: string): void {
-    premiumSentModels.get(accountKey)?.delete(modelId)
-  }
-
-  /**
-   * Load all github-copilot accounts from auth.json and resolve via connection manager.
-   * Returns connections sorted by preference/availability with round-robin.
-   */
-  async function loadCopilotAccounts(): Promise<ResolvedConnection[]> {
-    try {
-      const allAuth = await Auth.all()
-      const copilotEntries: Record<string, { refresh: string; enterpriseUrl?: string }> = {}
-      for (const [key, info] of Object.entries(allAuth)) {
-        if (!key.startsWith("github-copilot") || info.type !== "oauth") continue
-        copilotEntries[key] = {
-          refresh: info.refresh,
-          enterpriseUrl: "enterpriseUrl" in info ? (info.enterpriseUrl as string) : undefined,
-        }
-      }
-      return connectionManager.getConnections(copilotEntries)
-    } catch {
-      return []
-    }
-  }
-
+  await Effect.runPromise(migrate().pipe(Effect.provide(Auth.defaultLayer), Effect.provide(AppFileSystem.defaultLayer))).catch(() => [])
+  const premium = new Map<string, Set<string>>()
+  const cfg = copilotRuntimeConfig(
+    await Effect.runPromise(Config.Service.use((cfg) => cfg.get()).pipe(Effect.provide(Config.defaultLayer))).catch(() => undefined),
+  )
+  const runtime = owner(cfg.limit, cfg.minIntervalMs)
+  CopilotRuntimeState.current = runtime
   return {
+    provider: {
+      id: "github-copilot",
+      async models(provider, ctx) {
+        if (ctx.auth?.type !== "oauth") {
+          return Object.fromEntries(Object.entries(provider.models).map(([id, model]) => [id, fix(model, base())]))
+        }
+
+        const auth = ctx.auth
+        const all = await allAuths()
+        const storeState = syncAccount(await readState(), all)
+        const match =
+          all.find((item) => item.key === "github-copilot") ?? all.find((item) => item.refresh === auth.refresh)
+        const key = match?.key ?? "github-copilot"
+        const cfg = proxyConfig(storeState, key)
+
+        return CopilotModels.get(
+          base(auth.enterpriseUrl),
+          {
+            Authorization: `Bearer ${auth.refresh}`,
+            "User-Agent": `opencode/${Installation.VERSION}`,
+            ...proxyHeaders(cfg?.token),
+          },
+          provider.models,
+          cfg?.url,
+        )
+          .then(async (models) => {
+            const next = discover(storeState, key, {
+              models: Object.values(models).map((item) => item.api.id),
+              api: base(auth.enterpriseUrl),
+              plan: storeState.connections[key]?.plan,
+              login: storeState.connections[key]?.login,
+              ok: true,
+            })
+            await writeState(next)
+            return models
+          })
+          .catch(async (error) => {
+            log.error("failed to fetch copilot models", { error })
+            const next = discover(storeState, key, {
+              models: [],
+              api: base(auth.enterpriseUrl),
+              plan: storeState.connections[key]?.plan,
+              login: storeState.connections[key]?.login,
+              ok: false,
+              err: error instanceof Error ? error.message : String(error),
+            })
+            await writeState(next)
+            return Object.fromEntries(
+              Object.entries(provider.models).map(([id, model]) => [id, fix(model, base(auth.enterpriseUrl))]),
+            )
+          })
+      },
+    },
     auth: {
       provider: "github-copilot",
-      async loader(getAuth, provider) {
+      async loader(getAuth) {
         const info = await getAuth()
         if (!info || info.type !== "oauth") return {}
 
-        const enterpriseUrl = info.enterpriseUrl
-        const baseURL = enterpriseUrl ? `https://copilot-api.${normalizeDomain(enterpriseUrl)}` : undefined
-
-        if (provider && provider.models) {
-          for (const model of Object.values(provider.models)) {
-            model.cost = {
-              input: 0,
-              output: 0,
-              cache: {
-                read: 0,
-                write: 0,
-              },
-            }
-
-            // TODO: re-enable once messages api has higher rate limits
-            // TODO: move some of this hacky-ness to models.dev presets once we have better grasp of things here...
-            // const base = baseURL ?? model.api.url
-            // const claude = model.id.includes("claude")
-            // const url = iife(() => {
-            //   if (!claude) return base
-            //   if (base.endsWith("/v1")) return base
-            //   if (base.endsWith("/")) return `${base}v1`
-            //   return `${base}/v1`
-            // })
-
-            // model.api.url = url
-            // model.api.npm = claude ? "@ai-sdk/anthropic" : "@ai-sdk/github-copilot"
-            model.api.npm = "@ai-sdk/github-copilot"
-          }
-        }
-
         return {
-          baseURL,
           apiKey: "",
           async fetch(request: RequestInfo | URL, init?: RequestInit) {
             const info = await getAuth()
             if (info.type !== "oauth") return fetch(request, init)
 
             const url = request instanceof URL ? request.href : request.toString()
-            const { isVision, modelId } = iife(() => {
+            const { isVision, isAgent } = iife(() => {
               try {
                 const body = typeof init?.body === "string" ? JSON.parse(init.body) : init?.body
-                const parsedModelId = body?.model ?? ""
 
                 // Completions API
                 if (body?.messages && url.includes("completions")) {
+                  const last = body.messages[body.messages.length - 1]
                   return {
                     isVision: body.messages.some(
                       (msg: any) =>
                         Array.isArray(msg.content) && msg.content.some((part: any) => part.type === "image_url"),
                     ),
-                    modelId: parsedModelId,
+                    isAgent: last?.role !== "user" || imgMsg(last),
                   }
                 }
 
                 // Responses API
                 if (body?.input) {
+                  const last = body.input[body.input.length - 1]
                   return {
                     isVision: body.input.some(
                       (item: any) =>
                         Array.isArray(item?.content) && item.content.some((part: any) => part.type === "input_image"),
                     ),
-                    modelId: parsedModelId,
+                    isAgent: last?.role !== "user" || imgMsg(last),
                   }
                 }
 
                 // Messages API
                 if (body?.messages) {
+                  const last = body.messages[body.messages.length - 1]
+                  const hasNonToolCalls =
+                    Array.isArray(last?.content) && last.content.some((part: any) => part?.type !== "tool_result")
                   return {
                     isVision: body.messages.some(
                       (item: any) =>
@@ -156,84 +783,34 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
                               part.content.some((nested: any) => nested?.type === "image")),
                         ),
                     ),
-                    modelId: parsedModelId,
+                    isAgent: !(last?.role === "user" && hasNonToolCalls) || imgMsg(last),
                   }
                 }
               } catch {}
-              return { isVision: false, modelId: "" }
+              return { isVision: false, isAgent: false }
             })
 
-            const stainlessOS = process.platform === "darwin" ? "MacOS" : process.platform === "win32" ? "Windows" : "Linux"
-            const stainlessArch = process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : process.arch
-
-            // Round-robin account selection: load all copilot accounts and pick next available.
-            // Falls back to primary account from getAuth() if no multi-account setup.
-            const accounts = await loadCopilotAccounts()
-            const activeAccount = await connectionManager.getNextConnection(
-              Object.fromEntries(accounts.map((a) => [a.key, { refresh: a.token, enterpriseUrl: a.enterpriseUrl }])),
-            )
-            const accountKey = activeAccount?.key ?? "github-copilot"
-            const token = activeAccount?.token ?? info.refresh
-
-            // Per-account per-model premium tracking: only the first request to each
-            // model per account gets x-initiator: "user" (premium).
-            const isFirstForModel = modelId ? checkAndMarkPremium(accountKey, modelId) : false
-
-            const headers: Record<string, string> = {
-              "x-initiator": isFirstForModel ? "user" : "agent",
-              "X-Interaction-Type": isFirstForModel ? "conversation-user" : "conversation-agent",
-              ...(init?.headers as Record<string, string>),
-              "User-Agent": `opencode/${Installation.VERSION} (${process.platform} ${process.version}) copilot-compat/1.0.14`,
-              Authorization: `Bearer ${token}`,
-              "Openai-Intent": "conversation-agent",
-              "Copilot-Integration-Id": "copilot-developer-cli",
-              "X-GitHub-Api-Version": "2026-01-09",
-              "X-Interaction-Id": crypto.randomUUID(),
-              "X-Agent-Task-Id": crypto.randomUUID(),
-              "X-Stainless-Retry-Count": "0",
-              "X-Stainless-Lang": "js",
-              "X-Stainless-Package-Version": "5.20.1",
-              "X-Stainless-OS": stainlessOS,
-              "X-Stainless-Arch": stainlessArch,
-              "X-Stainless-Runtime": "node",
-              "X-Stainless-Runtime-Version": process.version,
-              "X-Client-Session-Id": getCopilotSessionId(),
-              "X-Client-Machine-Id": getCopilotMachineId(),
-            }
-
-            if (isVision) {
-              headers["Copilot-Vision-Request"] = "true"
-            }
-
-            delete headers["x-api-key"]
-            delete headers["authorization"]
-
-            const response = await fetch(request, {
-              ...init,
-              headers,
+            const body = iife(() => {
+              try {
+                return typeof init?.body === "string" ? JSON.parse(init.body) : init?.body
+              } catch {
+                return undefined
+              }
             })
-
-            if (response.status === 429) {
-              // Mark this account as exhausted for 11 minutes (matching codex_git's
-              // first headerless 429 fallback delay). Connection manager will skip
-              // it and round-robin to the next available account on the next request.
-              connectionManager.setExhaustion(accountKey, Date.now() + 11 * 60 * 1000)
-
-              // Rollback premium so the retry on another account gets "user".
-              if (isFirstForModel && modelId) {
-                rollbackPremium(accountKey, modelId)
-              }
-            } else if (response.status === 401) {
-              // Bad token — rollback premium so retry re-sends "user".
-              if (isFirstForModel && modelId) {
-                rollbackPremium(accountKey, modelId)
-              }
-            } else if (response.ok) {
-              // Success — clear any exhaustion on this account.
-              connectionManager.clearExhaustion(accountKey)
-            }
-
-            return response
+            return dispatch({
+              getAuth,
+              auths: await allAuths(),
+              read: readState,
+              write: writeState,
+              premium,
+              runtime,
+              request,
+              init,
+              isVision,
+              isAgent,
+              providerID: (info as any).accountId,
+              modelId: model(body),
+            })
           },
         }
       },
@@ -298,7 +875,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
               },
               body: JSON.stringify({
                 client_id: CLIENT_ID,
-                scope: "read:user,read:org,repo,gist",
+                scope: "read:user",
               }),
             })
 
@@ -393,168 +970,15 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
             }
           },
         },
-        {
-          type: "oauth",
-          label: "Add additional GitHub Copilot account",
-          prompts: [
-            {
-              type: "text",
-              key: "accountLabel",
-              message: "Enter a label for this account (e.g., work, personal, enterprise)",
-              placeholder: "work",
-              validate: (value) => {
-                if (!value || !value.trim()) return "Label is required"
-                if (!/^[a-zA-Z0-9_-]+$/.test(value.trim())) return "Label must be alphanumeric (dashes and underscores allowed)"
-                return undefined
-              },
-            },
-            {
-              type: "select",
-              key: "deploymentType",
-              message: "Select GitHub deployment type",
-              options: [
-                {
-                  label: "GitHub.com",
-                  value: "github.com",
-                  hint: "Public",
-                },
-                {
-                  label: "GitHub Enterprise",
-                  value: "enterprise",
-                  hint: "Data residency or self-hosted",
-                },
-              ],
-            },
-            {
-              type: "text",
-              key: "enterpriseUrl",
-              message: "Enter your GitHub Enterprise URL or domain",
-              placeholder: "company.ghe.com or https://company.ghe.com",
-              when: { key: "deploymentType", op: "eq", value: "enterprise" },
-              validate: (value) => {
-                if (!value) return "URL or domain is required"
-                try {
-                  const url = value.includes("://") ? new URL(value) : new URL(`https://${value}`)
-                  if (!url.hostname) return "Please enter a valid URL or domain"
-                  return undefined
-                } catch {
-                  return "Please enter a valid URL (e.g., company.ghe.com or https://company.ghe.com)"
-                }
-              },
-            },
-          ],
-          async authorize(inputs = {}) {
-            const label = (inputs.accountLabel as string || "").trim()
-            const deploymentType = inputs.deploymentType || "github.com"
-
-            let domain = "github.com"
-            if (deploymentType === "enterprise") {
-              const enterpriseUrl = inputs.enterpriseUrl
-              domain = normalizeDomain(enterpriseUrl!)
-            }
-
-            const urls = getUrls(domain)
-
-            const deviceResponse = await fetch(urls.DEVICE_CODE_URL, {
-              method: "POST",
-              headers: {
-                Accept: "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": `opencode/${Installation.VERSION}`,
-              },
-              body: JSON.stringify({
-                client_id: CLIENT_ID,
-                scope: "read:user,read:org,repo,gist",
-              }),
-            })
-
-            if (!deviceResponse.ok) {
-              throw new Error("Failed to initiate device authorization")
-            }
-
-            const deviceData = (await deviceResponse.json()) as {
-              verification_uri: string
-              user_code: string
-              device_code: string
-              interval: number
-            }
-
-            return {
-              url: deviceData.verification_uri,
-              instructions: `Enter code: ${deviceData.user_code}`,
-              method: "auto" as const,
-              async callback() {
-                while (true) {
-                  const response = await fetch(urls.ACCESS_TOKEN_URL, {
-                    method: "POST",
-                    headers: {
-                      Accept: "application/json",
-                      "Content-Type": "application/json",
-                      "User-Agent": `opencode/${Installation.VERSION}`,
-                    },
-                    body: JSON.stringify({
-                      client_id: CLIENT_ID,
-                      device_code: deviceData.device_code,
-                      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-                    }),
-                  })
-
-                  if (!response.ok) return { type: "failed" as const }
-
-                  const data = (await response.json()) as {
-                    access_token?: string
-                    error?: string
-                    interval?: number
-                  }
-
-                  if (data.access_token) {
-                    const result: {
-                      type: "success"
-                      refresh: string
-                      access: string
-                      expires: number
-                      provider?: string
-                      enterpriseUrl?: string
-                    } = {
-                      type: "success",
-                      refresh: data.access_token,
-                      access: data.access_token,
-                      expires: 0,
-                      provider: `github-copilot#${label}`,
-                    }
-
-                    if (deploymentType === "enterprise") {
-                      result.enterpriseUrl = domain
-                    }
-
-                    return result
-                  }
-
-                  if (data.error === "authorization_pending") {
-                    await sleep(deviceData.interval * 1000 + OAUTH_POLLING_SAFETY_MARGIN_MS)
-                    continue
-                  }
-
-                  if (data.error === "slow_down") {
-                    let newInterval = (deviceData.interval + 5) * 1000
-                    const serverInterval = data.interval
-                    if (serverInterval && typeof serverInterval === "number" && serverInterval > 0) {
-                      newInterval = serverInterval * 1000
-                    }
-                    await sleep(newInterval + OAUTH_POLLING_SAFETY_MARGIN_MS)
-                    continue
-                  }
-
-                  if (data.error) return { type: "failed" as const }
-
-                  await sleep(deviceData.interval * 1000 + OAUTH_POLLING_SAFETY_MARGIN_MS)
-                  continue
-                }
-              },
-            }
-          },
-        },
       ],
+    },
+    "chat.params": async (incoming, output) => {
+      if (!incoming.model.providerID.includes("github-copilot")) return
+
+      // Match github copilot cli, omit maxOutputTokens for gpt models
+      if (incoming.model.api.id.includes("gpt")) {
+        output.maxOutputTokens = undefined
+      }
     },
     "chat.headers": async (incoming, output) => {
       if (!incoming.model.providerID.includes("github-copilot")) return
@@ -578,7 +1002,6 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
 
       if (parts?.data.parts?.some((part) => part.type === "compaction")) {
         output.headers["x-initiator"] = "agent"
-        output.headers["X-Interaction-Type"] = "conversation-background"
         return
       }
 
@@ -596,7 +1019,6 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
       if (!session || !session.data.parentID) return
       // mark subagent sessions as agent initiated matching standard that other copilot tools have
       output.headers["x-initiator"] = "agent"
-      output.headers["X-Interaction-Type"] = "conversation-subagent"
     },
   }
 }

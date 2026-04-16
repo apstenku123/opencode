@@ -45,4 +45,13 @@ export const TuiEvent = {
       sessionID: SessionID.zod.describe("Session ID to navigate to"),
     }),
   ),
+  TimerFired: BusEvent.define(
+    "tui.timer.fired",
+    z.object({
+      sessionID: SessionID.zod.describe("Session ID that owns the timer"),
+      id: z.string(),
+      repeat: z.boolean(),
+      fired_at: z.number().int().nonnegative(),
+    }),
+  ),
 }

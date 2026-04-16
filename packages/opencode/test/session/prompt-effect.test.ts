@@ -690,6 +690,36 @@ it.live(
 )
 
 it.live(
+  "autobest autofires at runLoop completion when enabled and assistant reply contains bullets",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+
+        yield* llm.text(`- tighten failing repro
+- rerun focused lane`)
+
+        const chat = yield* sessions.create({})
+        yield* sessions.setAutobestEnabled({ sessionID: chat.id, enabled: true, ts: 1 })
+        yield* user(chat.id, "hi")
+
+        yield* prompt.loop({ sessionID: chat.id })
+        const state = yield* sessions.getAutobest(chat.id)
+        expect(state.active?.key).toBe("tighten failing repro")
+        const result = yield* Effect.promise(() => import("../../src/history").then((m) => m.last(chat.id, "autobest.result")))
+        expect(result).toMatchObject({
+          type: "autobest.result",
+          sessionID: chat.id,
+          changed: true,
+        })
+      }),
+      { git: true, config: providerCfg },
+    ),
+  10_000,
+)
+
+it.live(
   "loop sets status to busy then idle",
   () =>
     provideTmpdirServer(

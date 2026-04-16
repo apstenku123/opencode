@@ -27,6 +27,8 @@ import { lazy } from "../../util/lazy"
 import { Bus } from "../../bus"
 import { NamedError } from "@opencode-ai/shared/util/error"
 import { jsonRequest } from "./trace"
+import { TimerSvc } from "./timer"
+import * as History from "@/history"
 
 const log = Log.create({ service: "server" })
 
@@ -165,6 +167,498 @@ export const SessionRoutes = lazy(() =>
           const session = yield* Session.Service
           return yield* session.children(sessionID)
         })
+      },
+    )
+    .get(
+      "/:sessionID/timer",
+      describeRoute({
+        summary: "List session timers",
+        description: "Retrieve managed timers for the current instance/session runtime.",
+        operationId: "session.timer.list",
+        responses: {
+          200: {
+            description: "Timer list",
+            content: {
+              "application/json": {
+                schema: resolver(TimerSvc.Info.array()),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      async (c) => {
+        c.req.valid("param")
+        const items = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.list()).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        return c.json(items)
+      },
+    )
+    .post(
+      "/:sessionID/timer",
+      describeRoute({
+        summary: "Create session timer",
+        description: "Create or replace a managed timer for the current instance/session runtime.",
+        operationId: "session.timer.create",
+        responses: {
+          200: {
+            description: "Created timer",
+            content: {
+              "application/json": {
+                schema: resolver(TimerSvc.Info),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      validator("json", TimerSvc.CreateInput),
+      async (c) => {
+        c.req.valid("param")
+        const body = c.req.valid("json")
+        const item = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.create(body)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        return c.json(item)
+      },
+    )
+    .post(
+      "/:sessionID/timer/drain",
+      describeRoute({
+        summary: "Drain fired timers",
+        description: "Drain and return fired timer events for the current instance/session runtime.",
+        operationId: "session.timer.drain",
+        responses: {
+          200: {
+            description: "Fired timer events",
+            content: {
+              "application/json": {
+                schema: resolver(TimerSvc.Fired.array()),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      validator(
+        "query",
+        z.object({
+          inject: z.coerce.boolean().optional(),
+        }),
+      ),
+      async (c) => {
+        const param = c.req.valid("param")
+        const query = c.req.valid("query")
+        const items = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.drain()).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        if (query.inject) {
+          for (const item of items) {
+            await AppRuntime.runPromise(Session.Service.use((svc) =>
+              svc.appendUserText({
+                sessionID: param.sessionID,
+                time: item.at,
+                text: `[timer:${item.id}] fired`,
+              }),
+            ))
+          }
+        }
+        return c.json(items)
+      },
+    )
+    .post(
+      "/:sessionID/timer/:id/pause",
+      describeRoute({
+        summary: "Pause timer",
+        description: "Pause a managed timer.",
+        operationId: "session.timer.pause",
+        responses: {
+          200: {
+            description: "Timer state",
+            content: {
+              "application/json": {
+                schema: resolver(TimerSvc.Info.nullable()),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+          id: z.string().min(1),
+        }),
+      ),
+      async (c) => {
+        const param = c.req.valid("param")
+        const item = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.pause(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        return c.json(item ?? null)
+      },
+    )
+    .post(
+      "/:sessionID/timer/:id/resume",
+      describeRoute({
+        summary: "Resume timer",
+        description: "Resume a paused managed timer.",
+        operationId: "session.timer.resume",
+        responses: {
+          200: {
+            description: "Timer state",
+            content: {
+              "application/json": {
+                schema: resolver(TimerSvc.Info.nullable()),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+          id: z.string().min(1),
+        }),
+      ),
+      async (c) => {
+        const param = c.req.valid("param")
+        const item = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.resume(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        return c.json(item ?? null)
+      },
+    )
+    .get(
+      "/:sessionID/autobest",
+      describeRoute({
+        summary: "Get session autobest state",
+        description: "Retrieve the current history-backed autobest state for a session.",
+        operationId: "session.autobest.get",
+        responses: {
+          200: {
+            description: "Autobest state",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    active: z
+                      .object({
+                        key: z.string(),
+                        source: z.enum(["manual", "auto"]),
+                        score: z.number().optional(),
+                        ts: z.number(),
+                      })
+                      .nullable(),
+                    enabled: z.boolean(),
+                    picks: z.array(
+                      z.object({
+                        key: z.string(),
+                        source: z.enum(["manual", "auto"]),
+                        score: z.number().optional(),
+                        ts: z.number(),
+                      }),
+                    ),
+                    log: z
+                      .array(
+                        z.object({
+                          ts: z.number(),
+                          changed: z.boolean(),
+                          active: z
+                            .object({
+                              key: z.string(),
+                              source: z.enum(["manual", "auto"]),
+                              score: z.number().optional(),
+                              ts: z.number(),
+                            })
+                            .optional(),
+                          selected: z
+                            .object({
+                              key: z.string(),
+                              score: z.number(),
+                              reason: z.array(z.string()).optional(),
+                            })
+                            .optional(),
+                          candidates: z.array(
+                            z.object({
+                              key: z.string(),
+                              score: z.number(),
+                              reason: z.array(z.string()).optional(),
+                            }),
+                          ),
+                        }),
+                      )
+                      .optional(),
+                  }),
+                ),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const state = await AppRuntime.runPromise(Session.Service.use((svc) => svc.getAutobest(sessionID)))
+        const enabled = await AppRuntime.runPromise(Session.Service.use((svc) => svc.getAutobestEnabled(sessionID)))
+        const log = await History.readByType(sessionID, "autobest.state")
+        const result = await History.last(sessionID, "autobest.result")
+        return c.json({
+          enabled,
+          active: state.active ?? null,
+          picks: state.picks,
+          log: log.flatMap((item) =>
+            item.log
+              ? [
+                  {
+                    ts: item.ts,
+                    changed: item.log.changed,
+                    ...(item.log.active ? { active: item.log.active } : {}),
+                    ...(item.log.selected ? { selected: item.log.selected } : {}),
+                    candidates: item.log.candidates,
+                  },
+                ]
+              : [],
+          ),
+          result: result
+            ? {
+                ts: result.ts,
+                ...(result.selected ? { selected: result.selected } : {}),
+                changed: result.changed,
+                candidates: result.candidates,
+              }
+            : null,
+        })
+      },
+    )
+    .post(
+      "/:sessionID/autobest",
+      describeRoute({
+        summary: "Apply session autobest",
+        description: "Persist a manual or auto autobest selection/candidate batch for a session.",
+        operationId: "session.autobest.apply",
+        responses: {
+          200: {
+            description: "Autobest decision",
+            content: {
+              "application/json": {
+                schema: resolver(
+                  z.object({
+                    active: z
+                      .object({
+                        key: z.string(),
+                        source: z.enum(["manual", "auto"]),
+                        score: z.number().optional(),
+                        ts: z.number(),
+                      })
+                      .nullable(),
+                    changed: z.boolean(),
+                    selected: z
+                      .object({
+                        key: z.string(),
+                        score: z.number(),
+                        reason: z.array(z.string()).optional(),
+                      })
+                      .nullable(),
+                    candidates: z.array(
+                      z.object({
+                        key: z.string(),
+                        score: z.number(),
+                        reason: z.array(z.string()).optional(),
+                      }),
+                    ),
+                  }),
+                ),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      validator(
+        "json",
+        z.union([
+          z.object({
+            key: z.string().min(1),
+            source: z.enum(["manual", "auto"]).optional(),
+            score: z.number().optional(),
+            ts: z.number().optional(),
+          }),
+          z.object({
+            candidates: z.array(
+              z.object({
+                key: z.string(),
+                score: z.number(),
+                reason: z.array(z.string()).optional(),
+              }),
+            ),
+            ts: z.number().optional(),
+          }),
+        ]),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const body = c.req.valid("json")
+        if ("key" in body) {
+          const state = await AppRuntime.runPromise(
+            Session.Service.use((svc) =>
+              svc.setAutobest({
+                sessionID,
+                key: body.key,
+                source: body.source,
+                score: body.score,
+                ts: body.ts,
+              }),
+            ),
+          )
+          return c.json({
+            active: state.active ?? null,
+            changed: true,
+            selected: null,
+            candidates: [],
+          })
+        }
+        const out = await AppRuntime.runPromise(
+          Session.Service.use((svc) =>
+            svc.applyAutobest({
+              sessionID,
+              candidates: body.candidates,
+              ts: body.ts,
+            }),
+          ),
+        )
+        return c.json({
+          active: out.decision.active ?? null,
+          changed: out.decision.changed,
+          selected: out.decision.selected ?? null,
+          candidates: out.decision.candidates,
+        })
+      },
+    )
+    .post(
+      "/:sessionID/autobest/enabled",
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      validator(
+        "json",
+        z.object({
+          enabled: z.boolean(),
+          ts: z.number().optional(),
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const body = c.req.valid("json")
+        const enabled = await AppRuntime.runPromise(
+          Session.Service.use((svc) => svc.setAutobestEnabled({ sessionID, enabled: body.enabled, ts: body.ts })),
+        )
+        return c.json({ enabled })
+      },
+    )
+    .post(
+      "/:sessionID/autobest/extract",
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      validator(
+        "json",
+        z.object({
+          candidates: z.array(
+            z.object({
+              key: z.string(),
+              score: z.number(),
+              reason: z.array(z.string()).optional(),
+            }),
+          ),
+          ts: z.number().optional(),
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const body = c.req.valid("json")
+        const out = await AppRuntime.runPromise(
+          Session.Service.use((svc) =>
+            svc.applyAutobest({
+              sessionID,
+              candidates: body.candidates,
+              ts: body.ts,
+            }),
+          ),
+        )
+        return c.json({
+          active: out.decision.active ?? null,
+          changed: out.decision.changed,
+          selected: out.decision.selected ?? null,
+          candidates: out.decision.candidates,
+          result: {
+            ts: out.decision.active?.ts ?? body.ts ?? Date.now(),
+            selected: out.decision.selected ?? null,
+            changed: out.decision.changed,
+            candidates: out.decision.candidates,
+          },
+        })
+      },
+    )
+    .delete(
+      "/:sessionID/timer/:id",
+      describeRoute({
+        summary: "Delete timer",
+        description: "Delete a managed timer.",
+        operationId: "session.timer.delete",
+        responses: {
+          200: {
+            description: "Delete result",
+            content: {
+              "application/json": {
+                schema: resolver(z.boolean()),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+          id: z.string().min(1),
+        }),
+      ),
+      async (c) => {
+        const param = c.req.valid("param")
+        const ok = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.delete(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        return c.json(ok)
       },
     )
     .get(

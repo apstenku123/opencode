@@ -111,8 +111,10 @@ export namespace CopilotModels {
     baseURL: string,
     headers: HeadersInit = {},
     existing: Record<string, Model> = {},
+    proxyUrl?: string,
   ): Promise<Record<string, Model>> {
-    const data = await fetch(`${baseURL}/models`, {
+    const target = proxyUrl ? new URL("/models", proxyUrl).href : `${baseURL}/models`
+    const data = await fetch(target, {
       headers,
       signal: AbortSignal.timeout(5_000),
     }).then(async (res) => {

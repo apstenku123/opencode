@@ -101,6 +101,7 @@ export default {
     api.kv.set(options.kv_key, "stored")
     const kv_after = api.kv.get(options.kv_key, "missing")
     const diff = api.state.session.diff(options.session_id)
+    const autobest = api.state.session.autobest(options.session_id)
     const todo = api.state.session.todo(options.session_id)
     const lsp = api.state.lsp()
     const mcp = api.state.mcp()
@@ -141,6 +142,7 @@ export default {
         kv_ready: api.kv.ready,
         diff_count: diff.length,
         diff_file: diff[0]?.file,
+        autobest_key: autobest?.selected?.key ?? autobest?.active?.key,
         todo_count: todo.length,
         todo_first: todo[0]?.content,
         lsp_count: lsp.length,

@@ -57,6 +57,9 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       session_diff: {
         [sessionID: string]: Snapshot.FileDiff[]
       }
+      session_autobest: {
+        [sessionID: string]: unknown
+      }
       todo: {
         [sessionID: string]: Todo[]
       }
@@ -94,6 +97,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       session: [],
       session_status: {},
       session_diff: {},
+      session_autobest: {},
       todo: {},
       message: {},
       part: {},
@@ -506,7 +510,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
               if (match.found) draft.session[match.index] = session.data!
               if (!match.found) draft.session.splice(match.index, 0, session.data!)
               draft.todo[sessionID] = todo.data ?? []
-              draft.message[sessionID] = messages.data!.map((x) => x.info)
+              draft.message[sessionID] = messages.data!.map((x: any) => x.info)
               for (const message of messages.data!) {
                 draft.part[message.info.id] = message.parts
               }
