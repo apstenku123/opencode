@@ -1,35 +1,35 @@
 import { describeRoute, resolver } from "hono-openapi"
-import { SessionID, MessageID } from "@/session/schema"
+import { MessageID } from "@/session/schema"
 import { Hono } from "hono"
+import type { UpgradeWebSocket } from "hono/ws"
 import { proxy } from "hono/proxy"
 import z from "zod"
 import { createHash } from "node:crypto"
-import { Log } from "../util/log"
-import { Format } from "../format"
-import { TuiRoutes } from "./routes/tui"
-import { Instance } from "../project/instance"
-import { Vcs } from "../project/vcs"
-import { Agent } from "../agent/agent"
-import { Skill } from "../skill"
-import { Global } from "../global"
-import { LSP } from "../lsp"
-import { Command } from "../command"
-import { Flag } from "../flag/flag"
-import { QuestionRoutes } from "./routes/question"
-import { PermissionRoutes } from "./routes/permission"
-import { ProjectRoutes } from "./routes/project"
-import { SessionRoutes } from "./routes/session"
-import { PtyRoutes } from "./routes/pty"
-import { McpRoutes } from "./routes/mcp"
-import { FileRoutes } from "./routes/file"
-import { ConfigRoutes } from "./routes/config"
-import { ExperimentalRoutes } from "./routes/experimental"
-import { ProviderRoutes } from "./routes/provider"
-import { EventRoutes } from "./routes/event"
-import { errorHandler } from "./middleware"
-import { Session } from "../session"
-import { MessageV2 } from "../session/message-v2"
-import { SessionPrompt } from "../session/prompt"
+import { Log } from "../../util"
+import { Format } from "../../format"
+import { TuiRoutes } from "./tui"
+import { Instance } from "../../project/instance"
+import * as Vcs from "../../project/vcs"
+import { Agent } from "../../agent/agent"
+import { Skill } from "../../skill"
+import { Global } from "../../global"
+import { LSP } from "../../lsp"
+import { Command } from "../../command"
+import { Flag } from "../../flag/flag"
+import { QuestionRoutes } from "./question"
+import { PermissionRoutes } from "./permission"
+import { ProjectRoutes } from "./project"
+import { SessionRoutes } from "./session"
+import { PtyRoutes } from "./pty"
+import { McpRoutes } from "./mcp"
+import { FileRoutes } from "./file"
+import { ConfigRoutes } from "./config"
+import { ExperimentalRoutes } from "./experimental"
+import { ProviderRoutes } from "./provider"
+import { EventRoutes } from "./event"
+import { ThreadRoutes, TurnRoutes } from "./thread"
+import { ErrorMiddleware } from "../middleware"
+import { MessageV2 } from "../../session/message-v2"
 
 const log = Log.create({ service: "server" })
 
@@ -44,76 +44,13 @@ const DEFAULT_CSP =
 const csp = (hash = "") =>
   `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'${hash ? ` 'sha256-${hash}'` : ""}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' data:`
 
-export const InstanceRoutes = (app?: Hono) =>
-  (app ?? new Hono())
-    .onError(errorHandler(log))
-    .get("/thread", async (c) => {
-      const sessions: Session.Info[] = []
-      for await (const session of Session.list()) sessions.push(session)
-      return c.json(sessions)
-    })
-    .get("/thread/:threadID", async (c) => {
-      const threadID = SessionID.zod.parse(c.req.param("threadID"))
-      return c.json(await Session.get(threadID))
-    })
-    .post("/thread/start", async (c) => {
-      const body = await c.req.json().catch(() => ({}))
-      return c.json(await Session.create(body ?? {}))
-    })
-    .post("/thread/:threadID/fork", async (c) => {
-      const threadID = SessionID.zod.parse(c.req.param("threadID"))
-      const body = await c.req.json().catch(() => ({}))
-      return c.json(await Session.fork({ ...body, sessionID: threadID }))
-    })
-    .post("/thread/:threadID/setName", async (c) => {
-      const threadID = SessionID.zod.parse(c.req.param("threadID"))
-      const body = await c.req.json()
-      await Session.setTitle({ sessionID: threadID, title: z.object({ name: z.string() }).parse(body).name })
-      return c.json(await Session.get(threadID))
-    })
-    .post("/thread/:threadID/archive", async (c) => {
-      const threadID = SessionID.zod.parse(c.req.param("threadID"))
-      await Session.setArchived({ sessionID: threadID, time: Date.now() })
-      return c.json(await Session.get(threadID))
-    })
-    .post("/thread/:threadID/unarchive", async (c) => {
-      const threadID = SessionID.zod.parse(c.req.param("threadID"))
-      await Session.setArchived({ sessionID: threadID, time: null as any })
-      return c.json(await Session.get(threadID))
-    })
-    .post("/turn/start", async (c) => {
-      const body = await c.req.json()
-      const input = z
-        .object({
-          threadID: SessionID.zod,
-          parts: z.array(z.object({ type: z.literal("text"), text: z.string() })).default([]),
-          outputSchema: z.record(z.string(), z.any()).optional(),
-        })
-        .parse(body)
-      const msg = await SessionPrompt.prompt({
-        sessionID: input.threadID,
-        parts: input.parts,
-        format: input.outputSchema ? { type: "json_schema", schema: input.outputSchema, retryCount: 2 } : undefined,
-      })
-      return c.json(msg)
-    })
-    .post("/turn/interrupt", async (c) => {
-      const body = await c.req.json()
-      const input = z.object({ threadID: SessionID.zod }).parse(body)
-      await SessionPrompt.cancel(input.threadID)
-      return c.json(true)
-    })
-    .post("/turn/steer", async (c) => {
-      const body = await c.req.json()
-      const input = z.object({ threadID: SessionID.zod, prompt: z.string() }).parse(body)
-      const msg = await SessionPrompt.prompt({
-        sessionID: input.threadID,
-        parts: [{ type: "text", text: input.prompt }],
-      })
-      return c.json(msg)
-    })
+export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
+  new Hono()
+    .onError(ErrorMiddleware)
+    .route("/thread", ThreadRoutes())
+    .route("/turn", TurnRoutes())
     .route("/project", ProjectRoutes())
-    .route("/pty", PtyRoutes())
+    .route("/pty", PtyRoutes(_upgrade))
     .route("/config", ConfigRoutes())
     .route("/experimental", ExperimentalRoutes())
     .route("/session", SessionRoutes())
