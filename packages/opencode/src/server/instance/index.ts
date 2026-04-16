@@ -1,58 +1,125 @@
-import { describeRoute, resolver, validator } from "hono-openapi"
+import { describeRoute, resolver } from "hono-openapi"
+import { SessionID, MessageID } from "@/session/schema"
 import { Hono } from "hono"
-import type { UpgradeWebSocket } from "hono/ws"
-import { Effect } from "effect"
+import { proxy } from "hono/proxy"
 import z from "zod"
-import { Format } from "../../format"
-import { TuiRoutes } from "./tui"
-import { Instance } from "../../project/instance"
-import { Vcs } from "../../project"
-import { Agent } from "../../agent/agent"
-import { Skill } from "../../skill"
-import { Global } from "../../global"
-import { LSP } from "../../lsp"
-import { Command } from "../../command"
-import { QuestionRoutes } from "./question"
-import { PermissionRoutes } from "./permission"
-import { Flag } from "@/flag/flag"
-import { ExperimentalHttpApiServer } from "./httpapi/server"
-import { ProjectRoutes } from "./project"
-import { SessionRoutes } from "./session"
-import { PtyRoutes } from "./pty"
-import { McpRoutes } from "./mcp"
-import { FileRoutes } from "./file"
-import { ConfigRoutes } from "./config"
-import { ExperimentalRoutes } from "./experimental"
-import { ProviderRoutes } from "./provider"
-import { EventRoutes } from "./event"
-import { SyncRoutes } from "./sync"
-import { WorkspaceRouterMiddleware } from "./middleware"
-import { AppRuntime } from "@/effect/app-runtime"
+import { createHash } from "node:crypto"
+import { Log } from "../util/log"
+import { Format } from "../format"
+import { TuiRoutes } from "./routes/tui"
+import { Instance } from "../project/instance"
+import { Vcs } from "../project/vcs"
+import { Agent } from "../agent/agent"
+import { Skill } from "../skill"
+import { Global } from "../global"
+import { LSP } from "../lsp"
+import { Command } from "../command"
+import { Flag } from "../flag/flag"
+import { QuestionRoutes } from "./routes/question"
+import { PermissionRoutes } from "./routes/permission"
+import { ProjectRoutes } from "./routes/project"
+import { SessionRoutes } from "./routes/session"
+import { PtyRoutes } from "./routes/pty"
+import { McpRoutes } from "./routes/mcp"
+import { FileRoutes } from "./routes/file"
+import { ConfigRoutes } from "./routes/config"
+import { ExperimentalRoutes } from "./routes/experimental"
+import { ProviderRoutes } from "./routes/provider"
+import { EventRoutes } from "./routes/event"
+import { errorHandler } from "./middleware"
+import { Session } from "../session"
+import { MessageV2 } from "../session/message-v2"
+import { SessionPrompt } from "../session/prompt"
 
-export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono => {
-  const app = new Hono()
-    .use(WorkspaceRouterMiddleware(upgrade))
+const log = Log.create({ service: "server" })
+
+const embeddedUIPromise = Flag.OPENCODE_DISABLE_EMBEDDED_WEB_UI
+  ? Promise.resolve(null)
+  : // @ts-expect-error - generated file at build time
+    import("opencode-web-ui.gen.ts").then((module) => module.default as Record<string, string>).catch(() => null)
+
+const DEFAULT_CSP =
+  "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' data:"
+
+const csp = (hash = "") =>
+  `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'${hash ? ` 'sha256-${hash}'` : ""}; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; media-src 'self' data:; connect-src 'self' data:`
+
+export const InstanceRoutes = (app?: Hono) =>
+  (app ?? new Hono())
+    .onError(errorHandler(log))
+    .get("/thread", async (c) => {
+      const sessions: Session.Info[] = []
+      for await (const session of Session.list()) sessions.push(session)
+      return c.json(sessions)
+    })
+    .get("/thread/:threadID", async (c) => {
+      const threadID = SessionID.zod.parse(c.req.param("threadID"))
+      return c.json(await Session.get(threadID))
+    })
+    .post("/thread/start", async (c) => {
+      const body = await c.req.json().catch(() => ({}))
+      return c.json(await Session.create(body ?? {}))
+    })
+    .post("/thread/:threadID/fork", async (c) => {
+      const threadID = SessionID.zod.parse(c.req.param("threadID"))
+      const body = await c.req.json().catch(() => ({}))
+      return c.json(await Session.fork({ ...body, sessionID: threadID }))
+    })
+    .post("/thread/:threadID/setName", async (c) => {
+      const threadID = SessionID.zod.parse(c.req.param("threadID"))
+      const body = await c.req.json()
+      await Session.setTitle({ sessionID: threadID, title: z.object({ name: z.string() }).parse(body).name })
+      return c.json(await Session.get(threadID))
+    })
+    .post("/thread/:threadID/archive", async (c) => {
+      const threadID = SessionID.zod.parse(c.req.param("threadID"))
+      await Session.setArchived({ sessionID: threadID, time: Date.now() })
+      return c.json(await Session.get(threadID))
+    })
+    .post("/thread/:threadID/unarchive", async (c) => {
+      const threadID = SessionID.zod.parse(c.req.param("threadID"))
+      await Session.setArchived({ sessionID: threadID, time: null as any })
+      return c.json(await Session.get(threadID))
+    })
+    .post("/turn/start", async (c) => {
+      const body = await c.req.json()
+      const input = z
+        .object({
+          threadID: SessionID.zod,
+          parts: z.array(z.object({ type: z.literal("text"), text: z.string() })).default([]),
+          outputSchema: z.record(z.string(), z.any()).optional(),
+        })
+        .parse(body)
+      const msg = await SessionPrompt.prompt({
+        sessionID: input.threadID,
+        parts: input.parts,
+        format: input.outputSchema ? { type: "json_schema", schema: input.outputSchema, retryCount: 2 } : undefined,
+      })
+      return c.json(msg)
+    })
+    .post("/turn/interrupt", async (c) => {
+      const body = await c.req.json()
+      const input = z.object({ threadID: SessionID.zod }).parse(body)
+      await SessionPrompt.cancel(input.threadID)
+      return c.json(true)
+    })
+    .post("/turn/steer", async (c) => {
+      const body = await c.req.json()
+      const input = z.object({ threadID: SessionID.zod, prompt: z.string() }).parse(body)
+      const msg = await SessionPrompt.prompt({
+        sessionID: input.threadID,
+        parts: [{ type: "text", text: input.prompt }],
+      })
+      return c.json(msg)
+    })
     .route("/project", ProjectRoutes())
-    .route("/pty", PtyRoutes(upgrade))
+    .route("/pty", PtyRoutes())
     .route("/config", ConfigRoutes())
     .route("/experimental", ExperimentalRoutes())
     .route("/session", SessionRoutes())
     .route("/permission", PermissionRoutes())
-
-  if (Flag.OPENCODE_EXPERIMENTAL_HTTPAPI) {
-    const handler = ExperimentalHttpApiServer.webHandler().handler
-    app
-      .all("/question", (c) => handler(c.req.raw))
-      .all("/question/*", (c) => handler(c.req.raw))
-      .all("/permission", (c) => handler(c.req.raw))
-      .all("/permission/*", (c) => handler(c.req.raw))
-      .all("/provider/auth", (c) => handler(c.req.raw))
-  }
-
-  return app
     .route("/question", QuestionRoutes())
     .route("/provider", ProviderRoutes())
-    .route("/sync", SyncRoutes())
     .route("/", FileRoutes())
     .route("/", EventRoutes())
     .route("/mcp", McpRoutes())
@@ -136,51 +203,10 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono => {
         },
       }),
       async (c) => {
-        return c.json(
-          await AppRuntime.runPromise(
-            Effect.gen(function* () {
-              const vcs = yield* Vcs.Service
-              const [branch, default_branch] = yield* Effect.all([vcs.branch(), vcs.defaultBranch()], {
-                concurrency: 2,
-              })
-              return { branch, default_branch }
-            }),
-          ),
-        )
-      },
-    )
-    .get(
-      "/vcs/diff",
-      describeRoute({
-        summary: "Get VCS diff",
-        description: "Retrieve the current git diff for the working tree or against the default branch.",
-        operationId: "vcs.diff",
-        responses: {
-          200: {
-            description: "VCS diff",
-            content: {
-              "application/json": {
-                schema: resolver(Vcs.FileDiff.array()),
-              },
-            },
-          },
-        },
-      }),
-      validator(
-        "query",
-        z.object({
-          mode: Vcs.Mode,
-        }),
-      ),
-      async (c) => {
-        return c.json(
-          await AppRuntime.runPromise(
-            Effect.gen(function* () {
-              const vcs = yield* Vcs.Service
-              return yield* vcs.diff(c.req.valid("query").mode)
-            }),
-          ),
-        )
+        const branch = await Vcs.branch()
+        return c.json({
+          branch,
+        })
       },
     )
     .get(
@@ -201,7 +227,7 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono => {
         },
       }),
       async (c) => {
-        const commands = await AppRuntime.runPromise(Command.Service.use((svc) => svc.list()))
+        const commands = await Command.list()
         return c.json(commands)
       },
     )
@@ -223,7 +249,7 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono => {
         },
       }),
       async (c) => {
-        const modes = await AppRuntime.runPromise(Agent.Service.use((svc) => svc.list()))
+        const modes = await Agent.list()
         return c.json(modes)
       },
     )
@@ -245,12 +271,7 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono => {
         },
       }),
       async (c) => {
-        const skills = await AppRuntime.runPromise(
-          Effect.gen(function* () {
-            const skill = yield* Skill.Service
-            return yield* skill.all()
-          }),
-        )
+        const skills = await Skill.all()
         return c.json(skills)
       },
     )
@@ -272,8 +293,7 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono => {
         },
       }),
       async (c) => {
-        const items = await AppRuntime.runPromise(LSP.Service.use((lsp) => lsp.status()))
-        return c.json(items)
+        return c.json(await LSP.status())
       },
     )
     .get(
@@ -294,7 +314,41 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono => {
         },
       }),
       async (c) => {
-        return c.json(await AppRuntime.runPromise(Format.Service.use((svc) => svc.status())))
+        return c.json(await Format.status())
       },
     )
-}
+    .all("/*", async (c) => {
+      const embeddedWebUI = await embeddedUIPromise
+      const path = c.req.path
+
+      if (embeddedWebUI) {
+        const match = embeddedWebUI[path.replace(/^\//, "")] ?? embeddedWebUI["index.html"] ?? null
+        if (!match) return c.json({ error: "Not Found" }, 404)
+        const file = Bun.file(match)
+        if (await file.exists()) {
+          c.header("Content-Type", file.type)
+          if (file.type.startsWith("text/html")) {
+            c.header("Content-Security-Policy", DEFAULT_CSP)
+          }
+          return c.body(await file.arrayBuffer())
+        } else {
+          return c.json({ error: "Not Found" }, 404)
+        }
+      } else {
+        const response = await proxy(`https://app.opencode.ai${path}`, {
+          ...c.req,
+          headers: {
+            ...c.req.raw.headers,
+            host: "app.opencode.ai",
+          },
+        })
+        const match = response.headers.get("content-type")?.includes("text/html")
+          ? (await response.clone().text()).match(
+              /<script\b(?![^>]*\bsrc\s*=)[^>]*\bid=(['"])oc-theme-preload-script\1[^>]*>([\s\S]*?)<\/script>/i,
+            )
+          : undefined
+        const hash = match ? createHash("sha256").update(match[2]).digest("base64") : ""
+        response.headers.set("Content-Security-Policy", csp(hash))
+        return response
+      }
+    })
