@@ -3,8 +3,8 @@ import { Installation } from "@/installation"
 import { Auth } from "@/auth"
 import { iife } from "@/util/iife"
 import { setTimeout as sleep } from "node:timers/promises"
-import { getCopilotSessionId, getCopilotMachineId } from "./copilot-ids"
-import { CopilotConnectionManager, type ResolvedConnection } from "./copilot-connections"
+import { getCopilotSessionId, getCopilotMachineId } from "../copilot-ids"
+import { CopilotConnectionManager, type ResolvedConnection } from "../copilot-connections"
 
 const CLIENT_ID = "Ov23ctDVkRmgkPke0Mmm"
 // Add a small safety buffer when polling to avoid hitting the server

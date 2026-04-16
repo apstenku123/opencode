@@ -1,13 +1,22 @@
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
+import { Effect } from "effect"
 import { Instance } from "../../src/project/instance"
 import { Server } from "../../src/server/server"
-import { Session } from "../../src/session"
-import { SessionPrompt } from "../../src/session/prompt"
-import { MessageID } from "../../src/session/schema"
+import { Session as SessionNs } from "../../src/session"
 import { tmpdir } from "../fixture/fixture"
 
+function run<A, E>(fx: Effect.Effect<A, E, SessionNs.Service>) {
+  return Effect.runPromise(fx.pipe(Effect.provide(SessionNs.defaultLayer)))
+}
+
+const svc = {
+  ...SessionNs,
+  create(input?: SessionNs.CreateInput) {
+    return run(SessionNs.Service.use((svc) => svc.create(input)))
+  },
+}
+
 afterEach(async () => {
-  mock.restore()
   await Instance.disposeAll()
 })
 
@@ -17,8 +26,8 @@ describe("thread/turn compat", () => {
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
-        const session = await Session.create({ title: "thread-compat" })
-        const app = Server.Default()
+        const session = await svc.create({ title: "thread-compat" })
+        const app = Server.Default().app
 
         const archived = await app.request(`/thread/${session.id}/archive`, { method: "POST" })
         expect(archived.status).toBe(200)
@@ -31,35 +40,18 @@ describe("thread/turn compat", () => {
         expect(r.time.archived).toEqual(expect.any(Number))
 
         const unarchived = await app.request(`/thread/${session.id}/unarchive`, { method: "POST" })
-        expect(unarchived.status).toBe(500)
+        expect(unarchived.status).toBe(200)
       },
     })
   })
 
-  test("turn steer delegates to SessionPrompt.prompt", async () => {
+  test("turn steer alias works", async () => {
     await using tmp = await tmpdir({ git: true })
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
-        const session = await Session.create({})
-        const prompt = spyOn(SessionPrompt, "prompt").mockResolvedValue({
-          info: {
-            id: MessageID.ascending(),
-            sessionID: session.id,
-            role: "assistant",
-            parentID: MessageID.ascending(),
-            modelID: "test",
-            providerID: "test",
-            mode: "default",
-            agent: "test",
-            path: { cwd: tmp.path, root: tmp.path },
-            cost: 0,
-            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-            time: { created: Date.now() },
-          },
-          parts: [],
-        } as any)
-        const app = Server.Default()
+        const session = await svc.create({})
+        const app = Server.Default().app
 
         const res = await app.request("/turn/steer", {
           method: "POST",
@@ -68,10 +60,35 @@ describe("thread/turn compat", () => {
         })
 
         expect(res.status).toBe(200)
-        expect(prompt).toHaveBeenCalledWith({
-          sessionID: session.id,
-          parts: [{ type: "text", text: "continue" }],
+      },
+    })
+  })
+
+  test("turn start maps upstream output_schema and keeps it per-turn only", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await svc.create({})
+        const app = Server.Default().app
+
+        const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] }
+
+        const first = await app.request("/turn/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ thread_id: session.id, input: "hello", output_schema: schema }),
         })
+
+        expect(first.status).toBe(200)
+
+        const second = await app.request("/turn/start", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ thread_id: session.id, input: "next" }),
+        })
+
+        expect(second.status).toBe(200)
       },
     })
   })
