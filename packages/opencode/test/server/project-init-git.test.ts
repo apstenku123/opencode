@@ -29,45 +29,56 @@ describe("project.initGit endpoint", () => {
     GlobalBus.on("event", fn)
 
     try {
-      const init = await app.request("/project/git/init", {
-        method: "POST",
-        headers: {
-          "x-opencode-directory": tmp.path,
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const init = await app.request("/project/git/init", {
+            method: "POST",
+            headers: {
+              "x-opencode-directory": tmp.path,
+            },
+          })
+          const body = await init.json()
+          expect(init.status).toBe(200)
+          expect(body).toMatchObject({
+            id: "global",
+            vcs: "git",
+            worktree: tmp.path,
+          })
+          expect(reloadSpy).toHaveBeenCalledTimes(1)
+          expect(seen.some((evt) => evt.directory === tmp.path && evt.payload.type === "server.instance.disposed")).toBe(
+            true,
+          )
+          expect(await Filesystem.exists(path.join(tmp.path, ".git", "opencode"))).toBe(false)
         },
       })
-      const body = await init.json()
-      expect(init.status).toBe(200)
-      expect(body).toMatchObject({
-        id: "global",
-        vcs: "git",
-        worktree: tmp.path,
-      })
-      expect(reloadSpy).toHaveBeenCalledTimes(1)
-      expect(seen.some((evt) => evt.directory === tmp.path && evt.payload.type === "server.instance.disposed")).toBe(
-        true,
-      )
-      expect(await Filesystem.exists(path.join(tmp.path, ".git", "opencode"))).toBe(false)
 
-      const current = await app.request("/project/current", {
-        headers: {
-          "x-opencode-directory": tmp.path,
+      // Re-enter Instance.provide so ALS picks up the post-reload cached context.
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const current = await app.request("/project/current", {
+            headers: {
+              "x-opencode-directory": tmp.path,
+            },
+          })
+          expect(current.status).toBe(200)
+          expect(await current.json()).toMatchObject({
+            id: "global",
+            vcs: "git",
+            worktree: tmp.path,
+          })
+
+          expect(
+            await Effect.runPromise(
+              Snapshot.Service.use((svc) => svc.track()).pipe(
+                provideInstance(tmp.path),
+                Effect.provide(Snapshot.defaultLayer),
+              ),
+            ),
+          ).toBeTruthy()
         },
       })
-      expect(current.status).toBe(200)
-      expect(await current.json()).toMatchObject({
-        id: "global",
-        vcs: "git",
-        worktree: tmp.path,
-      })
-
-      expect(
-        await Effect.runPromise(
-          Snapshot.Service.use((svc) => svc.track()).pipe(
-            provideInstance(tmp.path),
-            Effect.provide(Snapshot.defaultLayer),
-          ),
-        ),
-      ).toBeTruthy()
     } finally {
       await Instance.disposeAll()
       reloadSpy.mockRestore()
@@ -87,31 +98,36 @@ describe("project.initGit endpoint", () => {
     GlobalBus.on("event", fn)
 
     try {
-      const init = await app.request("/project/git/init", {
-        method: "POST",
-        headers: {
-          "x-opencode-directory": tmp.path,
-        },
-      })
-      expect(init.status).toBe(200)
-      expect(await init.json()).toMatchObject({
-        vcs: "git",
-        worktree: tmp.path,
-      })
-      expect(
-        seen.filter((evt) => evt.directory === tmp.path && evt.payload.type === "server.instance.disposed").length,
-      ).toBe(0)
-      expect(reloadSpy).toHaveBeenCalledTimes(0)
+      await Instance.provide({
+        directory: tmp.path,
+        fn: async () => {
+          const init = await app.request("/project/git/init", {
+            method: "POST",
+            headers: {
+              "x-opencode-directory": tmp.path,
+            },
+          })
+          expect(init.status).toBe(200)
+          expect(await init.json()).toMatchObject({
+            vcs: "git",
+            worktree: tmp.path,
+          })
+          expect(
+            seen.filter((evt) => evt.directory === tmp.path && evt.payload.type === "server.instance.disposed").length,
+          ).toBe(0)
+          expect(reloadSpy).toHaveBeenCalledTimes(0)
 
-      const current = await app.request("/project/current", {
-        headers: {
-          "x-opencode-directory": tmp.path,
+          const current = await app.request("/project/current", {
+            headers: {
+              "x-opencode-directory": tmp.path,
+            },
+          })
+          expect(current.status).toBe(200)
+          expect(await current.json()).toMatchObject({
+            vcs: "git",
+            worktree: tmp.path,
+          })
         },
-      })
-      expect(current.status).toBe(200)
-      expect(await current.json()).toMatchObject({
-        vcs: "git",
-        worktree: tmp.path,
       })
     } finally {
       await Instance.disposeAll()
