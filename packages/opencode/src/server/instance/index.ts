@@ -51,8 +51,6 @@ const csp = (hash = "") =>
 export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
   new Hono()
     .onError(ErrorMiddleware)
-    .route("/thread", ThreadRoutes())
-    .route("/turn", TurnRoutes())
     .route("/project", ProjectRoutes())
     .route("/pty", PtyRoutes(_upgrade))
     .route("/config", ConfigRoutes())
@@ -60,7 +58,6 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
     .route("/session", SessionRoutes())
     .route("/thread", ThreadRoutes())
     .route("/turn", TurnRoutes())
-
     .route("/permission", PermissionRoutes())
     .route("/question", QuestionRoutes())
     .route("/provider", ProviderRoutes())

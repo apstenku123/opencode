@@ -13,7 +13,7 @@ import { Instance } from "../../project/instance"
 import type { Hooks } from "@opencode-ai/plugin"
 import * as Process from "../../util/process"
 import { text } from "node:stream/consumers"
-import { fetchCopilotQuota, formatQuotaBar } from "../../plugin/copilot-quota"
+import { fetchQuota as fetchCopilotQuota, formatQuotaBar } from "../../plugin/github-copilot/quota"
 import { AppRuntime } from "@/effect/app-runtime"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
