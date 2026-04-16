@@ -408,6 +408,13 @@ export function emptyDiscovery(): AccountDiscoveryJSON {
   }
 }
 
+export function resolveMigrationSummary(hasExistingAccounts: boolean): ReturnType<typeof summarizeMigration> {
+  const recorded = CopilotRuntimeState.migrationSummary()
+  if (recorded && (recorded.migrated > 0 || recorded.skipped || recorded.source)) return recorded
+  if (hasExistingAccounts) return summarizeMigration({ version: 1, keys: [], skipped: true })
+  return recorded ?? summarizeMigration({ version: 1, keys: [] })
+}
+
 export function jsonMigration(input: ReturnType<typeof summarizeMigration> | undefined | null): MigrationJSON {
   const item = input ?? {
     migrated: 0,
@@ -1025,7 +1032,7 @@ export const ProvidersQuotaCommand = cmd({
     prompts.intro("GitHub Copilot Quota")
 
     const { accounts, items } = await loadAccountStatuses()
-    const migration = CopilotRuntimeState.migrationSummary() ?? summarizeMigration({ version: 1, keys: [] })
+    const migration = resolveMigrationSummary(accounts.length > 0)
 
     if (accounts.length === 0) {
       prompts.log.error("No GitHub Copilot accounts configured. Run: opencode providers login")
@@ -1072,7 +1079,7 @@ export const ProvidersAccountsCommand = cmd({
     UI.empty()
     prompts.intro("GitHub Copilot Accounts")
     const { accounts, items } = await loadAccountStatuses()
-    const migration = CopilotRuntimeState.migrationSummary() ?? summarizeMigration({ version: 1, keys: [] })
+    const migration = resolveMigrationSummary(accounts.length > 0)
     if (accounts.length === 0) {
       prompts.log.error("No GitHub Copilot accounts configured. Run: opencode providers login")
       prompts.outro("Done")

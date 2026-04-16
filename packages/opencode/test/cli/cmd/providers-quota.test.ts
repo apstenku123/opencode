@@ -313,78 +313,81 @@ test("accountStatus/jsonStatus expose penalties and route debug", () => {
 })
 
 test("ProvidersRouteDebugCommand emits json candidate list", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () =>
-    Promise.resolve({
-      "github-copilot#enterprise": { type: "oauth", refresh: "a" },
-      "github-copilot#free": { type: "oauth", refresh: "b" },
-    } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({ model: "gpt-5-enterprise", json: true } as never)
+    await withAuth(
+      {
+        "github-copilot#enterprise": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }),
+        "github-copilot#free": new Auth.Oauth({ type: "oauth", refresh: "b", access: "", expires: 0 }),
+      },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({ model: "gpt-5-enterprise", json: true } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(data.schemaVersion).toBe(ACCOUNT_STATUS_SCHEMA_VERSION)
     expect(data.model).toBe("gpt-5-enterprise")
     expect(Array.isArray(data.candidates)).toBe(true)
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
 
 test("ProvidersRouteDebugCommand supports account filter in json mode", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () =>
-    Promise.resolve({
-      "github-copilot#enterprise": { type: "oauth", refresh: "a" },
-      "github-copilot#free": { type: "oauth", refresh: "b" },
-    } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({
-      model: "gpt-5-enterprise",
-      account: "github-copilot#free",
-      json: true,
-    } as never)
+    await withAuth(
+      {
+        "github-copilot#enterprise": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }),
+        "github-copilot#free": new Auth.Oauth({ type: "oauth", refresh: "b", access: "", expires: 0 }),
+      },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({
+          model: "gpt-5-enterprise",
+          account: "github-copilot#free",
+          json: true,
+        } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(data.account).toBe("github-copilot#free")
     expect(data.candidates.every((x: any) => x.key === "github-copilot#free")).toBe(true)
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
 
 test("ProvidersRouteDebugCommand supports all-models in json mode", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () => Promise.resolve({ "github-copilot": { type: "oauth", refresh: "a" } } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({ allModels: true, json: true } as never)
+    await withAuth(
+      {
+        "github-copilot": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }),
+      },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({ allModels: true, json: true } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(data.schemaVersion).toBe(ACCOUNT_STATUS_SCHEMA_VERSION)
     expect(Array.isArray(data.models)).toBe(true)
     expect(data.models.length).toBeGreaterThan(1)
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
@@ -417,25 +420,26 @@ test("ProvidersRouteDebugCommand supports all-accounts with all-models in json m
 })
 
 test("ProvidersRouteDebugCommand all-models json exposes summary and provider path", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () =>
-    Promise.resolve({
-      "github-copilot#enterprise": { type: "oauth", refresh: "a" },
-      "github-copilot#free": { type: "oauth", refresh: "b" },
-    } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({
-      provider: "github-copilot#enterprise",
-      allModels: true,
-      json: true,
-    } as never)
+    await withAuth(
+      {
+        "github-copilot#enterprise": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }),
+        "github-copilot#free": new Auth.Oauth({ type: "oauth", refresh: "b", access: "", expires: 0 }),
+      },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({
+          provider: "github-copilot#enterprise",
+          allModels: true,
+          json: true,
+        } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(typeof data.summary.selectedCount).toBe("number")
     expect(data.summary.selectedCount).toBeGreaterThanOrEqual(0)
@@ -462,32 +466,32 @@ test("ProvidersRouteDebugCommand all-models json exposes summary and provider pa
     expect(typeof data.summary.byModel).toBe("object")
     expect(data.models.every((x: any) => x.providerID === "github-copilot#enterprise")).toBe(true)
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
 
 test("ProvidersRouteDebugCommand supports summary-only json mode", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () =>
-    Promise.resolve({
-      "github-copilot#enterprise": { type: "oauth", refresh: "a" },
-      "github-copilot#free": { type: "oauth", refresh: "b" },
-    } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({
-      provider: "github-copilot#enterprise",
-      allModels: true,
-      summaryOnly: true,
-      json: true,
-    } as never)
+    await withAuth(
+      {
+        "github-copilot#enterprise": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }),
+        "github-copilot#free": new Auth.Oauth({ type: "oauth", refresh: "b", access: "", expires: 0 }),
+      },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({
+          provider: "github-copilot#enterprise",
+          allModels: true,
+          summaryOnly: true,
+          json: true,
+        } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(data.schemaVersion).toBe(ACCOUNT_STATUS_SCHEMA_VERSION)
     expect(data.models).toBeUndefined()
@@ -504,23 +508,24 @@ test("ProvidersRouteDebugCommand supports summary-only json mode", async () => {
     expect(typeof data.summary.rejectedByDiscovery).toBe("number")
     expect(typeof data.summary.byModel).toBe("object")
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
 
 test("route summary exposes selectedRate, winRate and byModel aggregates", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () => Promise.resolve({ "github-copilot": { type: "oauth", refresh: "a" } } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({ allModels: true, summaryOnly: true, json: true } as never)
+    await withAuth(
+      { "github-copilot": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }) },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({ allModels: true, summaryOnly: true, json: true } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(typeof data.summary.modelCount).toBe("number")
     expect(typeof data.summary.selectedRate).toBe("number")
@@ -536,45 +541,47 @@ test("route summary exposes selectedRate, winRate and byModel aggregates", async
     expect(keys.length).toBeGreaterThan(1)
     expect(data.summary.byModel[keys[0]].selected).not.toBeUndefined()
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
 
 test("route summary exposes byAccount and modelCount", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () => Promise.resolve({ "github-copilot": { type: "oauth", refresh: "a" } } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({ allModels: true, summaryOnly: true, json: true } as never)
+    await withAuth(
+      { "github-copilot": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }) },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({ allModels: true, summaryOnly: true, json: true } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(typeof data.summary.modelCount).toBe("number")
     expect(data.summary.modelCount).toBeGreaterThan(1)
     expect(typeof data.summary.byAccount).toBe("object")
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
 
 test("route summary exposes byProviderAlias and top winner fields", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () => Promise.resolve({ "github-copilot": { type: "oauth", refresh: "a" } } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({ allModels: true, summaryOnly: true, json: true } as never)
+    await withAuth(
+      { "github-copilot": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }) },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({ allModels: true, summaryOnly: true, json: true } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(typeof data.summary.byProviderAlias).toBe("object")
     expect(["string", "object"]).toContain(typeof data.summary.topWinner)
@@ -582,46 +589,43 @@ test("route summary exposes byProviderAlias and top winner fields", async () => 
     expect(["string", "object"]).toContain(typeof data.summary.topLoser)
     expect(typeof data.summary.rejectionRate).toBe("number")
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
 
 test("route summary exposes topLoser, rejectionRate and winnerReason", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
   const prevWrite = process.stdout.write
   const out: Array<string | Uint8Array> = []
-  ;(Auth as any).all = () =>
-    Promise.resolve({
-      "github-copilot#enterprise": { type: "oauth", refresh: "a" },
-      "github-copilot#free": { type: "oauth", refresh: "b" },
-    } as never) as never
   process.stdout.write = ((chunk: string | Uint8Array) => {
     out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
     return true
   }) as never
   try {
-    await ProvidersRouteDebugCommand.handler({ allModels: true, json: true } as never)
+    await withAuth(
+      {
+        "github-copilot#enterprise": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }),
+        "github-copilot#free": new Auth.Oauth({ type: "oauth", refresh: "b", access: "", expires: 0 }),
+      },
+      async () => {
+        await ProvidersRouteDebugCommand.handler({ allModels: true, json: true } as never)
+      },
+    )
     const data = JSON.parse(out.join(""))
     expect(["string", "object"]).toContain(typeof data.summary.topLoser)
     expect(typeof data.summary.rejectionRate).toBe("number")
     const first = Object.keys(data.summary.byModel)[0]
     expect(Array.isArray(data.summary.byModel[first].winnerReason)).toBe(true)
   } finally {
-    (Auth as any).all = prevAll
     process.stdout.write = prevWrite
   }
 })
 test("ProvidersRouteDebugCommand text mode runs without error", async () => {
-  const { Auth } = await import("@/auth")
-  const prevAll = (Auth as any).all
-  ;(Auth as any).all = () => Promise.resolve({ "github-copilot": { type: "oauth", refresh: "a" } } as never) as never
-  try {
-    await expect(ProvidersRouteDebugCommand.handler({ model: "gpt-5-mini" } as never)).resolves.toBeUndefined()
-  } finally {
-    (Auth as any).all = prevAll
-  }
+  await withAuth(
+    { "github-copilot": new Auth.Oauth({ type: "oauth", refresh: "a", access: "", expires: 0 }) },
+    async () => {
+      await expect(ProvidersRouteDebugCommand.handler({ model: "gpt-5-mini" } as never)).resolves.toBeUndefined()
+    },
+  )
 })
 test("ProvidersQuotaCommand emits json account overview", async () => {
   const prevFetch = globalThis.fetch
