@@ -32,6 +32,7 @@ import { ErrorMiddleware } from "../middleware"
 import { MessageV2 } from "../../session/message-v2"
 import { SyncRoutes } from "./sync"
 import { AppRuntime } from "@/effect/app-runtime"
+import { Effect } from "effect"
 import { TimerSvc } from "./timer"
 
 const log = Log.create({ service: "server" })
@@ -146,7 +147,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
         },
       }),
       async (c) => {
-        const branch = await Vcs.branch()
+        const branch = await AppRuntime.runPromise(Vcs.Service.use((svc) => svc.branch()))
         return c.json({
           branch,
         })
@@ -170,7 +171,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
         },
       }),
       async (c) => {
-        const commands = await Command.list()
+        const commands = await AppRuntime.runPromise(Command.Service.use((svc) => svc.list()))
         return c.json(commands)
       },
     )
@@ -192,7 +193,9 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
         },
       }),
       async (c) => {
-        const items = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.list()))
+        const items = await AppRuntime.runPromise(
+          TimerSvc.Service.use((svc) => svc.list()).pipe(Effect.provide(TimerSvc.defaultLayer)),
+        )
         return c.json(items)
       },
     )
@@ -214,7 +217,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
         },
       }),
       async (c) => {
-        const modes = await Agent.list()
+        const modes = await AppRuntime.runPromise(Agent.Service.use((svc) => svc.list()))
         return c.json(modes)
       },
     )
@@ -236,7 +239,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
         },
       }),
       async (c) => {
-        const skills = await Skill.all()
+        const skills = await AppRuntime.runPromise(Skill.Service.use((svc) => svc.all()))
         return c.json(skills)
       },
     )
@@ -258,7 +261,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
         },
       }),
       async (c) => {
-        return c.json(await LSP.status())
+        return c.json(await AppRuntime.runPromise(LSP.Service.use((svc) => svc.status())))
       },
     )
     .get(
@@ -279,7 +282,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
         },
       }),
       async (c) => {
-        return c.json(await Format.status())
+        return c.json(await AppRuntime.runPromise(Format.Service.use((svc) => svc.status())))
       },
     )
     .all("/*", async (c) => {

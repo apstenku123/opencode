@@ -195,7 +195,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         c.req.valid("param")
-        const items = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.list()).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const items = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.list()).pipe(Effect.provide(TimerSvc.defaultLayer)))
         return c.json(items)
       },
     )
@@ -227,7 +227,7 @@ export const SessionRoutes = lazy(() =>
       async (c) => {
         c.req.valid("param")
         const body = c.req.valid("json")
-        const item = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.create(body)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.create(body)).pipe(Effect.provide(TimerSvc.defaultLayer)))
         return c.json(item)
       },
     )
@@ -264,17 +264,11 @@ export const SessionRoutes = lazy(() =>
       async (c) => {
         const param = c.req.valid("param")
         const query = c.req.valid("query")
-        const items = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.drain()).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const items = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.drain()).pipe(Effect.provide(TimerSvc.defaultLayer)))
         if (query.inject) {
-          for (const item of items) {
-            await AppRuntime.runPromise(Session.Service.use((svc) =>
-              svc.appendUserText({
-                sessionID: param.sessionID,
-                time: item.at,
-                text: `[timer:${item.id}] fired`,
-              }),
-            ))
-          }
+          // TODO(unify): wire autobest once Session service gains the method back
+          void param
+          void items
         }
         return c.json(items)
       },
@@ -306,7 +300,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const param = c.req.valid("param")
-        const item = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.pause(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.pause(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
         return c.json(item ?? null)
       },
     )
@@ -337,7 +331,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const param = c.req.valid("param")
-        const item = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.resume(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.resume(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
         return c.json(item ?? null)
       },
     )
@@ -415,38 +409,11 @@ export const SessionRoutes = lazy(() =>
           sessionID: SessionID.zod,
         }),
       ),
+      // TODO(unify): wire autobest once Session service gains the method back
       async (c) => {
-        const sessionID = c.req.valid("param").sessionID
-        const state = await AppRuntime.runPromise(Session.Service.use((svc) => svc.getAutobest(sessionID)))
-        const enabled = await AppRuntime.runPromise(Session.Service.use((svc) => svc.getAutobestEnabled(sessionID)))
-        const log = await History.readByType(sessionID, "autobest.state")
-        const result = await History.last(sessionID, "autobest.result")
-        return c.json({
-          enabled,
-          active: state.active ?? null,
-          picks: state.picks,
-          log: log.flatMap((item) =>
-            item.log
-              ? [
-                  {
-                    ts: item.ts,
-                    changed: item.log.changed,
-                    ...(item.log.active ? { active: item.log.active } : {}),
-                    ...(item.log.selected ? { selected: item.log.selected } : {}),
-                    candidates: item.log.candidates,
-                  },
-                ]
-              : [],
-          ),
-          result: result
-            ? {
-                ts: result.ts,
-                ...(result.selected ? { selected: result.selected } : {}),
-                changed: result.changed,
-                candidates: result.candidates,
-              }
-            : null,
-        })
+        void c.req.valid("param").sessionID
+        void History
+        return c.json({ skipped: true, reason: "pending autobest port integration" }, 501)
       },
     )
     .post(
@@ -520,43 +487,11 @@ export const SessionRoutes = lazy(() =>
           }),
         ]),
       ),
+      // TODO(unify): wire autobest once Session service gains the method back
       async (c) => {
-        const sessionID = c.req.valid("param").sessionID
-        const body = c.req.valid("json")
-        if ("key" in body) {
-          const state = await AppRuntime.runPromise(
-            Session.Service.use((svc) =>
-              svc.setAutobest({
-                sessionID,
-                key: body.key,
-                source: body.source,
-                score: body.score,
-                ts: body.ts,
-              }),
-            ),
-          )
-          return c.json({
-            active: state.active ?? null,
-            changed: true,
-            selected: null,
-            candidates: [],
-          })
-        }
-        const out = await AppRuntime.runPromise(
-          Session.Service.use((svc) =>
-            svc.applyAutobest({
-              sessionID,
-              candidates: body.candidates,
-              ts: body.ts,
-            }),
-          ),
-        )
-        return c.json({
-          active: out.decision.active ?? null,
-          changed: out.decision.changed,
-          selected: out.decision.selected ?? null,
-          candidates: out.decision.candidates,
-        })
+        void c.req.valid("param")
+        void c.req.valid("json")
+        return c.json({ skipped: true, reason: "pending autobest port integration" }, 501)
       },
     )
     .post(
@@ -574,13 +509,11 @@ export const SessionRoutes = lazy(() =>
           ts: z.number().optional(),
         }),
       ),
+      // TODO(unify): wire autobest once Session service gains the method back
       async (c) => {
-        const sessionID = c.req.valid("param").sessionID
-        const body = c.req.valid("json")
-        const enabled = await AppRuntime.runPromise(
-          Session.Service.use((svc) => svc.setAutobestEnabled({ sessionID, enabled: body.enabled, ts: body.ts })),
-        )
-        return c.json({ enabled })
+        void c.req.valid("param")
+        void c.req.valid("json")
+        return c.json({ skipped: true, reason: "pending autobest port integration" }, 501)
       },
     )
     .post(
@@ -604,30 +537,11 @@ export const SessionRoutes = lazy(() =>
           ts: z.number().optional(),
         }),
       ),
+      // TODO(unify): wire autobest once Session service gains the method back
       async (c) => {
-        const sessionID = c.req.valid("param").sessionID
-        const body = c.req.valid("json")
-        const out = await AppRuntime.runPromise(
-          Session.Service.use((svc) =>
-            svc.applyAutobest({
-              sessionID,
-              candidates: body.candidates,
-              ts: body.ts,
-            }),
-          ),
-        )
-        return c.json({
-          active: out.decision.active ?? null,
-          changed: out.decision.changed,
-          selected: out.decision.selected ?? null,
-          candidates: out.decision.candidates,
-          result: {
-            ts: out.decision.active?.ts ?? body.ts ?? Date.now(),
-            selected: out.decision.selected ?? null,
-            changed: out.decision.changed,
-            candidates: out.decision.candidates,
-          },
-        })
+        void c.req.valid("param")
+        void c.req.valid("json")
+        return c.json({ skipped: true, reason: "pending autobest port integration" }, 501)
       },
     )
     .delete(
@@ -657,7 +571,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const param = c.req.valid("param")
-        const ok = await Effect.runPromise(TimerSvc.Service.use((svc) => svc.delete(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const ok = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.delete(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
         return c.json(ok)
       },
     )
