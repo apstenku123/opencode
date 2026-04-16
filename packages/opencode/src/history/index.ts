@@ -1,5 +1,5 @@
 import path from "path"
-import { Filesystem } from "@/util/filesystem"
+import * as Filesystem from "@/util/filesystem"
 import { Global } from "@/global"
 
 export type Event =
@@ -231,9 +231,9 @@ export async function read(sessionID: string) {
   if (!raw) return []
   return raw
     .split("\n")
-    .map((line) => line.trim())
+    .map((line: string) => line.trim())
     .filter(Boolean)
-    .flatMap((line) => {
+    .flatMap((line: string) => {
       try {
         return [JSON.parse(line) as Event]
       } catch {
@@ -243,7 +243,7 @@ export async function read(sessionID: string) {
 }
 
 export async function readByType<T extends Event["type"]>(sessionID: string, type: T) {
-  return (await read(sessionID)).filter((item): item is Extract<Event, { type: T }> => item.type === type)
+  return (await read(sessionID)).filter((item: Event): item is Extract<Event, { type: T }> => item.type === type)
 }
 
 export async function last<T extends Event["type"]>(sessionID: string, type: T) {
