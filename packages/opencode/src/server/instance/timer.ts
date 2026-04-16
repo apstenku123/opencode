@@ -1,4 +1,4 @@
-import { InstanceState } from "@/effect/instance-state"
+import { InstanceState } from "@/effect"
 import { Timer } from "@/timer"
 import { Instance } from "@/project/instance"
 import { Context, Effect, Layer } from "effect"
