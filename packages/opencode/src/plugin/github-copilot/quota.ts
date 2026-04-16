@@ -1,4 +1,4 @@
-import { Installation } from "@/installation"
+import { InstallationVersion } from "@/installation/version"
 
 export type Premium = {
   used: number
@@ -68,7 +68,7 @@ export async function fetchQuota(token: string, enterpriseUrl?: string, proxy?: 
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
-      "User-Agent": `opencode/${Installation.VERSION}`,
+      "User-Agent": `opencode/${InstallationVersion}`,
       ...(enterpriseUrl ? { "X-GitHub-Enterprise-Host": enterpriseUrl } : {}),
       ...(proxy?.token ? { "x-copilot-proxy-token": proxy.token } : {}),
     },

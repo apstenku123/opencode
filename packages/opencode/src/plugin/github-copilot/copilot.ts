@@ -10,7 +10,8 @@ import { cooldown, eligible, feed, load, owner, reserve, reserveBatch, touch, us
 import { classifyPlan, fetchQuota } from "./quota"
 import { MessageV2 } from "@/session/message-v2"
 import { Auth } from "@/auth"
-import { Config } from "@/config/config"
+import { Config } from "@/config"
+import { AppRuntime } from "@/effect/app-runtime"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { list, migrate, outcome as migrationOutcome, summarizeMigration, type CopilotAuth } from "./auth"
 import {
@@ -666,7 +667,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   await Effect.runPromise(migrate().pipe(Effect.provide(Auth.defaultLayer), Effect.provide(AppFileSystem.defaultLayer))).catch(() => [])
   const premium = new Map<string, Set<string>>()
   const cfg = copilotRuntimeConfig(
-    await Effect.runPromise(Config.Service.use((cfg) => cfg.get()).pipe(Effect.provide(Config.defaultLayer))).catch(() => undefined),
+    await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.get())).catch(() => undefined),
   )
   const runtime = owner(cfg.limit, cfg.minIntervalMs)
   CopilotRuntimeState.current = runtime
