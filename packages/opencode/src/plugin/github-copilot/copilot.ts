@@ -1,8 +1,8 @@
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import type { Model } from "@opencode-ai/sdk/v2"
-import { Installation } from "@/installation"
+import { InstallationVersion } from "@/installation/version"
 import { iife } from "@/util/iife"
-import { Log } from "../../util/log"
+import { Log } from "../../util"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Effect } from "effect"
 import { CopilotModels } from "./models"
@@ -110,7 +110,7 @@ export async function aliasModels(input: {
     base(match.enterpriseUrl),
     {
       Authorization: `Bearer ${match.refresh}`,
-      "User-Agent": `opencode/${Installation.VERSION}`,
+      "User-Agent": `opencode/${InstallationVersion}`,
       ...proxyHeaders(cfg?.token),
     },
     input.provider.models,
@@ -530,7 +530,7 @@ export function protocol(input: {
       : input.premium
         ? "conversation-user"
         : "conversation-agent",
-    "User-Agent": `opencode/${Installation.VERSION} (${process.platform} ${process.version}) copilot-compat/1.0.14`,
+    "User-Agent": `opencode/${InstallationVersion} (${process.platform} ${process.version}) copilot-compat/1.0.14`,
     Authorization: `Bearer ${input.token}`,
     "Openai-Intent": "conversation-agent",
     "Copilot-Integration-Id": "copilot-developer-cli",
@@ -690,7 +690,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
           base(auth.enterpriseUrl),
           {
             Authorization: `Bearer ${auth.refresh}`,
-            "User-Agent": `opencode/${Installation.VERSION}`,
+            "User-Agent": `opencode/${InstallationVersion}`,
             ...proxyHeaders(cfg?.token),
           },
           provider.models,
@@ -871,7 +871,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
               headers: {
                 Accept: "application/json",
                 "Content-Type": "application/json",
-                "User-Agent": `opencode/${Installation.VERSION}`,
+                "User-Agent": `opencode/${InstallationVersion}`,
               },
               body: JSON.stringify({
                 client_id: CLIENT_ID,
@@ -901,7 +901,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
                     headers: {
                       Accept: "application/json",
                       "Content-Type": "application/json",
-                      "User-Agent": `opencode/${Installation.VERSION}`,
+                      "User-Agent": `opencode/${InstallationVersion}`,
                     },
                     body: JSON.stringify({
                       client_id: CLIENT_ID,

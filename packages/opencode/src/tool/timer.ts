@@ -1,7 +1,7 @@
 import z from "zod"
 import { Effect } from "effect"
 import { Timer } from "../timer"
-import { Tool } from "./tool"
+import * as Tool from "./tool"
 
 const Parameters = z.object({
   action: z.enum(["create", "pause", "resume", "delete", "get", "list", "drain", "clear"]),

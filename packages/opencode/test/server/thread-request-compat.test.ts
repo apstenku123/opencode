@@ -5,7 +5,7 @@ import { Permission } from "../../src/permission"
 import { Question } from "../../src/question"
 import { Server } from "../../src/server/server"
 import { SessionID } from "../../src/session/schema"
-import { Log } from "../../src/util/log"
+import { Log } from "../../src/util"
 import { tmpdir } from "../fixture/fixture"
 
 Log.init({ print: false })

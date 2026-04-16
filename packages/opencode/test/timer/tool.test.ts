@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
 import { TimerTool, TimerToolState } from "../../src/tool/timer"
-import { Tool } from "../../src/tool/tool"
+import * as Tool from "../../src/tool/tool"
 import { Agent } from "../../src/agent/agent"
-import { Truncate } from "../../src/tool/truncate"
+import * as Truncate from "../../src/tool/truncate"
 
 afterEach(() => {
   TimerToolState.reset()

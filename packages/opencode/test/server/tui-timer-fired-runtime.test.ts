@@ -3,7 +3,7 @@ import { Instance } from "../../src/project/instance"
 import { Server } from "../../src/server/server"
 import { Session as SessionNs } from "../../src/session"
 import { AppRuntime } from "../../src/effect/app-runtime"
-import { Log } from "../../src/util/log"
+import { Log } from "../../src/util"
 import { TuiEvent } from "../../src/cli/cmd/tui/event"
 import { tmpdir } from "../fixture/fixture"
 
