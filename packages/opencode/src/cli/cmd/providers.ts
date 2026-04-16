@@ -2,18 +2,19 @@ import { Auth } from "../../auth"
 import { cmd } from "./cmd"
 import * as prompts from "@clack/prompts"
 import { UI } from "../ui"
-import { ModelsDev } from "../../provider/models"
+import { ModelsDev } from "../../provider"
 import { map, pipe, sortBy, values } from "remeda"
 import path from "path"
 import os from "os"
-import { Config } from "../../config/config"
+import { Config } from "../../config"
 import { Global } from "../../global"
 import { Plugin } from "../../plugin"
 import { Instance } from "../../project/instance"
 import type { Hooks } from "@opencode-ai/plugin"
-import { Process } from "../../util/process"
+import * as Process from "../../util/process"
 import { text } from "node:stream/consumers"
 import { fetchCopilotQuota, formatQuotaBar } from "../../plugin/copilot-quota"
+import { AppRuntime } from "@/effect/app-runtime"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
 
@@ -94,19 +95,27 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string, 
         const saveProvider = result.provider ?? provider
         if ("refresh" in result) {
           const { type: _, provider: __, refresh, access, expires, ...extraFields } = result
-          await Auth.set(saveProvider, {
-            type: "oauth",
-            refresh,
-            access,
-            expires,
-            ...extraFields,
-          })
+          await AppRuntime.runPromise(
+            Auth.Service.use((svc) =>
+              svc.set(saveProvider, {
+                type: "oauth",
+                refresh,
+                access,
+                expires,
+                ...extraFields,
+              }),
+            ),
+          )
         }
         if ("key" in result) {
-          await Auth.set(saveProvider, {
-            type: "api",
-            key: result.key,
-          })
+          await AppRuntime.runPromise(
+            Auth.Service.use((svc) =>
+              svc.set(saveProvider, {
+                type: "api",
+                key: result.key,
+              }),
+            ),
+          )
         }
         spinner.stop("Login successful")
       }
@@ -126,19 +135,27 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string, 
         const saveProvider = result.provider ?? provider
         if ("refresh" in result) {
           const { type: _, provider: __, refresh, access, expires, ...extraFields } = result
-          await Auth.set(saveProvider, {
-            type: "oauth",
-            refresh,
-            access,
-            expires,
-            ...extraFields,
-          })
+          await AppRuntime.runPromise(
+            Auth.Service.use((svc) =>
+              svc.set(saveProvider, {
+                type: "oauth",
+                refresh,
+                access,
+                expires,
+                ...extraFields,
+              }),
+            ),
+          )
         }
         if ("key" in result) {
-          await Auth.set(saveProvider, {
-            type: "api",
-            key: result.key,
-          })
+          await AppRuntime.runPromise(
+            Auth.Service.use((svc) =>
+              svc.set(saveProvider, {
+                type: "api",
+                key: result.key,
+              }),
+            ),
+          )
         }
         prompts.log.success("Login successful")
       }
@@ -156,10 +173,14 @@ async function handlePluginAuth(plugin: { auth: PluginAuth }, provider: string, 
       }
       if (result.type === "success") {
         const saveProvider = result.provider ?? provider
-        await Auth.set(saveProvider, {
-          type: "api",
-          key: result.key,
-        })
+        await AppRuntime.runPromise(
+          Auth.Service.use((svc) =>
+            svc.set(saveProvider, {
+              type: "api",
+              key: result.key,
+            }),
+          ),
+        )
         prompts.log.success("Login successful")
       }
       prompts.outro("Done")
@@ -221,7 +242,7 @@ export const ProvidersListCommand = cmd({
     const homedir = os.homedir()
     const displayPath = authPath.startsWith(homedir) ? authPath.replace(homedir, "~") : authPath
     prompts.intro(`Credentials ${UI.Style.TEXT_DIM}${displayPath}`)
-    const results = Object.entries(await Auth.all())
+    const results = Object.entries(await AppRuntime.runPromise(Auth.Service.use((svc) => svc.all())))
     const database = await ModelsDev.get()
 
     for (const [providerID, result] of results) {
@@ -300,18 +321,22 @@ export const ProvidersLoginCommand = cmd({
             prompts.outro("Done")
             return
           }
-          await Auth.set(url, {
-            type: "wellknown",
-            key: wellknown.auth.env,
-            token: token.trim(),
-          })
+          await AppRuntime.runPromise(
+            Auth.Service.use((svc) =>
+              svc.set(url, {
+                type: "wellknown",
+                key: wellknown.auth.env,
+                token: token.trim(),
+              }),
+            ),
+          )
           prompts.log.success("Logged into " + url)
           prompts.outro("Done")
           return
         }
         await ModelsDev.refresh().catch(() => {})
 
-        const config = await Config.get()
+        const config = await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.get()))
 
         const disabled = new Set(config.disabled_providers ?? [])
         const enabled = config.enabled_providers ? new Set(config.enabled_providers) : undefined
@@ -336,7 +361,7 @@ export const ProvidersLoginCommand = cmd({
           vercel: 6,
         }
         const pluginProviders = resolvePluginProviders({
-          hooks: await Plugin.list(),
+          hooks: await AppRuntime.runPromise(Plugin.Service.use((svc) => svc.list())),
           existingProviders: providers,
           disabled,
           enabled,
@@ -393,7 +418,9 @@ export const ProvidersLoginCommand = cmd({
           provider = selected as string
         }
 
-        const plugin = await Plugin.list().then((x) => x.findLast((x) => x.auth?.provider === provider))
+        const plugin = await AppRuntime.runPromise(Plugin.Service.use((svc) => svc.list())).then((x) =>
+          x.findLast((x) => x.auth?.provider === provider),
+        )
         if (plugin && plugin.auth) {
           const handled = await handlePluginAuth({ auth: plugin.auth }, provider, args.method)
           if (handled) return
@@ -407,7 +434,9 @@ export const ProvidersLoginCommand = cmd({
           if (prompts.isCancel(custom)) throw new UI.CancelledError()
           provider = custom.replace(/^@ai-sdk\//, "")
 
-          const customPlugin = await Plugin.list().then((x) => x.findLast((x) => x.auth?.provider === provider))
+          const customPlugin = await AppRuntime.runPromise(Plugin.Service.use((svc) => svc.list())).then((x) =>
+            x.findLast((x) => x.auth?.provider === provider),
+          )
           if (customPlugin && customPlugin.auth) {
             const handled = await handlePluginAuth({ auth: customPlugin.auth }, provider, args.method)
             if (handled) return
@@ -447,10 +476,14 @@ export const ProvidersLoginCommand = cmd({
           validate: (x) => (x && x.length > 0 ? undefined : "Required"),
         })
         if (prompts.isCancel(key)) throw new UI.CancelledError()
-        await Auth.set(provider, {
-          type: "api",
-          key,
-        })
+        await AppRuntime.runPromise(
+          Auth.Service.use((svc) =>
+            svc.set(provider, {
+              type: "api",
+              key,
+            }),
+          ),
+        )
 
         prompts.outro("Done")
       },
@@ -463,7 +496,9 @@ export const ProvidersLogoutCommand = cmd({
   describe: "log out from a configured provider",
   async handler(_args) {
     UI.empty()
-    const credentials = await Auth.all().then((x) => Object.entries(x))
+    const credentials = await AppRuntime.runPromise(Auth.Service.use((svc) => svc.all())).then((x) =>
+      Object.entries(x),
+    )
     prompts.intro("Remove credential")
     if (credentials.length === 0) {
       prompts.log.error("No credentials found")
@@ -478,7 +513,7 @@ export const ProvidersLogoutCommand = cmd({
       })),
     })
     if (prompts.isCancel(providerID)) throw new UI.CancelledError()
-    await Auth.remove(providerID)
+    await AppRuntime.runPromise(Auth.Service.use((svc) => svc.remove(providerID)))
     prompts.outro("Logout successful")
   },
 })
@@ -490,7 +525,7 @@ export const ProvidersQuotaCommand = cmd({
     UI.empty()
     prompts.intro("GitHub Copilot Quota")
 
-    const credentials = await Auth.all()
+    const credentials = await AppRuntime.runPromise(Auth.Service.use((svc) => svc.all()))
     const copilotAccounts = Object.entries(credentials).filter(
       ([key, info]) => key.startsWith("github-copilot") && info.type === "oauth",
     )
