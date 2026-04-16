@@ -121,13 +121,24 @@ export namespace SessionEntry {
     }),
   }) {}
 
+  export class Plan extends Schema.Class<Plan>("Session.Entry.Plan")({
+    ...Base,
+    type: Schema.Literal("plan"),
+    items: Schema.Array(
+      Schema.Struct({
+        step: Schema.String,
+        status: Schema.Union([Schema.Literal("pending"), Schema.Literal("in_progress"), Schema.Literal("completed")]),
+      }),
+    ),
+  }) {}
+
   export class Compaction extends Schema.Class<Compaction>("Session.Entry.Compaction")({
     ...SessionEvent.Compacted.fields,
     type: Schema.Literal("compaction"),
     ...Base,
   }) {}
 
-  export const Entry = Schema.Union([User, Synthetic, Assistant, Compaction])
+  export const Entry = Schema.Union([User, Synthetic, Assistant, Plan, Compaction])
 
   export type Entry = Schema.Schema.Type<typeof Entry>
 
@@ -163,6 +174,16 @@ export namespace SessionEntry {
               created: event.timestamp,
             },
             content: [],
+          })
+          break
+        }
+        case "plan": {
+          draft.entries.push({
+            id: event.id,
+            type: "plan",
+            metadata: event.metadata,
+            time: { created: event.timestamp },
+            items: event.items.map((item) => ({ step: item.step, status: item.status })),
           })
           break
         }

@@ -16,6 +16,7 @@ import { QuestionRoutes } from "./question"
 import { PermissionRoutes } from "./permission"
 import { ProjectRoutes } from "./project"
 import { SessionRoutes } from "./session"
+import { ThreadRoutes, TurnRoutes } from "./thread"
 import { PtyRoutes } from "./pty"
 import { McpRoutes } from "./mcp"
 import { FileRoutes } from "./file"
@@ -26,6 +27,7 @@ import { EventRoutes } from "./event"
 import { SyncRoutes } from "./sync"
 import { WorkspaceRouterMiddleware } from "./middleware"
 import { AppRuntime } from "@/effect/app-runtime"
+import { TimerSvc } from "./timer"
 
 export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono =>
   new Hono()
@@ -35,6 +37,9 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono =>
     .route("/config", ConfigRoutes())
     .route("/experimental", ExperimentalRoutes())
     .route("/session", SessionRoutes())
+    .route("/thread", ThreadRoutes())
+    .route("/turn", TurnRoutes())
+
     .route("/permission", PermissionRoutes())
     .route("/question", QuestionRoutes())
     .route("/provider", ProviderRoutes())
@@ -189,6 +194,28 @@ export const InstanceRoutes = (upgrade: UpgradeWebSocket): Hono =>
       async (c) => {
         const commands = await AppRuntime.runPromise(Command.Service.use((svc) => svc.list()))
         return c.json(commands)
+      },
+    )
+    .get(
+      "/timer",
+      describeRoute({
+        summary: "List timers",
+        description: "Retrieve managed timers for the current instance runtime.",
+        operationId: "timer.list",
+        responses: {
+          200: {
+            description: "Timer list",
+            content: {
+              "application/json": {
+                schema: resolver(TimerSvc.Info.array()),
+              },
+            },
+          },
+        },
+      }),
+      async (c) => {
+        const items = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.list()))
+        return c.json(items)
       },
     )
     .get(

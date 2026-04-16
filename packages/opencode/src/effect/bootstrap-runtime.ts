@@ -12,16 +12,18 @@ import { Snapshot } from "@/snapshot"
 import { Bus } from "@/bus"
 import { Observability } from "./observability"
 
-export const BootstrapLayer = Layer.mergeAll(
-  Plugin.defaultLayer,
-  ShareNext.defaultLayer,
-  Format.defaultLayer,
-  LSP.defaultLayer,
-  File.defaultLayer,
-  FileWatcher.defaultLayer,
-  Vcs.defaultLayer,
-  Snapshot.defaultLayer,
-  Bus.defaultLayer,
-).pipe(Layer.provide(Observability.layer))
+export const BootstrapLayer = Layer.suspend(() =>
+  Layer.mergeAll(
+    Plugin.defaultLayer,
+    ShareNext.defaultLayer,
+    Format.defaultLayer,
+    LSP.defaultLayer,
+    File.defaultLayer,
+    FileWatcher.defaultLayer,
+    Vcs.defaultLayer,
+    Snapshot.defaultLayer,
+    Bus.defaultLayer,
+  ).pipe(Layer.provide(Observability.layer)),
+)
 
 export const BootstrapRuntime = ManagedRuntime.make(BootstrapLayer, { memoMap })

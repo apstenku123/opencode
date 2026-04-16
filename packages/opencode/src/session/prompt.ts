@@ -34,6 +34,7 @@ import { ConfigMarkdown } from "../config/markdown"
 import { SessionSummary } from "./summary"
 import { NamedError } from "@opencode-ai/shared/util/error"
 import { SessionProcessor } from "./processor"
+import { SessionAutobestObserver } from "./autobest-observer"
 import { Tool } from "@/tool/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
@@ -1537,7 +1538,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
-          return yield* lastAssistant(sessionID)
+          const out = yield* lastAssistant(sessionID)
+          const enabled = yield* sessions.getAutobestEnabled(sessionID)
+          if (enabled && out.info.role === "assistant") {
+            const text = out.parts
+              .filter((part): part is MessageV2.TextPart => part.type === "text")
+              .map((part) => part.text.trim())
+              .filter(Boolean)
+              .join("\n")
+            const picks = SessionAutobestObserver.extract(text)
+            if (picks.length) {
+              yield* sessions.applyAutobest({ sessionID, candidates: picks, ts: Date.now() }).pipe(Effect.ignore)
+            }
+          }
+          return out
         },
       )
 

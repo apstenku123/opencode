@@ -19,6 +19,7 @@ import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
 import { Snapshot } from "../../src/snapshot"
 import { Log } from "../../src/util/log"
+import { last } from "../../src/history"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
 import { provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -701,11 +702,26 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
           expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
         }
         expect(yield* llm.calls).toBe(1)
+        expect(call).toBeDefined()
         expect(call?.state.status).toBe("error")
         if (call?.state.status === "error") {
           expect(call.state.error).toBe("Tool execution aborted")
           expect(call.state.metadata?.interrupted).toBe(true)
           expect(call.state.time.end).toBeDefined()
+        }
+        if (call) {
+          expect(yield* Effect.promise(() => last(chat.id, "tool.state"))).toEqual({
+            ts: expect.any(Number),
+            type: "tool.state",
+            sessionID: chat.id,
+            messageID: msg.id,
+            partID: call.id,
+            tool: "bash",
+            callID: call.callID,
+            state: "error",
+            error: "Tool execution aborted",
+            interrupted: true,
+          })
         }
       }),
     { git: true, config: (url) => providerCfg(url) },

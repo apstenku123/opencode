@@ -11,7 +11,7 @@ import { Installation } from "../installation"
 import { Database, NotFoundError, eq, and, gte, isNull, desc, like, inArray, lt } from "../storage/db"
 import { SyncEvent } from "../sync"
 import type { SQL } from "../storage/db"
-import { PartTable, SessionTable } from "./session.sql"
+import { MessageTable, PartTable, SessionTable } from "./session.sql"
 import { ProjectTable } from "../project/project.sql"
 import { Storage } from "@/storage/storage"
 import { Log } from "../util/log"
@@ -27,6 +27,8 @@ import { SessionID, MessageID, PartID } from "./schema"
 import type { Provider } from "@/provider/provider"
 import { Permission } from "@/permission"
 import { Global } from "@/global"
+import * as History from "@/history"
+import * as Autobest from "@/autobest"
 import { Effect, Layer, Option, Context } from "effect"
 
 export namespace Session {
@@ -381,6 +383,22 @@ export namespace Session {
       sessionID: SessionID,
       predicate: (msg: MessageV2.WithParts) => boolean,
     ) => Effect.Effect<Option.Option<MessageV2.WithParts>>
+    readonly setAutobest: (input: {
+      sessionID: SessionID
+      key: string
+      source?: Autobest.Pick["source"]
+      score?: number
+      ts?: number
+    }) => Effect.Effect<Autobest.State>
+    readonly getAutobest: (sessionID: SessionID) => Effect.Effect<Autobest.State>
+    readonly getAutobestEnabled: (sessionID: SessionID) => Effect.Effect<boolean>
+    readonly setAutobestEnabled: (input: { sessionID: SessionID; enabled: boolean; ts?: number }) => Effect.Effect<boolean>
+    readonly applyAutobest: (input: {
+      sessionID: SessionID
+      candidates: Autobest.Candidate[]
+      ts?: number
+    }) => Effect.Effect<{ state: Autobest.State; decision: Autobest.Decision }>
+    readonly appendUserText: (input: { sessionID: SessionID; text: string; time?: number }) => Effect.Effect<MessageID>
   }
 
   export class Service extends Context.Service<Service, Interface>()("@opencode/Session") {}
@@ -423,6 +441,14 @@ export namespace Session {
         log.info("created", result)
 
         yield* Effect.sync(() => SyncEvent.run(Event.Created, { sessionID: result.id, info: result }))
+        yield* Effect.promise(() =>
+          History.append(result.id, {
+            ts: result.time.created,
+            type: "session.created",
+            sessionID: result.id,
+            title: result.title,
+          }),
+        )
 
         if (!Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
           // This only exist for backwards compatibility. We should not be
@@ -481,17 +507,39 @@ export namespace Session {
 
       const updateMessage = <T extends MessageV2.Info>(msg: T): Effect.Effect<T> =>
         Effect.gen(function* () {
+          const prev = Database.use((db) => db.select({ id: MessageTable.id }).from(MessageTable).where(eq(MessageTable.id, msg.id)).get())
           yield* Effect.sync(() => SyncEvent.run(MessageV2.Event.Updated, { sessionID: msg.sessionID, info: msg }))
+          yield* Effect.promise(() =>
+            History.append(msg.sessionID, {
+              ts: msg.time.created,
+              type: prev ? "message.updated" : "message.created",
+              sessionID: msg.sessionID,
+              messageID: msg.id,
+              role: msg.role,
+            }),
+          )
           return msg
         }).pipe(Effect.withSpan("Session.updateMessage"))
 
       const updatePart = <T extends MessageV2.Part>(part: T): Effect.Effect<T> =>
         Effect.gen(function* () {
+          const time = Date.now()
+          const prev = Database.use((db) => db.select({ id: PartTable.id }).from(PartTable).where(eq(PartTable.id, part.id)).get())
           yield* Effect.sync(() =>
             SyncEvent.run(MessageV2.Event.PartUpdated, {
               sessionID: part.sessionID,
               part: structuredClone(part),
-              time: Date.now(),
+              time,
+            }),
+          )
+          yield* Effect.promise(() =>
+            History.append(part.sessionID, {
+              ts: time,
+              type: prev ? "message.part.updated" : "message.part.created",
+              sessionID: part.sessionID,
+              messageID: part.messageID,
+              partID: part.id,
+              partType: part.type,
             }),
           )
           return part
@@ -570,8 +618,111 @@ export namespace Session {
             })
           }
         }
+        yield* Effect.promise(() =>
+          History.append(session.id, {
+            ts: Date.now(),
+            type: "session.forked",
+            sessionID: session.id,
+            parentID: input.sessionID,
+          }),
+        )
         return session
       })
+
+      const getAutobest: Interface["getAutobest"] = (sessionID) =>
+        Effect.promise(async () => {
+          const items = await History.readByType(sessionID, "autobest.active")
+          return items.reduce<Autobest.State>((state, item) =>
+            Autobest.setActive(state, {
+              key: item.key,
+              source: item.source,
+              score: item.score,
+              ts: item.ts,
+            }), Autobest.empty())
+        }).pipe(Effect.withSpan("Session.getAutobest"))
+
+
+      const getAutobestEnabled: Interface["getAutobestEnabled"] = (sessionID) =>
+        Effect.promise(async () => {
+          const item = await History.last(sessionID, "autobest.enabled")
+          return item?.enabled ?? false
+        }).pipe(Effect.withSpan("Session.getAutobestEnabled"))
+
+      const setAutobestEnabled: Interface["setAutobestEnabled"] = (input) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            History.append(input.sessionID, {
+              ts: input.ts ?? Date.now(),
+              type: "autobest.enabled",
+              sessionID: input.sessionID,
+              enabled: input.enabled,
+            }),
+          )
+          return input.enabled
+        }).pipe(Effect.withSpan("Session.setAutobestEnabled"))
+
+      const setAutobest: Interface["setAutobest"] = (input) =>
+        Effect.gen(function* () {
+          const prev = yield* getAutobest(input.sessionID)
+          const next = Autobest.setActive(prev, {
+            key: input.key,
+            source: input.source,
+            score: input.score,
+            ts: input.ts,
+          })
+          yield* Effect.promise(() =>
+            History.append(input.sessionID, {
+              ts: next.active?.ts ?? input.ts ?? Date.now(),
+              type: "autobest.active",
+              sessionID: input.sessionID,
+              source: next.active?.source ?? input.source ?? "manual",
+              key: input.key,
+              score: input.score,
+              changed: input.key !== prev.active?.key,
+              picks: next.picks.length,
+            }),
+          )
+          return next
+        }).pipe(Effect.withSpan("Session.setAutobest"))
+
+      const applyAutobest: Interface["applyAutobest"] = (input) =>
+        Effect.gen(function* () {
+          const prev = yield* getAutobest(input.sessionID)
+          const out = Autobest.apply(prev, {
+            candidates: input.candidates,
+            ts: input.ts,
+          })
+          const ts = out.decision.active?.ts ?? input.ts ?? Date.now()
+          yield* Effect.promise(() =>
+            History.append(input.sessionID, {
+              ts,
+              type: "autobest.result",
+              sessionID: input.sessionID,
+              ...(out.decision.selected ? { selected: out.decision.selected } : {}),
+              changed: out.decision.changed,
+              candidates: out.decision.candidates.map((item) => ({
+                key: item.key,
+                score: item.score,
+                ...(item.reason ? { reason: item.reason } : {}),
+              })),
+            }),
+          )
+          if (!out.decision.active || !out.decision.changed) return out
+          yield* Effect.promise(() =>
+            History.append(input.sessionID, {
+              ts,
+              type: "autobest.active",
+              sessionID: input.sessionID,
+              source: out.decision.active?.source ?? "auto",
+              key: out.decision.active?.key ?? out.state.active?.key ?? "",
+              score: out.decision.active?.score,
+              changed: out.decision.changed,
+              picks: out.state.picks.length,
+              candidates: out.decision.candidates.map((item) => ({ key: item.key, score: item.score })),
+            }),
+          )
+          return out
+        }).pipe(Effect.withSpan("Session.applyAutobest"))
 
       const patch = (sessionID: SessionID, info: Patch) =>
         Effect.sync(() => SyncEvent.run(Event.Updated, { sessionID, info }))
@@ -612,6 +763,20 @@ export namespace Session {
         summary: Info["summary"]
       }) {
         yield* patch(input.sessionID, { time: { updated: Date.now() }, summary: input.summary })
+        yield* Effect.promise(() =>
+          History.append(input.sessionID, {
+            ts: Date.now(),
+            type: "session.summary.updated",
+            sessionID: input.sessionID,
+            summary: input.summary
+              ? {
+                  additions: input.summary.additions,
+                  deletions: input.summary.deletions,
+                  files: input.summary.files,
+                }
+              : null,
+          }),
+        )
       })
 
       const diff = Effect.fn("Session.diff")(function* (sessionID: SessionID) {
@@ -637,6 +802,14 @@ export namespace Session {
             messageID: input.messageID,
           }),
         )
+        yield* Effect.promise(() =>
+          History.append(input.sessionID, {
+            ts: Date.now(),
+            type: "message.removed",
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+          }),
+        )
         return input.messageID
       })
 
@@ -647,6 +820,15 @@ export namespace Session {
       }) {
         yield* Effect.sync(() =>
           SyncEvent.run(MessageV2.Event.PartRemoved, {
+            sessionID: input.sessionID,
+            messageID: input.messageID,
+            partID: input.partID,
+          }),
+        )
+        yield* Effect.promise(() =>
+          History.append(input.sessionID, {
+            ts: Date.now(),
+            type: "message.part.removed",
             sessionID: input.sessionID,
             messageID: input.messageID,
             partID: input.partID,
@@ -676,6 +858,28 @@ export namespace Session {
         return Option.none<MessageV2.WithParts>()
       })
 
+      const appendUserText: Interface["appendUserText"] = Effect.fn("Session.appendUserText")(function* (input) {
+        const id = MessageID.ascending()
+        const partID = PartID.ascending()
+        const msg = yield* updateMessage({
+          id,
+          sessionID: input.sessionID,
+          role: "user",
+          time: { created: input.time ?? Date.now() },
+          agent: "user",
+          model: { providerID: "manual" as never, modelID: "manual" as never },
+        } satisfies MessageV2.User)
+        yield* updatePart({
+          id: partID,
+          sessionID: input.sessionID,
+          messageID: id,
+          type: "text",
+          text: input.text,
+        } satisfies MessageV2.TextPart)
+        yield* touch(input.sessionID)
+        return msg.id
+      })
+
       return Service.of({
         create,
         fork,
@@ -698,6 +902,12 @@ export namespace Session {
         getPart,
         updatePartDelta,
         findMessage,
+        setAutobest,
+        getAutobest,
+        getAutobestEnabled,
+        setAutobestEnabled,
+        applyAutobest,
+        appendUserText,
       })
     }),
   )

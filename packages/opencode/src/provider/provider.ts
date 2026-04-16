@@ -23,6 +23,8 @@ import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { isRecord } from "@/util/record"
+import { Store } from "../plugin/github-copilot/connections"
+import { aliasModels } from "../plugin/github-copilot/copilot"
 
 // Direct imports for bundled providers
 import { createAmazonBedrock, type AmazonBedrockProviderSettings } from "@ai-sdk/amazon-bedrock"
@@ -61,6 +63,58 @@ import { ModelID, ProviderID } from "./schema"
 
 export namespace Provider {
   const log = Log.create({ service: "provider" })
+  const copilotAliasIDs = ["github-copilot#edu", "github-copilot#enterprise", "github-copilot#personal", "github-copilot#free"] as const
+
+  async function hydrateCopilotAlias(input: {
+    id: string
+    providerID: ProviderID
+    baseProvider: Info
+    auth: Auth.Interface
+    fs: AppFileSystem.Interface
+  }) {
+    const store = new Store(input.fs)
+    const state = await Effect.runPromise(store.read())
+    const auths = Object.entries(await Effect.runPromise(input.auth.all().pipe(Effect.orDie)))
+      .flatMap(([key, value]) => {
+        if (!value || value.type !== "oauth") return []
+        if (!key.startsWith("github-copilot")) return []
+        return [{
+          key,
+          label: key === "github-copilot" ? "Primary" : key.replace(/^github-copilot#/, ""),
+          refresh: value.refresh,
+          access: value.access,
+          expires: value.expires,
+          accountId: value.accountId,
+          enterpriseUrl: value.enterpriseUrl,
+        }]
+      })
+      .sort((a, b) => a.key.localeCompare(b.key))
+    const pluginAuth = await Effect.runPromise(input.auth.get(ProviderID.githubCopilot).pipe(Effect.orDie))
+    const models = (await aliasModels({
+      provider: { id: input.id, models: input.baseProvider.models },
+      auth: pluginAuth,
+      auths,
+      state,
+      write: async (next) => {
+        await Effect.runPromise(store.write(next))
+      },
+    })) ?? input.baseProvider.models
+    return {
+      ...input.baseProvider,
+      id: input.providerID,
+      name: input.id,
+      models: Object.fromEntries(
+        Object.entries(models).map(([modelID, model]) => [
+          modelID,
+          {
+            ...model,
+            id: ModelID.make(modelID),
+            providerID: input.providerID,
+          },
+        ]),
+      ),
+    } satisfies Info
+  }
 
   function shouldUseCopilotResponsesApi(modelID: string): boolean {
     const match = /^gpt-(\d+)/.exec(modelID)
@@ -1278,6 +1332,17 @@ export namespace Provider {
                 log.warn("state discovery error", { id: "gitlab", error: e })
               }
             })
+          }
+
+          const copilot = providers[ProviderID.githubCopilot]
+          if (copilot && isProviderAllowed(ProviderID.githubCopilot)) {
+            for (const id of copilotAliasIDs) {
+              const providerID = ProviderID.make(id)
+              if (!isProviderAllowed(providerID)) continue
+              providers[providerID] = yield* Effect.promise(() =>
+                hydrateCopilotAlias({ id, providerID, baseProvider: copilot, auth, fs }),
+              )
+            }
           }
 
           for (const hook of plugins) {

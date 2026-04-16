@@ -360,5 +360,5 @@ export namespace Pty {
     }),
   )
 
-  export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(Plugin.defaultLayer))
+  export const defaultLayer = Layer.suspend(() => layer.pipe(Layer.provide(Bus.layer), Layer.provide(Plugin.defaultLayer)))
 }

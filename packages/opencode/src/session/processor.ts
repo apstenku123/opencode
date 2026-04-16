@@ -1,3 +1,5 @@
+import { SessionHistoryObserver } from "./history-observer"
+import { SessionAutobestObserver } from "./autobest-observer"
 import { Cause, Deferred, Effect, Layer, Context, Scope } from "effect"
 import * as Stream from "effect/Stream"
 import { Agent } from "@/agent/agent"
@@ -6,6 +8,7 @@ import { Config } from "@/config/config"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { Snapshot } from "@/snapshot"
+import * as History from "@/history"
 import { Session } from "."
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
@@ -160,6 +163,18 @@ export namespace SessionProcessor {
           const match = yield* readToolCall(toolCallID)
           if (!match) return
           const part = yield* session.updatePart(update(match.part))
+          yield* Effect.promise(() =>
+            History.append(part.sessionID, {
+              ts: Date.now(),
+              type: "tool.state",
+              sessionID: part.sessionID,
+              messageID: part.messageID,
+              partID: part.id,
+              tool: part.tool,
+              callID: part.callID,
+              state: part.state.status,
+            }),
+          )
           ctx.toolcalls[toolCallID] = {
             ...match.call,
             partID: part.id,
@@ -192,21 +207,50 @@ export namespace SessionProcessor {
               attachments: output.attachments,
             },
           })
+          yield* Effect.promise(() =>
+            History.append(match.part.sessionID, {
+              ts: Date.now(),
+              type: "tool.state",
+              sessionID: match.part.sessionID,
+              messageID: match.part.messageID,
+              partID: match.part.id,
+              tool: match.part.tool,
+              callID: match.part.callID,
+              state: "completed",
+              title: output.title,
+              output: output.output.length,
+              attachments: output.attachments?.length ?? 0,
+            }),
+          )
           yield* settleToolCall(toolCallID)
         })
 
         const failToolCall = Effect.fn("SessionProcessor.failToolCall")(function* (toolCallID: string, error: unknown) {
           const match = yield* readToolCall(toolCallID)
           if (!match || match.part.state.status !== "running") return false
+          const next = errorMessage(error)
           yield* session.updatePart({
             ...match.part,
             state: {
               status: "error",
               input: match.part.state.input,
-              error: errorMessage(error),
+              error: next,
               time: { start: match.part.state.time.start, end: Date.now() },
             },
           })
+          yield* Effect.promise(() =>
+            History.append(match.part.sessionID, {
+              ts: Date.now(),
+              type: "tool.state",
+              sessionID: match.part.sessionID,
+              messageID: match.part.messageID,
+              partID: match.part.id,
+              tool: match.part.tool,
+              callID: match.part.callID,
+              state: "error",
+              error: next,
+            }),
+          )
           if (error instanceof Permission.RejectedError || error instanceof Question.RejectedError) {
             ctx.blocked = ctx.shouldBreak
           }
@@ -374,6 +418,17 @@ export namespace SessionProcessor {
                 cost: usage.cost,
               })
               yield* session.updateMessage(ctx.assistantMessage)
+              yield* Effect.promise(() =>
+                History.append(ctx.sessionID, {
+                  ts: Date.now(),
+                  type: "step.finish",
+                  sessionID: ctx.sessionID,
+                  messageID: ctx.assistantMessage.id,
+                  reason: value.finishReason,
+                  cost: usage.cost,
+                  tokens: usage.tokens,
+                }),
+              ).pipe(Effect.ignore)
               if (ctx.snapshot) {
                 const patch = yield* snapshot.patch(ctx.snapshot)
                 if (patch.files.length) {
@@ -513,6 +568,20 @@ export namespace SessionProcessor {
                 time: { start: "time" in part.state ? part.state.time.start : end, end },
               },
             })
+            yield* Effect.promise(() =>
+              History.append(part.sessionID, {
+                ts: end,
+                type: "tool.state",
+                sessionID: part.sessionID,
+                messageID: part.messageID,
+                partID: part.id,
+                tool: part.tool,
+                callID: part.callID,
+                state: "error",
+                error: "Tool execution aborted",
+                interrupted: true,
+              }),
+            )
           }
           ctx.toolcalls = {}
           ctx.assistantMessage.time.completed = Date.now()
@@ -610,6 +679,7 @@ export namespace SessionProcessor {
       Layer.provide(Plugin.defaultLayer),
       Layer.provide(SessionSummary.defaultLayer),
       Layer.provide(SessionStatus.defaultLayer),
+      Layer.provide(SessionHistoryObserver.defaultLayer),
       Layer.provide(Bus.layer),
       Layer.provide(Config.defaultLayer),
     ),

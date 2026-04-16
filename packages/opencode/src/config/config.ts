@@ -849,6 +849,18 @@ export namespace Config {
             .describe(
               "Timeout in milliseconds between streamed SSE chunks for this provider. If no chunk arrives within this window, the request is aborted.",
             ),
+          runtimeLimit: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe("GitHub Copilot runtime per-account concurrency limit. Default is 1."),
+          runtimeMinIntervalMs: z
+            .number()
+            .int()
+            .nonnegative()
+            .optional()
+            .describe("GitHub Copilot runtime minimum interval in milliseconds between account reuses. Default is 0."),
         })
         .catchall(z.any())
         .optional(),
@@ -900,6 +912,10 @@ export namespace Config {
         .describe(
           "Automatically update to the latest version. Set to true to auto-update, false to disable, or 'notify' to show update notifications",
         ),
+      autoskill: z
+        .boolean()
+        .optional()
+        .describe("Enable auto-skill recommendations and request-matched skill hints in system prompts"),
       disabled_providers: z.array(z.string()).optional().describe("Disable providers that are loaded automatically"),
       enabled_providers: z
         .array(z.string())

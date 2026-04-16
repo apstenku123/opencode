@@ -42,12 +42,25 @@ export namespace SessionV2 {
     Effect.gen(function* () {
       const session = yield* Session.Service
 
-      const create: Interface["create"] = Effect.fn("Session.create")(function* (input) {
-        throw new Error("Not implemented")
+      const create: Interface["create"] = Effect.fn("Session.create")(function* (_input) {
+        const created = yield* session.create()
+        return fromV1(created)
       })
 
       const prompt: Interface["prompt"] = Effect.fn("Session.prompt")(function* (input) {
-        throw new Error("Not implemented")
+        const id = yield* session.appendUserText({
+          sessionID: input.sessionID,
+          text: input.text,
+        })
+        return new SessionEntry.User({
+          id: SessionEntry.ID.make(id),
+          type: "user",
+          text: input.text,
+          files: input.files,
+          agents: input.agents,
+          metadata: input.metadata,
+          time: { created: new Date() as never },
+        })
       })
 
       const fromID: Interface["fromID"] = Effect.fn("Session.fromID")(function* (id) {

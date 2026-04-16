@@ -1,6 +1,7 @@
 import { Context, Effect, Layer } from "effect"
 
 import { Instance } from "../project/instance"
+import { Config } from "../config/config"
 
 import PROMPT_ANTHROPIC from "./prompt/anthropic.txt"
 import PROMPT_DEFAULT from "./prompt/default.txt"
@@ -33,9 +34,30 @@ export namespace SystemPrompt {
     return [PROMPT_DEFAULT]
   }
 
+  export function recommend(input: { text?: string; list: Skill.Info[] }) {
+    const text = input.text?.toLowerCase().trim()
+    if (!text) return []
+
+    const words = text.split(/[^a-z0-9]+/).filter((part) => part.length >= 4)
+    return input.list
+      .map((skill) => {
+        const hay = [skill.name, skill.description, skill.content].join("\n").toLowerCase()
+        const score = words.reduce((sum, word) => {
+          if (!hay.includes(word)) return sum
+          if (skill.name.toLowerCase().includes(word)) return sum + 4
+          if (skill.description.toLowerCase().includes(word)) return sum + 2
+          return sum + 1
+        }, 0)
+        return { skill, score }
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.skill.name.localeCompare(b.skill.name))
+      .map((item) => item.skill)
+  }
+
   export interface Interface {
     readonly environment: (model: Provider.Model) => string[]
-    readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
+    readonly skills: (agent: Agent.Info, input?: string) => Effect.Effect<string | undefined>
   }
 
   export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -44,8 +66,9 @@ export namespace SystemPrompt {
     Service,
     Effect.gen(function* () {
       const skill = yield* Skill.Service
+      const cfg = yield* Config.Service
 
-      return Service.of({
+      const api: Interface = {
         environment(model) {
           const project = Instance.project
           return [
@@ -62,23 +85,30 @@ export namespace SystemPrompt {
             ].join("\n"),
           ]
         },
+        skills(agent: Agent.Info, input?: string) {
+          return Effect.gen(function* () {
+            if (Permission.disabled(["skill"], agent.permission).has("skill")) return
+            const conf = yield* cfg.get()
+            const list = yield* skill.available(agent)
+            const picks = conf.autoskill === false ? [] : recommend({ text: input, list }).slice(0, 3)
+            return [
+              "Skills provide specialized instructions and workflows for specific tasks.",
+              "Use the skill tool to load a skill when a task matches its description.",
+              ...(picks.length
+                ? [
+                    "Auto-skill hints: the following skills appear relevant to the current request.",
+                    ...picks.map((skill) => `- ${skill.name}: ${skill.description}`),
+                  ]
+                : []),
+              Skill.fmt(list, { verbose: true }),
+            ].join("\n")
+          })
+        },
+      }
 
-        skills: Effect.fn("SystemPrompt.skills")(function* (agent: Agent.Info) {
-          if (Permission.disabled(["skill"], agent.permission).has("skill")) return
-
-          const list = yield* skill.available(agent)
-
-          return [
-            "Skills provide specialized instructions and workflows for specific tasks.",
-            "Use the skill tool to load a skill when a task matches its description.",
-            // the agents seem to ingest the information about skills a bit better if we present a more verbose
-            // version of them here and a less verbose version in tool description, rather than vice versa.
-            Skill.fmt(list, { verbose: true }),
-          ].join("\n")
-        }),
-      })
+      return Service.of(api)
     }),
   )
 
-  export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer))
+  export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer), Layer.provide(Config.defaultLayer))
 }

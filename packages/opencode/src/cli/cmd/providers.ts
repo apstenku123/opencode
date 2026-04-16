@@ -4,6 +4,13 @@ import { cmd } from "./cmd"
 import * as prompts from "@clack/prompts"
 import { UI } from "../ui"
 import { ModelsDev } from "../../provider/models"
+import { classifyPlan, fetchQuota, formatQuotaBar, type Quota } from "../../plugin/github-copilot/quota"
+import { summarizeMigration } from "../../plugin/github-copilot/auth"
+import { connectionFile } from "../../plugin/github-copilot/paths"
+import { CopilotRuntimeState } from "../../plugin/github-copilot/copilot"
+import { policyPlan, recent429, recentDiscoveryError, routeDebug, score } from "../../plugin/github-copilot/copilot"
+import { Store, StateSchema, empty, type State } from "../../plugin/github-copilot/connections"
+import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { map, pipe, sortBy, values } from "remeda"
 import path from "path"
 import os from "os"
@@ -17,6 +24,17 @@ import { text } from "node:stream/consumers"
 import { Effect } from "effect"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
+
+export async function allAuth() {
+  if ((Auth as any).all) return (Auth as any).all()
+  return AppRuntime.runPromise(Auth.Service.use((auth) => auth.all()))
+}
+
+async function readConnections() {
+  const raw = await Bun.file(connectionFile).json().catch(() => empty())
+  const parsed = StateSchema.zod.safeParse(raw)
+  return parsed.success ? parsed.data : empty()
+}
 
 const put = (key: string, info: Auth.Info) =>
   AppRuntime.runPromise(
@@ -212,12 +230,475 @@ export function resolvePluginProviders(input: {
   return result
 }
 
+export function quotaAccounts(credentials: Record<string, { type: string; refresh?: string; enterpriseUrl?: string }>) {
+  return Object.entries(credentials).filter(([key, info]) => key.startsWith("github-copilot") && info.type === "oauth")
+}
+
+export function applyProxy(
+  state: { version: number; preferred?: string; connections: Record<string, any> },
+  key: string,
+  input: { proxyUrl?: string; proxyToken?: string },
+) {
+  return {
+    ...state,
+    connections: {
+      ...state.connections,
+      [key]: {
+        ...state.connections[key],
+        proxyUrl: input.proxyUrl,
+        proxyToken: input.proxyToken,
+      },
+    },
+  }
+}
+
+export function copilotAliasName(key: string, name?: string) {
+  if (key.startsWith("github-copilot#")) return copilotAliasLabel(key)
+  return name || key
+}
+
+export function proxyList(
+  state: State,
+  accounts: Array<[string, { type: string; refresh?: string; enterpriseUrl?: string }]>,
+) {
+  return accounts.map(([key]) => ({
+    key,
+    label: copilotAliasLabel(key),
+    url: state.connections[key]?.proxyUrl,
+    token: state.connections[key]?.proxyToken,
+  }))
+}
+
+export type AccountDiscoveryJSON = {
+  ok: boolean | null
+  stale: boolean
+  at: number | null
+  models: string[]
+  api: string | null
+  plan: string | null
+  login: string | null
+  err: string | null
+}
+
+export const ACCOUNT_STATUS_SCHEMA_VERSION = 1
+
+export type AccountStatusEnvelopeJSON = {
+  schemaVersion: typeof ACCOUNT_STATUS_SCHEMA_VERSION
+  status: AccountStatusJSON
+}
+
+export type RouteDebugJSON = {
+  schemaVersion: typeof ACCOUNT_STATUS_SCHEMA_VERSION
+  model: string
+  providerID: string | null
+  account: string | null
+  selected: string | null
+  candidates: import("../../plugin/github-copilot/copilot").RouteDebug[]
+}
+
+export type RouteDebugSummaryJSON = {
+  wins: Record<string, number>
+  byAccount: Record<string, { wins: number; winRate: number }>
+  byProviderAlias: Record<string, { wins: number; winRate: number }>
+  topWinner: string | null
+  topWinRate: number
+  topLoser: string | null
+  rejectionRate: number
+  modelCount: number
+  selectedCount: number
+  selectedRate: number
+  winRate: Record<string, number>
+  rejectedByLane: number
+  rejectedByPenalty: number
+  rejectedByDiscovery: number
+  byModel: Record<
+    string,
+    {
+      selected: string | null
+      winnerReason: string[]
+      rejectedByLane: number
+      rejectedByPenalty: number
+      rejectedByDiscovery: number
+    }
+  >
+}
+
+export type RouteDebugExplainJSON =
+  | RouteDebugJSON
+  | {
+      schemaVersion: typeof ACCOUNT_STATUS_SCHEMA_VERSION
+      summary: RouteDebugSummaryJSON
+      models: RouteDebugJSON[]
+    }
+
+export type AccountPenaltyJSON = {
+  recent429: boolean
+  recentDiscoveryError: boolean
+}
+
+export type AccountRouteJSON = {
+  discovery: number
+  penalty: number
+  load: number
+  cooldown: boolean
+  routeReason: string[]
+}
+
+export type MigrationJSON = {
+  migrated: number
+  skipped: boolean
+  source: string | null
+  migratedAt: number | null
+  text: string
+}
+
+export type AccountStatusJSON = {
+  key: string
+  label: string
+  login: string | null
+  plan: string | null
+  proxy: boolean
+  premium: string | null
+  health: string
+  exhausted: boolean
+  exhaustedUntil: number | null
+  quota: Quota | null
+  error: string | null
+  ghe: string | null
+  discovery: AccountDiscoveryJSON
+  penalties: AccountPenaltyJSON
+  route: AccountRouteJSON
+}
+
+export function emptyDiscovery(): AccountDiscoveryJSON {
+  return {
+    ok: null,
+    stale: true,
+    at: null,
+    models: [],
+    api: null,
+    plan: null,
+    login: null,
+    err: null,
+  }
+}
+
+export function jsonMigration(input: ReturnType<typeof summarizeMigration>): MigrationJSON {
+  const item = input ?? {
+    migrated: 0,
+    skipped: false,
+    source: undefined,
+    migratedAt: undefined,
+    text: "no legacy Copilot migration recorded",
+  }
+  return {
+    migrated: item.migrated,
+    skipped: item.skipped,
+    source: item.source ?? null,
+    migratedAt: item.migratedAt ?? null,
+    text: item.text,
+  }
+}
+
+export function jsonStatus(input: ReturnType<typeof accountStatus> & { premium?: string; ghe?: string }): AccountStatusJSON {
+  return {
+    key: input.key,
+    label: input.label,
+    login: input.login ?? null,
+    plan: input.plan ?? null,
+    proxy: input.proxy,
+    health: input.health,
+    exhausted: input.exhausted,
+    exhaustedUntil: input.exhaustedUntil ?? null,
+    quota: input.quota ?? null,
+    error: input.error ?? null,
+    discovery: input.discovery
+      ? {
+          ok: input.discovery.ok,
+          stale: input.discovery.stale,
+          at: input.discovery.at ?? null,
+          models: [...input.discovery.models],
+          api: input.discovery.api ?? null,
+          plan: input.discovery.plan ?? null,
+          login: input.discovery.login ?? null,
+          err: input.discovery.err ?? null,
+        }
+      : emptyDiscovery(),
+    penalties: {
+      recent429: !!input.penalties?.recent429,
+      recentDiscoveryError: !!input.penalties?.recentDiscoveryError,
+    },
+    premium: input.premium ?? null,
+    ghe: input.ghe ?? null,
+    route: {
+      discovery: input.route?.discovery ?? 0,
+      penalty: input.route?.penalty ?? 0,
+      load: input.route?.load ?? 0,
+      cooldown: !!input.route?.cooldown,
+      routeReason: input.route?.routeReason ?? [],
+    },
+  }
+}
+
+export function accountStatus(input: {
+  key: string
+  modelId?: string
+  now?: number
+  state: State
+  quota?: Quota
+  quotaError?: string
+}) {
+  const item = input.state.connections[input.key]
+  const now = input.now ?? Date.now()
+  const exhaustedUntil = item?.exhaustedUntil
+  const exhausted = !!exhaustedUntil && exhaustedUntil > now
+  const plan = input.quota ? classifyPlan(input.quota) : undefined
+  const discovery = item?.discovery
+  const stale = !discovery ? true : now - discovery.at > 30 * 60 * 1000
+  const health = exhausted
+    ? "exhausted"
+    : input.quotaError
+      ? "quota_error"
+      : discovery?.ok === false
+        ? "discovery_error"
+        : "ok"
+  const rated = score(input.state, input.key, input.modelId ?? "", now)
+  const debug = routeDebug({
+    auths: [{ key: input.key, label: input.key, refresh: "", access: "", expires: 0 }],
+    state: input.state,
+    modelId: input.modelId ?? "",
+    now,
+  })[0]
+  return {
+    key: input.key,
+    label: copilotAliasLabel(input.key),
+    login: input.quota?.login ?? item?.login,
+    plan: plan && plan !== "unknown" ? plan : item?.plan,
+    proxy: !!item?.proxyUrl,
+    exhausted,
+    exhaustedUntil,
+    quota: input.quota,
+    health,
+    error: input.quotaError ?? discovery?.err,
+    discovery: discovery
+      ? {
+          ok: discovery.ok ?? true,
+          at: discovery.at,
+          stale,
+          models: [...discovery.models],
+          api: discovery.api,
+          plan: discovery.plan,
+          login: discovery.login,
+          err: discovery.err,
+        }
+      : undefined,
+    penalties: {
+      recent429: recent429(input.state, input.key, now),
+      recentDiscoveryError: recentDiscoveryError(input.state, input.key, now),
+    },
+    route: {
+      discovery: rated.discovery,
+      penalty: rated.penalty,
+      load: 0,
+      cooldown: false,
+      routeReason: debug?.routeReason ?? [],
+    },
+  }
+}
+
+export function renderAccountStatus(
+  status: ReturnType<typeof accountStatus>,
+  input?: { premium?: string; enterpriseUrl?: string },
+) {
+  const extra = [
+    status.proxy ? "proxy on" : "direct",
+    status.exhausted ? "cooldown" : undefined,
+    input?.enterpriseUrl ? `ghe ${input.enterpriseUrl}` : undefined,
+    status.discovery?.stale ? "discovery stale" : status.discovery ? "discovery fresh" : undefined,
+  ]
+    .filter(Boolean)
+    .join(", ")
+  return `${status.label} ${UI.Style.TEXT_DIM}${extra}
+  Login: ${status.login ?? "unknown"}
+  Plan: ${status.plan ?? "unknown"}
+  Health: ${status.health}
+  Discovery: ${status.discovery ? `${status.discovery.ok ? "ok" : "error"}${status.discovery.models?.length ? `, ${status.discovery.models.length} models` : ""}${status.discovery.err ? `, ${status.discovery.err}` : ""}` : "unknown"}${
+    input?.premium
+      ? `
+  Premium: ${input.premium}`
+      : ""
+  }`
+}
+
+export async function loadAccountStatuses() {
+  const credentials = await allAuth()
+  const accounts = quotaAccounts(
+    credentials as Record<string, { type: string; refresh?: string; enterpriseUrl?: string }>,
+  )
+  const state = await readConnections()
+  const items = await Promise.all(
+    accounts.map(async ([key, info]) => {
+      try {
+        const quota = await fetchQuota(
+          info.refresh || "",
+          info.enterpriseUrl,
+          state.connections[key]?.proxyUrl
+            ? {
+                url: state.connections[key]?.proxyUrl,
+                token: state.connections[key]?.proxyToken,
+              }
+            : undefined,
+        )
+        return {
+          info,
+          status: accountStatus({ key, state, quota }),
+          premium: quota.premium ? formatQuotaBar(quota.premium, quota.resetDate) : "no quota info available",
+          ghe: info.enterpriseUrl ?? null,
+        }
+      } catch (err) {
+        return {
+          info,
+          status: accountStatus({ key, state, quotaError: err instanceof Error ? err.message : String(err) }),
+          premium: undefined,
+          ghe: info.enterpriseUrl ?? null,
+        }
+      }
+    }),
+  )
+  return { accounts, state, items }
+}
+
+export function copilotAliasLabel(key: string) {
+  if (key === "github-copilot") return "Primary"
+  if (key === "github-copilot#edu") return "Copilot Edu"
+  if (key === "github-copilot#enterprise") return "Copilot Enterprise"
+  if (key === "github-copilot#personal") return "Copilot Personal"
+  if (key === "github-copilot#free") return "Copilot Free"
+  if (key.startsWith("github-copilot#")) return key.replace("github-copilot#", "")
+  return key
+}
+
+export async function loadRouteDebug(input: { model: string; providerID?: string; account?: string }) {
+  const credentials = await allAuth()
+  const accounts = quotaAccounts(
+    credentials as Record<
+      string,
+      { type: string; refresh?: string; access?: string; expires?: number; enterpriseUrl?: string }
+    >,
+  )
+  const auths = accounts.map(([key, info]) => ({
+    key,
+    label: copilotAliasLabel(key),
+    refresh: info.refresh || "",
+    access: (info as any).access || info.refresh || "",
+    expires: (info as any).expires || 0,
+    enterpriseUrl: info.enterpriseUrl,
+  }))
+  const state = await readConnections()
+  const debug = routeDebug({ auths, state, modelId: input.model, providerID: input.providerID })
+  const candidates = input.account ? debug.filter((item) => item.key === input.account) : debug
+  const selected = candidates[0]?.key ?? null
+  return {
+    schemaVersion: 1,
+    model: input.model,
+    providerID: input.providerID ?? null,
+    account: input.account ?? null,
+    selected,
+    candidates,
+  } satisfies RouteDebugJSON
+}
+
+export async function loadRouteExplain(input: {
+  model?: string
+  models?: string[]
+  providerID?: string
+  account?: string
+  allModels?: boolean
+  allAccounts?: boolean
+}) {
+  const models = input.allModels
+    ? ["gpt-5-mini", "gpt-4.1", "gpt-5-enterprise", "gpt-4.1-edu"]
+    : [input.model || "gpt-5-mini"]
+  const data = await Promise.all(
+    models.map((model) =>
+      loadRouteDebug({ model, providerID: input.providerID, account: input.allAccounts ? undefined : input.account }),
+    ),
+  )
+  if (input.allModels)
+    return { schemaVersion: 1, summary: routeSummary(data), models: data }
+  return data[0]
+}
+
+export function routeSummary(models: RouteDebugJSON[]): RouteDebugSummaryJSON {
+  const wins = Object.fromEntries(
+    Object.entries(
+      models.reduce(
+        (acc, item) => {
+          if (item.selected) acc[item.selected] = (acc[item.selected] || 0) + 1
+          return acc
+        },
+        {} as Record<string, number>,
+      ),
+    ).sort(([a], [b]) => a.localeCompare(b)),
+  )
+  const selectedCount = models.filter((item) => !!item.selected).length
+  const total = models.length || 1
+  const byAccount = Object.fromEntries(
+    Object.entries(wins).map(([key, value]) => [key, { wins: value, winRate: value / total }]),
+  )
+  const top = Object.entries(wins).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0]
+  const seen = new Set(models.flatMap((item) => item.candidates.map((x) => x.key)))
+  const losers = [...seen].filter((key) => !(key in wins)).sort()
+  return {
+    wins,
+    byAccount,
+    byProviderAlias: byAccount,
+    topWinner: top?.[0] ?? null,
+    topWinRate: top ? top[1] / total : 0,
+    topLoser: losers[0] ?? null,
+    rejectionRate: 1 - selectedCount / total,
+    modelCount: models.length,
+    selectedCount,
+    selectedRate: selectedCount / total,
+    winRate: Object.fromEntries(Object.entries(wins).map(([key, value]) => [key, value / total])),
+    rejectedByLane: models
+      .flatMap((item) => item.candidates)
+      .filter((item) => item.rejectedReason.includes("laneMismatch")).length,
+    rejectedByPenalty: models
+      .flatMap((item) => item.candidates)
+      .filter((item) => item.rejectedReason.includes("higherPenalty")).length,
+    rejectedByDiscovery: models
+      .flatMap((item) => item.candidates)
+      .filter((item) => item.rejectedReason.includes("lowerDiscoveryRank")).length,
+    byModel: Object.fromEntries(
+      models.map((item) => [
+        item.model,
+        {
+          selected: item.selected,
+          winnerReason: item.candidates.find((x) => x.selected)?.selectedReason ?? [],
+          rejectedByLane: item.candidates.filter((x) => x.rejectedReason.includes("laneMismatch")).length,
+          rejectedByPenalty: item.candidates.filter((x) => x.rejectedReason.includes("higherPenalty")).length,
+          rejectedByDiscovery: item.candidates.filter((x) => x.rejectedReason.includes("lowerDiscoveryRank")).length,
+        },
+      ]),
+    ),
+  }
+}
+
 export const ProvidersCommand = cmd({
   command: "providers",
   aliases: ["auth"],
   describe: "manage AI providers and credentials",
   builder: (yargs) =>
-    yargs.command(ProvidersListCommand).command(ProvidersLoginCommand).command(ProvidersLogoutCommand).demandCommand(),
+    yargs
+      .command(ProvidersListCommand)
+      .command(ProvidersLoginCommand)
+      .command(ProvidersLogoutCommand)
+      .command(ProvidersQuotaCommand)
+      .command(ProvidersAccountsCommand)
+      .command(ProvidersRouteDebugCommand)
+      .command(ProvidersProxyCommand)
+      .demandCommand(),
   async handler() {},
 })
 
@@ -240,7 +721,7 @@ export const ProvidersListCommand = cmd({
     const database = await ModelsDev.get()
 
     for (const [providerID, result] of results) {
-      const name = database[providerID]?.name || providerID
+      const name = copilotAliasName(providerID, database[providerID]?.name)
       prompts.log.info(`${name} ${UI.Style.TEXT_DIM}${result.type}`)
     }
 
@@ -252,7 +733,7 @@ export const ProvidersListCommand = cmd({
       for (const envVar of provider.env) {
         if (process.env[envVar]) {
           activeEnvVars.push({
-            provider: provider.name || providerID,
+            provider: copilotAliasName(providerID, provider.name),
             envVar,
           })
         }
@@ -479,6 +960,152 @@ export const ProvidersLoginCommand = cmd({
   },
 })
 
+export const ProvidersQuotaCommand = cmd({
+  command: "quota",
+  describe: "show GitHub Copilot quota for all configured accounts",
+  builder: (yargs) => yargs.option("json", { type: "boolean", describe: "output account overview as json" }),
+  async handler(args) {
+    UI.empty()
+    prompts.intro("GitHub Copilot Quota")
+
+    const { accounts, items, state } = await loadAccountStatuses()
+    const migration = CopilotRuntimeState.migrationSummary() ?? summarizeMigration({ version: 1, keys: [] })
+
+    if (accounts.length === 0) {
+      prompts.log.error("No GitHub Copilot accounts configured. Run: opencode providers login")
+      prompts.outro("Done")
+      return
+    }
+
+    if (args.json) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            schemaVersion: ACCOUNT_STATUS_SCHEMA_VERSION,
+            migration: jsonMigration(migration),
+            items: items.map((item) => ({
+              schemaVersion: ACCOUNT_STATUS_SCHEMA_VERSION,
+              ...item,
+              status: jsonStatus(item.status),
+            })),
+          },
+          null,
+          2,
+        ) + "\n",
+      )
+      return
+    }
+
+    prompts.log.info(`Migration: ${migration.text}`)
+    if (migration.source) prompts.log.info(`Migration source: ${migration.source}`)
+    if (migration.migratedAt) prompts.log.info(`Migration at: ${new Date(migration.migratedAt).toISOString()}`)
+    for (const item of items) {
+      const text = renderAccountStatus(item.status, { premium: item.premium, enterpriseUrl: item.info.enterpriseUrl })
+      if (item.status.error && item.status.health !== "ok") prompts.log.error(text)
+      else prompts.log.info(text)
+    }
+    prompts.outro(`${accounts.length} account${accounts.length === 1 ? "" : "s"}`)
+  },
+})
+
+export const ProvidersAccountsCommand = cmd({
+  command: "accounts",
+  describe: "show GitHub Copilot account overview",
+  builder: (yargs) => yargs.option("json", { type: "boolean", describe: "output account overview as json" }),
+  async handler(args) {
+    UI.empty()
+    prompts.intro("GitHub Copilot Accounts")
+    const { accounts, items, state } = await loadAccountStatuses()
+    const migration = CopilotRuntimeState.migrationSummary() ?? summarizeMigration({ version: 1, keys: [] })
+    if (accounts.length === 0) {
+      prompts.log.error("No GitHub Copilot accounts configured. Run: opencode providers login")
+      prompts.outro("Done")
+      return
+    }
+    if (args.json) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            schemaVersion: ACCOUNT_STATUS_SCHEMA_VERSION,
+            migration: jsonMigration(migration),
+            items: items.map((item) => ({
+              schemaVersion: ACCOUNT_STATUS_SCHEMA_VERSION,
+              ...item,
+              status: jsonStatus(item.status),
+            })),
+          },
+          null,
+          2,
+        ) + "\n",
+      )
+      return
+    }
+    for (const item of items) {
+      const text = renderAccountStatus(item.status, { premium: item.premium, enterpriseUrl: item.info.enterpriseUrl })
+      if (item.status.error && item.status.health !== "ok") prompts.log.error(text)
+      else prompts.log.info(text)
+    }
+    prompts.outro(`${accounts.length} account${accounts.length === 1 ? "" : "s"}`)
+  },
+})
+
+export const ProvidersRouteDebugCommand = cmd({
+  command: "route-debug [model]",
+  describe: "Show GitHub Copilot routing candidates for a model",
+  builder: (yargs) =>
+    yargs
+      .positional("model", { type: "string" })
+      .option("provider", { type: "string" })
+      .option("account", { type: "string" })
+      .option("all-accounts", { type: "boolean" })
+      .option("all-models", { type: "boolean" })
+      .option("summary-only", { type: "boolean" })
+      .option("json", { type: "boolean" }),
+  handler: async (args) => {
+    const data = await loadRouteExplain({
+      model: args.model,
+      providerID: args.provider,
+      account: args.account,
+      allAccounts: args.allAccounts,
+      allModels: args.allModels,
+    })
+    if (args.json) {
+      const body =
+        args.summaryOnly && "summary" in data ? { schemaVersion: data.schemaVersion, summary: data.summary } : data
+      process.stdout.write(JSON.stringify(body, null, 2) + "\n")
+      return
+    }
+    if ("models" in data) {
+      prompts.intro("Route debug for multiple models")
+      prompts.log.info(`Selected: ${data.summary.selectedCount}`)
+      prompts.log.info(`Rejected by lane: ${data.summary.rejectedByLane}`)
+      prompts.log.info(`Rejected by penalty: ${data.summary.rejectedByPenalty}`)
+      prompts.log.info(`Rejected by discovery: ${data.summary.rejectedByDiscovery}`)
+      for (const [key, value] of Object.entries(data.summary.wins)) prompts.log.info(`Wins ${key}: ${value}`)
+      for (const block of data.models) {
+        prompts.log.info(`Model: ${block.model}`)
+        if (block.selected) prompts.log.info(`Selected: ${block.selected}`)
+        for (const item of block.candidates) {
+          prompts.log.info(
+            `${item.key} | discovery=${item.discovery} penalty=${item.penalty} | ${item.routeReason.join(", ") || "no-signals"}`,
+          )
+        }
+      }
+    } else {
+      prompts.intro(`Route debug for ${data.model}`)
+      if (data.providerID) prompts.log.info(`Provider: ${data.providerID}`)
+      if (data.account) prompts.log.info(`Account: ${data.account}`)
+      if (data.selected) prompts.log.info(`Selected: ${data.selected}`)
+      for (const item of data.candidates) {
+        prompts.log.info(
+          `${item.key} | discovery=${item.discovery} penalty=${item.penalty} | ${item.routeReason.join(", ") || "no-signals"}`,
+        )
+      }
+    }
+    prompts.outro("Done")
+  },
+})
+
 export const ProvidersLogoutCommand = cmd({
   command: "logout",
   describe: "log out from a configured provider",
@@ -499,7 +1126,7 @@ export const ProvidersLogoutCommand = cmd({
     const selected = await prompts.select({
       message: "Select provider",
       options: credentials.map(([key, value]) => ({
-        label: (database[key]?.name || key) + UI.Style.TEXT_DIM + " (" + value.type + ")",
+        label: copilotAliasName(key, database[key]?.name) + UI.Style.TEXT_DIM + " (" + value.type + ")",
         value: key,
       })),
     })
@@ -512,5 +1139,92 @@ export const ProvidersLogoutCommand = cmd({
       }),
     )
     prompts.outro("Logout successful")
+  },
+})
+
+export async function saveProxy(key: string, proxyUrl?: string, proxyToken?: string) {
+  const raw = await Bun.file(connectionFile).json().catch(() => empty())
+  const parsed = StateSchema.zod.safeParse(raw)
+  const state = parsed.success ? parsed.data : empty()
+  const next = applyProxy(state, key, { proxyUrl, proxyToken })
+  await Bun.write(connectionFile, JSON.stringify(next, null, 2))
+  return next
+}
+
+export const ProvidersProxyCommand = cmd({
+  command: "proxy",
+  describe: "configure GitHub Copilot proxy for a specific account",
+  builder: (yargs) =>
+    yargs
+      .option("provider", { type: "string", describe: "provider/account key" })
+      .option("url", { type: "string", describe: "proxy base url" })
+      .option("token", { type: "string", describe: "proxy token" })
+      .option("list", { type: "boolean", describe: "show current proxy config" }),
+  async handler(args) {
+    UI.empty()
+    prompts.intro("GitHub Copilot Proxy")
+
+    const credentials = await allAuth()
+    const accounts = quotaAccounts(
+      credentials as Record<string, { type: string; refresh?: string; enterpriseUrl?: string }>,
+    )
+
+    if (accounts.length === 0) {
+      prompts.log.error("No GitHub Copilot accounts configured. Run: opencode providers login")
+      prompts.outro("Done")
+      return
+    }
+
+    if (args.list) {
+      const state = await readConnections()
+      for (const item of proxyList(state, accounts)) {
+        const detail = item.url ? `${item.url}${item.token ? " (token set)" : ""}` : "direct (no proxy)"
+        prompts.log.info(`${item.label} ${UI.Style.TEXT_DIM}${detail}`)
+      }
+      prompts.outro(`${accounts.length} account${accounts.length === 1 ? "" : "s"}`)
+      return
+    }
+
+    const key =
+      args.provider ||
+      (await prompts.select({
+        message: "Account",
+        options: accounts.map(([item]) => ({
+          label: copilotAliasLabel(item),
+          value: item,
+        })),
+      }))
+
+    if (prompts.isCancel(key)) throw new UI.CancelledError()
+
+    const url =
+      args.url ??
+      (await prompts.text({
+        message: "Proxy URL (leave blank to clear)",
+        placeholder: "https://gcp-proxy.example",
+      }))
+
+    if (prompts.isCancel(url)) throw new UI.CancelledError()
+
+    const trimmed = url.trim()
+    const token =
+      args.token ??
+      (trimmed
+        ? await prompts.text({
+            message: "Proxy token (optional)",
+            placeholder: "token",
+          })
+        : "")
+
+    if (prompts.isCancel(token)) throw new UI.CancelledError()
+
+    const next = await saveProxy(key, trimmed || undefined, token?.trim() || undefined)
+    const cfg = next.connections[key]
+    prompts.log.success(
+      cfg?.proxyUrl
+        ? `Saved proxy for ${copilotAliasLabel(key)} -> ${cfg.proxyUrl}`
+        : `Cleared proxy for ${copilotAliasLabel(key)}`,
+    )
+    prompts.outro("Done")
   },
 })

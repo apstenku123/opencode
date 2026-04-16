@@ -79,6 +79,12 @@ function data(workspace?: string | null) {
         deletions: 0,
       },
     ],
+    autobest: {
+      active: { key: `pick-${tag}`, source: "auto", ts: 1, score: 7 },
+      selected: { key: `pick-${tag}`, score: 7, reason: [tag] },
+      changed: true,
+      candidates: 2,
+    },
   }
 }
 
@@ -165,6 +171,9 @@ function createFetch(log: Hit[]) {
       }
       if (url.pathname === "/session/ses_1/diff") {
         return json(data(workspace).diff)
+      }
+      if (url.pathname === "/session/ses_1/autobest") {
+        return json(data(workspace).autobest)
       }
 
       throw new Error(`unexpected request: ${req.method} ${url.pathname}`)
@@ -267,6 +276,7 @@ describe("SyncProvider", () => {
 
       expect(log.filter((item) => item.path === "/session/ses_1" && item.workspace === "ws_a")).toHaveLength(1)
       expect(sync.data.todo.ses_1[0]?.content).toBe("todo-ws_a")
+      expect(sync.data.session_autobest.ses_1).toEqual(data("ws_a").autobest)
       expect(sync.data.message.ses_1[0]?.id).toBe("msg_1")
       expect(sync.data.part.msg_1[0]).toMatchObject({ type: "text", text: "part-ws_a" })
       expect(sync.data.session_diff.ses_1[0]?.file).toBe("ws_a.ts")

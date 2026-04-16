@@ -1008,3 +1008,52 @@ describe("session.llm.stream", () => {
     })
   })
 })
+
+
+  test("github copilot alias provider ids resolve through provider registry", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(
+          path.join(dir, "opencode.json"),
+          JSON.stringify(
+            {
+              $schema: "https://opencode.ai/config.json",
+              provider: {
+                "github-copilot": {
+                  models: {
+                    "gpt-5-mini": {
+                      name: "GPT-5 mini",
+                      api: { id: "gpt-5-mini", npm: "@ai-sdk/openai-compatible", url: "https://api.githubcopilot.com" },
+                      capabilities: {
+                        temperature: true, reasoning: false, attachment: true, toolcall: true,
+                        input: { text: true, audio: false, image: true, video: false, pdf: false },
+                        output: { text: true, audio: false, image: false, video: false, pdf: false },
+                        interleaved: false,
+                      },
+                      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                      limit: { context: 128000, output: 8192 },
+                    },
+                  },
+                },
+              },
+              enabled_providers: ["github-copilot", "github-copilot#edu", "github-copilot#enterprise", "github-copilot#personal", "github-copilot#free"],
+            },
+            null,
+            2,
+          ),
+        )
+      },
+    })
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const ids = ["github-copilot#edu", "github-copilot#enterprise", "github-copilot#personal", "github-copilot#free"]
+        for (const id of ids) {
+          const resolved = await getModel(ProviderID.make(id as unknown as never), ModelID.make("gpt-5-mini"))
+          expect(resolved.providerID as string).toBe(id)
+          expect(resolved.api.id).toBe("gpt-5-mini")
+        }
+      },
+    })
+  })

@@ -47,8 +47,10 @@ import { Pty } from "@/pty"
 import { Installation } from "@/installation"
 import { ShareNext } from "@/share/share-next"
 import { SessionShare } from "@/share/session"
+import { TimerSvc } from "@/server/instance/timer"
 
-export const AppLayer = Layer.mergeAll(
+export const AppLayer = Layer.suspend(() =>
+  Layer.mergeAll(
   Observability.layer,
   AppFileSystem.defaultLayer,
   Bus.defaultLayer,
@@ -95,6 +97,8 @@ export const AppLayer = Layer.mergeAll(
   Installation.defaultLayer,
   ShareNext.defaultLayer,
   SessionShare.defaultLayer,
+  TimerSvc.defaultLayer,
+),
 )
 
 const rt = ManagedRuntime.make(AppLayer, { memoMap })
