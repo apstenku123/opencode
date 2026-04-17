@@ -23,6 +23,7 @@ const Conn = Schema.Struct({
   login: Schema.optional(Schema.String),
   plan: Schema.optional(Schema.String),
   preferred: Schema.optional(Schema.Boolean),
+  deactivated: Schema.optional(Schema.Boolean),
   machineId: Schema.optional(Schema.String),
   proxyUrl: Schema.optional(Schema.String),
   proxyToken: Schema.optional(Schema.String),
@@ -44,23 +45,74 @@ export function empty(): State {
   return { version: 1, connections: {} }
 }
 
+/**
+ * `true` if test-only accounts (keys matching `github-copilot#edu-*`)
+ * should be included in routing. Mirrors the Rust
+ * `ConnectionManager::with_test_accounts` flag. Defaults to `false` in
+ * production; set `OPENCODE_ALLOW_TEST_ACCOUNTS=1` to opt in (e.g. for
+ * E2E coverage).
+ */
+export function allowTestAccounts(): boolean {
+  return process.env.OPENCODE_ALLOW_TEST_ACCOUNTS === "1"
+}
+
+/** Returns `true` when the key matches the test-account pattern. */
+export function isTestAccountKey(key: string): boolean {
+  return /^github-copilot#edu-/.test(key)
+}
+
+/** Drop test accounts unless they have been explicitly allowed. */
+export function filterTestAccounts<T extends { key: string }>(items: T[]): T[] {
+  if (allowTestAccounts()) return items
+  return items.filter((item) => !isTestAccountKey(item.key))
+}
+
+/**
+ * Clear any `exhaustedUntil` entries that have already elapsed. Mirrors
+ * the in-place stale-exhaustion auto-clear performed by Rust's
+ * `ConnectionManager::get_connections` before returning the sorted list
+ * (`connections.rs:148-189`).
+ */
+export function clearStaleExhaustion(state: State, now = Date.now()): State {
+  let changed = false
+  const connections: Record<string, Conn> = {}
+  for (const [key, conn] of Object.entries(state.connections)) {
+    const until = conn.exhaustedUntil
+    if (until !== undefined && until <= now) {
+      const { exhaustedUntil: _dropped, ...rest } = conn
+      connections[key] = rest
+      changed = true
+    } else {
+      connections[key] = conn
+    }
+  }
+  return changed ? { ...state, connections } : state
+}
+
 export function sort(auths: CopilotAuth[], state: State) {
-  return [...auths].sort((a, b) => {
-    if (state.preferred === a.key) return -1
-    if (state.preferred === b.key) return 1
-    if (a.key === "github-copilot") return -1
-    if (b.key === "github-copilot") return 1
-    return a.key.localeCompare(b.key)
-  })
+  return filterTestAccounts(
+    [...auths].sort((a, b) => {
+      if (state.preferred === a.key) return -1
+      if (state.preferred === b.key) return 1
+      if (a.key === "github-copilot") return -1
+      if (b.key === "github-copilot") return 1
+      return a.key.localeCompare(b.key)
+    }),
+  )
 }
 
 export function next(auths: CopilotAuth[], state: State, now = Date.now()) {
   const items = sort(auths, state)
   const live = items.filter((item) => {
-    const until = state.connections[item.key]?.exhaustedUntil
+    const conn = state.connections[item.key]
+    if (conn?.deactivated) return false
+    const until = conn?.exhaustedUntil
     return !until || until <= now
   })
   if (live.length > 0) return live[0]
+  // Fall back to any non-deactivated entry before returning the first.
+  const active = items.filter((item) => !state.connections[item.key]?.deactivated)
+  if (active.length > 0) return active[0]
   return items[0]
 }
 
@@ -90,14 +142,34 @@ export function upsert(state: State, key: string, input: Partial<Conn>): State {
   }
 }
 
+/**
+ * Mark the account exhausted until at least `until`. Mirrors Rust's
+ * `set_exhaustion` (`connections.rs:326-345`) — monotonic: never
+ * shortens an existing cooldown.
+ */
 export function mark(state: State, key: string, until: number) {
-  return upsert(state, key, { exhaustedUntil: until })
+  const existing = state.connections[key]?.exhaustedUntil ?? 0
+  return upsert(state, key, { exhaustedUntil: Math.max(existing, until) })
 }
 
 export function clear(state: State, key: string) {
   const item = state.connections[key]
   if (!item) return state
   return upsert(state, key, { exhaustedUntil: undefined })
+}
+
+/** Mark the account as deactivated (401/403 from the Copilot API). */
+export function markDeactivated(state: State, key: string): State {
+  return upsert(state, key, { deactivated: true })
+}
+
+/** Clear the deactivated flag, e.g. after a successful re-auth. */
+export function clearDeactivated(state: State, key: string): State {
+  return upsert(state, key, { deactivated: undefined })
+}
+
+export function isDeactivated(state: State, key: string): boolean {
+  return state.connections[key]?.deactivated === true
 }
 
 export function machine(state: State, key: string) {
@@ -160,7 +232,10 @@ export class Store {
     function* (this: Store) {
       const raw = (yield* this.fs.readJson(connectionFile).pipe(Effect.orElseSucceed(() => empty()))) as unknown
       const parsed = Schema.decodeUnknownOption(State)(raw)
-      return parsed._tag === "Some" ? parsed.value : empty()
+      const value = parsed._tag === "Some" ? parsed.value : empty()
+      // Mirror Rust's in-place stale-exhaustion auto-clear so callers never
+      // see expired cooldowns (connections.rs:148-189).
+      return clearStaleExhaustion(value)
     }.bind(this),
   )
 

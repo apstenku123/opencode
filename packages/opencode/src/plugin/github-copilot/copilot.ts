@@ -22,7 +22,10 @@ import {
   clear,
   discover,
   empty,
+  filterTestAccounts,
   hasModel,
+  isDeactivated,
+  markDeactivated,
   rotate,
   routed,
   machine,
@@ -94,6 +97,48 @@ export function getUrls(domain: string) {
 
 export function base(enterpriseUrl?: string) {
   return enterpriseUrl ? `https://copilot-api.${normalizeDomain(enterpriseUrl)}` : "https://api.githubcopilot.com"
+}
+
+export type CopilotStatus = {
+  rateLimited: boolean
+  authError: boolean
+  networkError: boolean
+  retryAfterSec?: number
+}
+
+/**
+ * Triage an HTTP response against the Copilot API, mirroring
+ * `github-copilot/src/error.rs::{is_auth_error,is_rate_limited,is_network_error}`
+ * so dispatch callers can branch on a single classification.
+ *
+ * - `rateLimited` — HTTP 429
+ * - `authError`   — HTTP 401 or 403 (token invalid / account deactivated)
+ * - `networkError`— HTTP 5xx (transient server-side)
+ * - `retryAfterSec` — parsed `retry-after` / `retry-delay` header when present
+ */
+export function copilotStatus(res: { status: number; headers?: Headers | Record<string, string> }): CopilotStatus {
+  const status = res.status
+  const headers = res.headers
+  const get = (name: string): string | undefined => {
+    if (!headers) return undefined
+    if (typeof (headers as Headers).get === "function") {
+      return (headers as Headers).get(name) ?? undefined
+    }
+    const rec = headers as Record<string, string>
+    return rec[name] ?? rec[name.toLowerCase()] ?? undefined
+  }
+  let retryAfterSec: number | undefined
+  const retry = get("retry-after") ?? get("retry-delay")
+  if (retry) {
+    const n = Number(retry)
+    if (Number.isFinite(n) && n >= 0) retryAfterSec = Math.trunc(n)
+  }
+  return {
+    rateLimited: status === 429,
+    authError: status === 401 || status === 403,
+    networkError: status >= 500 && status < 600,
+    retryAfterSec,
+  }
 }
 
 export async function aliasModels(input: {
@@ -441,6 +486,16 @@ export function routeDebug(input: {
   })
 }
 
+/**
+ * Exclude test (`#edu-*`) and deactivated accounts from routing.
+ * Keeps the primary / fallback as a last-resort so callers always
+ * get *something* back even when every alternate has been flagged.
+ */
+export function routableAuths(state: State, auths: CopilotAuth[]): CopilotAuth[] {
+  const filtered = filterTestAccounts(auths).filter((item) => !isDeactivated(state, item.key))
+  return filtered.length > 0 ? filtered : auths
+}
+
 export function routeAccount(input: {
   auths: CopilotAuth[]
   state: State
@@ -450,13 +505,14 @@ export function routeAccount(input: {
   runtime?: Runtime
   now?: number
 }) {
-  const alias = input.providerID ? routeAlias(input.auths, input.state, input.providerID) : undefined
+  const candidates = routableAuths(input.state, input.auths)
+  const alias = input.providerID ? routeAlias(candidates, input.state, input.providerID) : undefined
   if (alias) {
-    const match = input.auths.find((item) => item.key === alias)
+    const match = candidates.find((item) => item.key === alias)
     if (match) return match
   }
   const now = input.now ?? Date.now()
-  const planned = preferPlan(input.state, input.auths, input.modelId)
+  const planned = preferPlan(input.state, candidates, input.modelId)
   const lane = preferPolicy(input.state, planned, input.modelId, now)
   const pool = preferDiscovery(input.state, lane, input.modelId, now)
   const live = input.runtime ? eligible(input.runtime, pool) : pool
@@ -645,13 +701,26 @@ export async function dispatch(input: {
   })
   const cfg = proxyConfig(nextState, live.key)
   const res = await routedFetch(input.request, { ...input.init, headers }, cfg)
-  if (res.status === 429) {
+  const triage = copilotStatus(res)
+  if (triage.rateLimited) {
     pick.release()
-    await input.write(mark(nextState, live.key, Date.now() + 11 * 60 * 1000))
+    const cooldownMs = triage.retryAfterSec ? triage.retryAfterSec * 1000 : 11 * 60 * 1000
+    await input.write(mark(nextState, live.key, Date.now() + cooldownMs))
     if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
     return res
   }
-  if (res.status === 401) {
+  if (triage.authError) {
+    pick.release()
+    // 401/403 means the token is invalid or the account has been deactivated.
+    // Flag the account so subsequent dispatches skip it (mirror Rust
+    // `check_account_statuses` → `AccountStatus::is_deactivated`).
+    await input.write(markDeactivated(nextState, live.key))
+    if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
+    return res
+  }
+  if (triage.networkError) {
+    // 5xx is transient server-side: don't mark the account, but roll back
+    // the premium stamp so the retry is free to re-claim it.
     pick.release()
     if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
     return res
@@ -899,6 +968,10 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
               instructions: `Enter code: ${deviceData.user_code}`,
               method: "auto" as const,
               async callback() {
+                // Cap `slow_down` retries at 10 to avoid trapping the login
+                // flow indefinitely. Mirrors the Rust device-flow guard
+                // (`device_flow.rs:233-240`).
+                let slowDownCount = 0
                 while (true) {
                   const response = await fetch(urls.ACCESS_TOKEN_URL, {
                     method: "POST",
@@ -950,6 +1023,10 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
                   }
 
                   if (data.error === "slow_down") {
+                    slowDownCount += 1
+                    if (slowDownCount > 10) {
+                      return { type: "failed" as const }
+                    }
                     // Based on the RFC spec, we must add 5 seconds to our current polling interval.
                     // (See https://www.rfc-editor.org/rfc/rfc8628#section-3.5)
                     let newInterval = (deviceData.interval + 5) * 1000
