@@ -1,6 +1,16 @@
 import { afterEach, describe, expect, mock, test } from "bun:test"
 import { CopilotModels } from "@/plugin/github-copilot/models"
-import { CopilotAuthPlugin, aliasModels, base, fix, getUrls, imgMsg, normalizeDomain } from "@/plugin/github-copilot/copilot"
+import {
+  CopilotAuthPlugin,
+  aliasModels,
+  base,
+  createDiscoveryBarrier,
+  DISCOVERY_TIMEOUT_MS,
+  fix,
+  getUrls,
+  imgMsg,
+  normalizeDomain,
+} from "@/plugin/github-copilot/copilot"
 import { discover } from "@/plugin/github-copilot/connections"
 import { MessageV2 } from "@/session/message-v2"
 
@@ -732,8 +742,12 @@ test("alias provider models use per-account proxy routing", async () => {
       write: async () => undefined,
     })
     expect(result).toEqual({})
-    expect(calls[0]?.url).toBe("https://gcp-proxy.example/models")
+    // Two-step discovery: `/copilot_internal/user` then `/models`, both routed
+    // through the per-account proxy with the `x-copilot-proxy-token` header.
+    expect(calls[0]?.url).toBe("https://gcp-proxy.example/copilot_internal/user")
     expect(calls[0]?.headers["x-copilot-proxy-token"]).toBe("ptok")
+    expect(calls[1]?.url).toBe("https://gcp-proxy.example/models")
+    expect(calls[1]?.headers["x-copilot-proxy-token"]).toBe("ptok")
   } finally {
   }
 })
@@ -922,4 +936,286 @@ test("base provider.models persists discovery error snapshot on failure", async 
     })
   } finally {
   }
+})
+
+describe("CopilotModels plan gating", () => {
+  test("retainForPlan drops models whose restricted_to excludes the plan", () => {
+    const items = [
+      { id: "free-model", billing: { restricted_to: [] } },
+      { id: "pro-only", billing: { restricted_to: ["pro_plus"] } },
+      { id: "biz-or-ent", billing: { restricted_to: ["business", "enterprise"] } },
+      { id: "unbilled" }, // no billing field at all
+    ] as never[]
+    // unrestricted ("no restricted_to" or empty) always passes
+    expect(CopilotModels.retainForPlan(items, "pro_plus").map((m: any) => m.id)).toEqual([
+      "free-model",
+      "pro-only",
+      "unbilled",
+    ])
+    expect(CopilotModels.retainForPlan(items, "business").map((m: any) => m.id)).toEqual([
+      "free-model",
+      "biz-or-ent",
+      "unbilled",
+    ])
+    // unknown SKU short-circuits (no filtering)
+    expect(CopilotModels.retainForPlan(items, "unknown").length).toBe(4)
+    expect(CopilotModels.retainForPlan(items, undefined).length).toBe(4)
+  })
+
+  test("CopilotModels.get filters catalog by plan SKU", async () => {
+    const prev = globalThis.fetch
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                model_picker_enabled: true,
+                id: "gpt-5.4",
+                name: "GPT-5.4",
+                version: "gpt-5.4-2026-01-01",
+                supported_endpoints: ["/chat/completions"],
+                billing: { restricted_to: [] },
+                capabilities: {
+                  family: "gpt",
+                  limits: { max_context_window_tokens: 1, max_output_tokens: 1, max_prompt_tokens: 1 },
+                  supports: { streaming: true, tool_calls: true },
+                },
+              },
+              {
+                model_picker_enabled: true,
+                id: "claude-opus-4.6",
+                name: "Claude Opus 4.6",
+                version: "claude-opus-4.6-2026-01-01",
+                supported_endpoints: ["/chat/completions"],
+                billing: { restricted_to: ["pro_plus", "business", "enterprise"] },
+                capabilities: {
+                  family: "claude",
+                  limits: { max_context_window_tokens: 1, max_output_tokens: 1, max_prompt_tokens: 1 },
+                  supports: { streaming: true, tool_calls: true },
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+    try {
+      const free = await CopilotModels.get("https://api.githubcopilot.com", {}, {}, undefined, "copilot_free")
+      expect(Object.keys(free)).toEqual(["gpt-5.4"])
+      const biz = await CopilotModels.get("https://api.githubcopilot.com", {}, {}, undefined, "business")
+      expect(Object.keys(biz).sort()).toEqual(["claude-opus-4.6", "gpt-5.4"])
+      // unknown plan returns everything
+      const any = await CopilotModels.get("https://api.githubcopilot.com", {}, {}, undefined, "unknown")
+      expect(Object.keys(any).sort()).toEqual(["claude-opus-4.6", "gpt-5.4"])
+    } finally {
+      globalThis.fetch = prev
+    }
+  })
+})
+
+describe("CopilotModels bundled fallback + canonicalization", () => {
+  test("BUNDLED contains the baseline 2026 Copilot catalog", () => {
+    const ids = CopilotModels.BUNDLED.map((m) => m.id)
+    expect(ids).toContain("gpt-5.4")
+    expect(ids).toContain("gpt-5.3-codex")
+    expect(ids).toContain("claude-opus-4.6")
+    expect(ids).toContain("gemini-3.1-pro-preview")
+  })
+
+  test("canonicalize rewrites known legacy aliases", () => {
+    expect(CopilotModels.canonicalize("gemini-3-pro-preview")).toBe("gemini-3.1-pro-preview")
+    expect(CopilotModels.canonicalize("  gpt-5.4 ")).toBe("gpt-5.4")
+  })
+
+  test("canonicalize rejects invalid model ids", () => {
+    expect(CopilotModels.canonicalize("")).toBeUndefined()
+    expect(CopilotModels.canonicalize("   ")).toBeUndefined()
+    expect(CopilotModels.canonicalize("GPT-5.4")).toBeUndefined() // uppercase rejected
+    expect(CopilotModels.canonicalize("gpt 5")).toBeUndefined() // space rejected
+    expect(CopilotModels.canonicalize("gpt/5")).toBeUndefined() // slash rejected
+  })
+})
+
+describe("aliasModels two-step discovery chain", () => {
+  test("resolves API base + plan SKU from /copilot_internal/user before /models", async () => {
+    const prev = globalThis.fetch
+    const calls: Array<{ url: string; headers: Record<string, string> }> = []
+    globalThis.fetch = mock((url, init) => {
+      const u = String(url)
+      calls.push({ url: u, headers: (init?.headers as Record<string, string>) ?? {} })
+      if (u.endsWith("/copilot_internal/user")) {
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              user_login: "corp",
+              copilot_plan: "enterprise",
+              access_type_sku: "enterprise",
+              endpoints: { api: "https://api.enterprise.githubcopilot.com" },
+              entitlements: { premium_requests: 0 },
+            }),
+            { status: 200 },
+          ),
+        )
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                model_picker_enabled: true,
+                id: "gpt-5.4",
+                name: "GPT-5.4",
+                version: "gpt-5.4-2026-01-01",
+                supported_endpoints: ["/chat/completions"],
+                billing: { restricted_to: ["enterprise"] },
+                capabilities: {
+                  family: "gpt",
+                  limits: { max_context_window_tokens: 1, max_output_tokens: 1, max_prompt_tokens: 1 },
+                  supports: { streaming: true, tool_calls: true },
+                },
+              },
+              {
+                // Filtered out by plan gate (free-plan-only)
+                model_picker_enabled: true,
+                id: "gpt-5.4-free",
+                name: "GPT-5.4 Free",
+                version: "gpt-5.4-free-2026-01-01",
+                supported_endpoints: ["/chat/completions"],
+                billing: { restricted_to: ["free"] },
+                capabilities: {
+                  family: "gpt",
+                  limits: { max_context_window_tokens: 1, max_output_tokens: 1, max_prompt_tokens: 1 },
+                  supports: { streaming: true, tool_calls: true },
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      )
+    }) as unknown as typeof fetch
+    try {
+      const writes: unknown[] = []
+      const result = await aliasModels({
+        provider: { id: "github-copilot#enterprise", models: {} } as never,
+        auth: { type: "oauth", refresh: "ent", access: "ent", expires: 0 } as never,
+        auths: [
+          {
+            key: "github-copilot#corp",
+            label: "corp",
+            refresh: "ent",
+            access: "ent",
+            expires: 0,
+            enterpriseUrl: "ghe.example.com",
+          },
+        ],
+        state: { version: 1, connections: { "github-copilot#corp": { plan: "enterprise", login: "corp" } } } as never,
+        write: async (next) => {
+          writes.push(next)
+        },
+      })
+      // Step 1: /copilot_internal/user (static api.github.com base because no proxy).
+      expect(calls[0]?.url).toBe("https://api.github.com/copilot_internal/user")
+      // Step 2: /models uses the dynamic `endpoints.api` from step 1.
+      expect(calls[1]?.url).toBe("https://api.enterprise.githubcopilot.com/models")
+      // Plan gate dropped `gpt-5.4-free`.
+      expect(Object.keys(result ?? {})).toEqual(["gpt-5.4"])
+      expect((writes.at(-1) as any).connections["github-copilot#corp"].discovery).toMatchObject({
+        ok: true,
+        models: ["gpt-5.4"],
+        api: "https://api.enterprise.githubcopilot.com",
+      })
+    } finally {
+      globalThis.fetch = prev
+    }
+  })
+
+  test("falls back to static base when /copilot_internal/user fails", async () => {
+    const prev = globalThis.fetch
+    const calls: string[] = []
+    globalThis.fetch = mock((url) => {
+      const u = String(url)
+      calls.push(u)
+      if (u.endsWith("/copilot_internal/user")) {
+        return Promise.resolve(new Response("nope", { status: 500 }))
+      }
+      return Promise.resolve(new Response(JSON.stringify({ data: [] }), { status: 200 }))
+    }) as unknown as typeof fetch
+    try {
+      await aliasModels({
+        provider: { id: "github-copilot#corp", models: {} } as never,
+        auth: { type: "oauth", refresh: "ent", access: "ent", expires: 0 } as never,
+        auths: [
+          {
+            key: "github-copilot#corp",
+            label: "corp",
+            refresh: "ent",
+            access: "ent",
+            expires: 0,
+            enterpriseUrl: "ghe.example.com",
+          },
+        ],
+        state: { version: 1, connections: { "github-copilot#corp": { plan: "enterprise", login: "corp" } } } as never,
+        write: async () => undefined,
+      })
+      expect(calls[0]).toBe("https://api.github.com/copilot_internal/user")
+      // Fallback to static enterprise base.
+      expect(calls[1]).toBe("https://copilot-api.ghe.example.com/models")
+    } finally {
+      globalThis.fetch = prev
+    }
+  })
+})
+
+describe("discovery barrier", () => {
+  test("wait returns immediately when barrier was never started for the key", async () => {
+    const b = createDiscoveryBarrier()
+    const before = Date.now()
+    await b.wait("never-started", 5000)
+    expect(Date.now() - before).toBeLessThan(100)
+  })
+
+  test("wait blocks until resolve is called", async () => {
+    const b = createDiscoveryBarrier()
+    b.start("k")
+    const gate = b.wait("k", 10_000)
+    let settled = false
+    const tracked = gate.then(() => {
+      settled = true
+    })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(settled).toBe(false)
+    b.resolve("k")
+    await tracked
+    expect(settled).toBe(true)
+    expect(b.done("k")).toBe(true)
+  })
+
+  test("wait returns after the bounded 10s timeout even if resolve is never called", async () => {
+    const b = createDiscoveryBarrier()
+    b.start("stuck")
+    const before = Date.now()
+    await b.wait("stuck", 25)
+    const elapsed = Date.now() - before
+    expect(elapsed).toBeGreaterThanOrEqual(20)
+    expect(elapsed).toBeLessThan(500)
+    expect(b.done("stuck")).toBe(false)
+  })
+
+  test("resolve is idempotent and subsequent waits return immediately", async () => {
+    const b = createDiscoveryBarrier()
+    b.start("k")
+    b.resolve("k")
+    b.resolve("k") // no-op
+    const before = Date.now()
+    await b.wait("k", 5000)
+    expect(Date.now() - before).toBeLessThan(100)
+    expect(b.done("k")).toBe(true)
+  })
+
+  test("DISCOVERY_TIMEOUT_MS mirrors the Rust 10s bound", () => {
+    expect(DISCOVERY_TIMEOUT_MS).toBe(10_000)
+  })
 })
