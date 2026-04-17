@@ -12,6 +12,7 @@ import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
+import { SkillSearchTool } from "./skill-search"
 import * as Tool from "./tool"
 import { Config } from "../config"
 import { type ToolContext as PluginToolContext, type ToolDefinition } from "@opencode-ai/plugin"
@@ -45,6 +46,7 @@ import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { Bus } from "../bus"
 import { Agent } from "../agent/agent"
 import { Skill } from "../skill"
+import { SkillEvolution } from "@/skill/evolution"
 import { Permission } from "@/permission"
 import { SubagentRegistry } from "@/subagent/registry"
 
@@ -78,6 +80,7 @@ export const layer: Layer.Layer<
   | Todo.Service
   | Agent.Service
   | Skill.Service
+  | SkillEvolution.Service
   | Session.Service
   | Provider.Service
   | LSP.Service
@@ -98,6 +101,7 @@ export const layer: Layer.Layer<
     const plugin = yield* Plugin.Service
     const agents = yield* Agent.Service
     const skill = yield* Skill.Service
+    const evolution = yield* SkillEvolution.Service
     const truncate = yield* Truncate.Service
 
     const invalid = yield* InvalidTool
@@ -117,6 +121,7 @@ export const layer: Layer.Layer<
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const skillsearchtool = yield* SkillSearchTool
     const agent = yield* Agent.Service
 
     const state = yield* InstanceState.make<State>(
@@ -191,6 +196,7 @@ export const layer: Layer.Layer<
           search: Tool.init(websearch),
           code: Tool.init(codesearch),
           skill: Tool.init(skilltool),
+          skill_search: Tool.init(skillsearchtool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
@@ -214,6 +220,7 @@ export const layer: Layer.Layer<
             tool.search,
             tool.code,
             tool.skill,
+            tool.skill_search,
             tool.patch,
             ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [tool.lsp] : []),
             ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [tool.plan] : []),
@@ -290,6 +297,27 @@ export const layer: Layer.Layer<
             parameters: tool.parameters,
           }
           yield* plugin.trigger("tool.definition", { toolID: tool.id }, output)
+          // Decorate the underlying execute to fan tool outcomes into the
+          // skill evolution engine. Fire-and-forget — never let a bookkeeping
+          // failure abort the user-facing tool call.
+          const wrappedExecute: Tool.Def["execute"] = (args, ctx) =>
+            Effect.gen(function* () {
+              const result = yield* tool.execute(args, ctx).pipe(
+                Effect.tapDefect((cause) =>
+                  evolution
+                    .onToolComplete({
+                      toolName: tool.id,
+                      success: false,
+                      error: String(cause),
+                    })
+                    .pipe(Effect.ignore),
+                ),
+              )
+              yield* evolution
+                .onToolComplete({ toolName: tool.id, success: true })
+                .pipe(Effect.ignore)
+              return result
+            })
           return {
             id: tool.id,
             description: [
@@ -300,7 +328,7 @@ export const layer: Layer.Layer<
               .filter(Boolean)
               .join("\n"),
             parameters: output.parameters,
-            execute: tool.execute,
+            execute: wrappedExecute,
             formatValidationError: tool.formatValidationError,
           }
         }),
@@ -324,6 +352,7 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(Question.defaultLayer),
     Layer.provide(Todo.defaultLayer),
     Layer.provide(Skill.defaultLayer),
+    Layer.provide(SkillEvolution.defaultLayer),
     Layer.provide(Agent.defaultLayer),
     Layer.provide(Session.defaultLayer),
     Layer.provide(Provider.defaultLayer),

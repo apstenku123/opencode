@@ -90,7 +90,19 @@ export namespace SystemPrompt {
             if (Permission.disabled(["skill"], agent.permission).has("skill")) return
             const conf = yield* cfg.get()
             const list = yield* skill.available(agent)
-            const picks = conf.autoskill === false ? [] : recommend({ text: input, list }).slice(0, 3)
+            // BM25 first-pass: when autoskill is enabled, ask the BM25 index
+            // for the top-5 matches. If it returns nothing (cold start, or a
+            // query whose tokens are all corpus-absent / stopword-only) we
+            // fall back to the legacy substring `recommend()` scorer so the
+            // system prompt still ships with at least one hint.
+            let picks: Skill.Info[] = []
+            if (conf.autoskill !== false && input && input.trim().length > 0) {
+              const hits = yield* skill.search(input, 5)
+              picks = hits.slice(0, 3).map((h) => h.skill)
+              if (picks.length === 0) {
+                picks = recommend({ text: input, list }).slice(0, 3)
+              }
+            }
             return [
               "Skills provide specialized instructions and workflows for specific tasks.",
               "Use the skill tool to load a skill when a task matches its description.",
