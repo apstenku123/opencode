@@ -11,6 +11,12 @@ export namespace CopilotModels {
         // every version looks like: `{model.id}-YYYY-MM-DD`
         version: z.string(),
         supported_endpoints: z.array(z.string()).optional(),
+        billing: z
+          .object({
+            restricted_to: z.array(z.string()).optional(),
+            multiplier: z.number().optional(),
+          })
+          .optional(),
         capabilities: z.object({
           family: z.string(),
           limits: z.object({
@@ -41,6 +47,82 @@ export namespace CopilotModels {
   })
 
   type Item = z.infer<typeof schema>["data"][number]
+
+  /**
+   * Bundled fallback catalog — mirrors Rust `COPILOT_MODELS` in
+   * `github-copilot/src/lib.rs:53-99`. Used to canonicalize/recognize
+   * known Copilot model IDs when `/models` cannot be reached.
+   */
+  export const BUNDLED: Array<{
+    id: string
+    display_name: string
+    context_window: number
+    max_output_tokens: number
+    supports_reasoning: boolean
+    premium_multiplier: number
+  }> = [
+    {
+      id: "gpt-5.4",
+      display_name: "GPT-5.4",
+      context_window: 272_000,
+      max_output_tokens: 128_000,
+      supports_reasoning: true,
+      premium_multiplier: 1.0,
+    },
+    {
+      id: "gpt-5.3-codex",
+      display_name: "GPT-5.3 Codex",
+      context_window: 272_000,
+      max_output_tokens: 128_000,
+      supports_reasoning: true,
+      premium_multiplier: 1.0,
+    },
+    {
+      id: "claude-opus-4.6",
+      display_name: "Claude Opus 4.6",
+      context_window: 144_000,
+      max_output_tokens: 64_000,
+      supports_reasoning: true,
+      premium_multiplier: 3.0,
+    },
+    {
+      id: "gemini-3.1-pro-preview",
+      display_name: "Gemini 3.1 Pro Preview",
+      context_window: 128_000,
+      max_output_tokens: 64_000,
+      supports_reasoning: true,
+      premium_multiplier: 1.0,
+    },
+  ]
+
+  /**
+   * Normalize Copilot model ID (mirrors Rust `canonicalize_copilot_model_id`
+   * in `github-copilot/src/lib.rs:101-116`). Returns `undefined` when the
+   * raw ID contains characters that aren't valid for Copilot model slugs.
+   */
+  export function canonicalize(modelId: string): string | undefined {
+    const trimmed = modelId.trim()
+    if (!trimmed) return undefined
+    const canonical = trimmed === "gemini-3-pro-preview" ? "gemini-3.1-pro-preview" : trimmed
+    const valid = /^[a-z0-9\-._]+$/.test(canonical)
+    return valid ? canonical : undefined
+  }
+
+  /**
+   * Drop any model whose `billing.restricted_to` plan list excludes `plan`.
+   * Empty/missing `restricted_to` means the model is unrestricted.
+   * Pass an empty/unknown plan to skip filtering (mirrors Rust
+   * `CopilotModelCatalog::retain_for_plan` in `models.rs:174-180`).
+   */
+  export function retainForPlan(items: Item[], plan: string | undefined): Item[] {
+    if (!plan) return items
+    if (plan === "unknown" || plan === "no_sku_field") return items
+    return items.filter((m) => {
+      const restricted = m.billing?.restricted_to ?? []
+      if (restricted.length === 0) return true
+      return restricted.includes(plan)
+    })
+  }
 
   function build(key: string, remote: Item, url: string, prev?: Model): Model {
     const reasoning =
@@ -112,6 +194,7 @@ export namespace CopilotModels {
     headers: HeadersInit = {},
     existing: Record<string, Model> = {},
     proxyUrl?: string,
+    plan?: string,
   ): Promise<Record<string, Model>> {
     const target = proxyUrl ? new URL("/models", proxyUrl).href : `${baseURL}/models`
     const data = await fetch(target, {
@@ -125,7 +208,8 @@ export namespace CopilotModels {
     })
 
     const result = { ...existing }
-    const remote = new Map(data.data.filter((m) => m.model_picker_enabled).map((m) => [m.id, m] as const))
+    const gated = retainForPlan(data.data, plan)
+    const remote = new Map(gated.filter((m) => m.model_picker_enabled).map((m) => [m.id, m] as const))
 
     // prune existing models whose api.id isn't in the endpoint response
     for (const [key, model] of Object.entries(result)) {
