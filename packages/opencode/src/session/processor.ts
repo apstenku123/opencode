@@ -15,6 +15,8 @@ import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
+import { Skill } from "@/skill"
+import { maybeAutoExtractSkill } from "@/skill/hook"
 import type { Provider } from "@/provider"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
@@ -91,6 +93,7 @@ export namespace SessionProcessor {
     | Plugin.Service
     | SessionSummary.Service
     | SessionStatus.Service
+    | Skill.Service
   > = Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -105,6 +108,7 @@ export namespace SessionProcessor {
       const summary = yield* SessionSummary.Service
       const scope = yield* Scope.Scope
       const status = yield* SessionStatus.Service
+      const skill = yield* Skill.Service
 
       const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
         // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -521,6 +525,50 @@ export namespace SessionProcessor {
           yield* session.updateMessage(ctx.assistantMessage)
         })
 
+        const maybeAutoExtractTurn = Effect.fn("SessionProcessor.maybeAutoExtractTurn")(function* (
+          processorCtx: ProcessorContext,
+        ) {
+          // Sub-agent detection: any session with a parentID is a spawned
+          // child, matching Rust's `SessionSource::SubAgent` gate.
+          const sessionInfo = yield* session
+            .get(processorCtx.sessionID)
+            .pipe(Effect.catch(() => Effect.succeed(undefined as Session.Info | undefined)))
+          const isSubAgent = !!sessionInfo && sessionInfo.parentID !== undefined
+
+          // Reconstruct the user prompt from the parent user message's text
+          // parts. The extractor's name generator ranks this first; a blank
+          // prompt falls back to the first tool-call argument summary.
+          const parentID = processorCtx.assistantMessage.parentID
+          let userPrompt = ""
+          if (parentID) {
+            const messages = yield* session
+              .messages({ sessionID: processorCtx.sessionID })
+              .pipe(Effect.catch(() => Effect.succeed([] as MessageV2.WithParts[])))
+            const userMsg = messages.find((m) => m.info.id === parentID)
+            if (userMsg) {
+              userPrompt = userMsg.parts
+                .filter((p): p is MessageV2.TextPart => p.type === "text")
+                .map((p) => p.text)
+                .join("\n")
+            }
+          }
+
+          // Gather assistant turn parts (the extractor walks ToolParts).
+          const parts = MessageV2.parts(processorCtx.assistantMessage.id)
+          const modelResponse = parts
+            .filter((p): p is MessageV2.TextPart => p.type === "text")
+            .map((p) => p.text)
+            .join("\n")
+
+          yield* maybeAutoExtractSkill({
+            turnId: processorCtx.assistantMessage.id,
+            userPrompt,
+            modelResponse,
+            parts,
+            isSubAgent,
+          })
+        })
+
         const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
           slog.error("process", { error: errorMessage(e), stack: e instanceof Error ? e.stack : undefined })
           const error = parse(e)
@@ -584,6 +632,24 @@ export namespace SessionProcessor {
 
             if (ctx.needsCompaction) return "compact"
             if (ctx.blocked || ctx.assistantMessage.error) return "stop"
+            // Autoskill hot-insert hook. We fire on every final step
+            // (finish reason != "tool-calls"), not on intermediate tool-call
+            // loops — otherwise a single multi-step turn would invoke the
+            // extractor several times and race on the auto-skill file path.
+            // The hook itself is fire-and-forget: extraction + disk I/O
+            // never block or fail the turn; errors are swallowed and logged.
+            const terminalFinish =
+              ctx.assistantMessage.finish && ctx.assistantMessage.finish !== "tool-calls"
+            if (terminalFinish) {
+              yield* maybeAutoExtractTurn(ctx).pipe(
+                Effect.ignore,
+                Effect.provideService(Config.Service, config),
+                Effect.provideService(Bus.Service, bus),
+                Effect.provideService(Skill.Service, skill),
+                Effect.provideService(Session.Service, session),
+                Effect.forkIn(scope),
+              )
+            }
             return "continue"
           })
         })
@@ -612,6 +678,7 @@ export namespace SessionProcessor {
       Layer.provide(Plugin.defaultLayer),
       Layer.provide(SessionSummary.defaultLayer),
       Layer.provide(SessionStatus.defaultLayer),
+      Layer.provide(Skill.defaultLayer),
       Layer.provide(Bus.layer),
       Layer.provide(Config.defaultLayer),
     ),

@@ -59,6 +59,16 @@ export interface Interface {
   readonly all: () => Effect.Effect<Info[]>
   readonly dirs: () => Effect.Effect<string[]>
   readonly available: (agent?: Agent.Info) => Effect.Effect<Info[]>
+  /**
+   * Inject a freshly-extracted skill into the live registry without a disk
+   * re-scan. Used by the autoskill hot-insert pipeline after it writes the
+   * generated SKILL.md to `~/.local/share/opencode/skills/auto/<name>.md`.
+   *
+   * Subsequent `get`/`all`/`available` calls within the same session reflect
+   * the insert. `notifyHotInserted` overlays the entry on top of the
+   * disk-scanned state — it does not touch disk itself.
+   */
+  readonly notifyHotInserted: (skill: Info) => Effect.Effect<void>
 }
 
 const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.Interface) {
@@ -224,7 +234,19 @@ export const layer = Layer.effect(
       return list.filter((skill) => Permission.evaluate("skill", skill.name, agent.permission).action !== "deny")
     })
 
-    return Service.of({ get, all, dirs, available })
+    const notifyHotInserted = Effect.fn("Skill.notifyHotInserted")(function* (skill: Info) {
+      const s = yield* InstanceState.get(state)
+      // Mid-turn safe overlay: the `State` record is held by reference inside
+      // ScopedCache so direct mutation is visible to every subsequent get/all.
+      // We intentionally do **not** emit a parse error if the name collides
+      // — a hot-insert is allowed to replace a stale auto-extracted skill
+      // with a freshly regenerated one.
+      s.skills[skill.name] = skill
+      s.dirs.add(path.dirname(skill.location))
+      log.info("hot-inserted skill", { name: skill.name, location: skill.location })
+    })
+
+    return Service.of({ get, all, dirs, available, notifyHotInserted })
   }),
 )
 

@@ -128,6 +128,7 @@ function makeHttp() {
     Command.defaultLayer,
     Permission.defaultLayer,
     Plugin.defaultLayer,
+    Skill.defaultLayer,
     Config.defaultLayer,
     ProviderSvc.defaultLayer,
     filetime,
