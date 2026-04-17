@@ -461,6 +461,25 @@ export namespace SessionEvent {
         reason: Schema.Array(Schema.String).pipe(Schema.optional),
       }),
     ),
+    /**
+     * Step A/B/C/D kind. Ports `codex-rs/core/src/autobest_extract.rs::AutobestStep`.
+     * Optional for backward-compat with existing history writers.
+     */
+    stepKind: Schema.Union([Schema.Literal("a"), Schema.Literal("b"), Schema.Literal("c"), Schema.Literal("d")]).pipe(
+      Schema.optional,
+    ),
+    /** Human-readable decision reason, e.g. "llm-step-a", "regex-fallback", "max-iterations". */
+    reason: Schema.String.pipe(Schema.optional),
+    /** Cycle iteration index (0-based). Mirror of Rust `AutobestTurnResult::iteration`. */
+    iteration: Schema.Number.pipe(Schema.optional),
+    /** Turn correlation id. */
+    turnID: Schema.String.pipe(Schema.optional),
+    /** LLM call duration in ms. */
+    elapsedMs: Schema.Number.pipe(Schema.optional),
+    /** Model id used for Step A extraction. */
+    modelUsed: Schema.String.pipe(Schema.optional),
+    /** Action scheduled as next user turn (auto-continue payload). */
+    resultingAction: Schema.String.pipe(Schema.optional),
   }) {
     static create(
       input: BaseInput & {
@@ -468,6 +487,13 @@ export namespace SessionEvent {
         selected?: { key: string; score: number; reason?: string[] }
         changed: boolean
         candidates: { key: string; score: number; reason?: string[] }[]
+        stepKind?: "a" | "b" | "c" | "d"
+        reason?: string
+        iteration?: number
+        turnID?: string
+        elapsedMs?: number
+        modelUsed?: string
+        resultingAction?: string
       },
     ) {
       return new Autobest({
@@ -479,6 +505,13 @@ export namespace SessionEvent {
         selected: input.selected,
         changed: input.changed,
         candidates: input.candidates,
+        stepKind: input.stepKind,
+        reason: input.reason,
+        iteration: input.iteration,
+        turnID: input.turnID,
+        elapsedMs: input.elapsedMs,
+        modelUsed: input.modelUsed,
+        resultingAction: input.resultingAction,
       })
     }
   }

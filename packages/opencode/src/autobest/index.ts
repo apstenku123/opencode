@@ -11,9 +11,27 @@ export type Pick = {
   ts: number
 }
 
+/** Step kind for post-turn continuation pipeline (A→B→C→D).
+ * See `codex-rs/core/src/autobest_extract.rs::AutobestStep`. */
+export type StepKind = "a" | "b" | "c" | "d"
+
+/**
+ * Per-session cycle state — tracks iteration count and the last step kind /
+ * turn correlation to gate the auto-continue feedback loop.
+ * Mirror of the Rust `Session::what_next_asks_used_this_cycle` + iteration
+ * bookkeeping from `autobest_extract.rs`.
+ */
+export type CycleState = {
+  iteration: number
+  stepKind: StepKind
+  turnID?: string
+  whatNextAsked?: boolean
+}
+
 export type State = {
   active?: Pick
   picks: Pick[]
+  cycle?: CycleState
 }
 
 export type Decision = {
@@ -25,6 +43,34 @@ export type Decision = {
 
 export function empty(): State {
   return { picks: [] }
+}
+
+/**
+ * Advance the cycle state — called each time the observer applies a Step A/B/C/D result.
+ * Returns a new state with iteration+1 and the provided stepKind / turnID.
+ */
+export function advanceCycle(
+  state: State,
+  input: { stepKind: StepKind; turnID?: string; whatNextAsked?: boolean },
+): State {
+  const prev = state.cycle ?? { iteration: 0, stepKind: "a" as StepKind }
+  return {
+    ...state,
+    cycle: {
+      iteration: prev.iteration + 1,
+      stepKind: input.stepKind,
+      turnID: input.turnID ?? prev.turnID,
+      whatNextAsked: input.whatNextAsked ?? prev.whatNextAsked,
+    },
+  }
+}
+
+/** Reset the cycle. Matches `reset_what_next_cycle` in Rust. */
+export function resetCycle(state: State): State {
+  return {
+    ...state,
+    cycle: { iteration: 0, stepKind: "a" },
+  }
 }
 
 export function setActive(state: State, input: { key: string; source?: Pick["source"]; ts?: number; score?: number }) {
