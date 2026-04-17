@@ -104,12 +104,34 @@ export const TaskTool = Tool.define(
         providerID: msg.info.providerID,
       }
 
-      yield* ctx.metadata({
+      // The tool-input-start / tool-call stream events (which register the tool part and
+      // transition it to "running") run concurrently with tool execution. If we call
+      // ctx.metadata before those events have landed, the processor has no toolcall entry
+      // and silently drops the update. Retry until we can observe our tool part so the
+      // metadata write actually sticks before we hand off to the child prompt loop.
+      const metadataPayload = {
         title: params.description,
         metadata: {
           sessionId: nextSession.id,
           model,
         },
+      }
+      yield* Effect.gen(function* () {
+        const deadline = Date.now() + 2_000
+        while (true) {
+          yield* ctx.metadata(metadataPayload)
+          const observed = yield* Effect.sync(() => {
+            const refreshed = MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID })
+            const toolPart = refreshed.parts.find(
+              (part): part is MessageV2.ToolPart =>
+                part.type === "tool" && part.callID === ctx.callID,
+            )
+            return toolPart?.state.status === "running" && toolPart.state.metadata?.sessionId === nextSession.id
+          })
+          if (observed) break
+          if (Date.now() >= deadline) break
+          yield* Effect.sleep("10 millis")
+        }
       })
 
       const ops = ctx.extra?.promptOps as TaskPromptOps
