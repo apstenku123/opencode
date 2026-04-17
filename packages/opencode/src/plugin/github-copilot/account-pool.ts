@@ -27,12 +27,33 @@ import {
   HEADERLESS_429_FALLBACK_DELAYS_MS,
   MAX_AGENTS_PER_ACCOUNT,
   effectiveLimit,
+  ensureRate,
+  hydrateExhaustion as hydrateRateState,
   owner,
   parseRetryAfter,
   record429,
   recordSuccess,
   type Runtime,
 } from "./runtime"
+import type { RateRow, RateStore } from "./account-pool-sqlite"
+
+/**
+ * Per-account model capability classification — mirrors Rust
+ * `core/src/account_pool.rs::ModelCapability`. Hard priority during
+ * model-aware failover: `Supported > Unknown > DiscoveryFailed > Unsupported`
+ * (lower rank wins; `Unsupported` is skipped entirely).
+ */
+export type ModelCapability = "Supported" | "Unknown" | "DiscoveryFailed" | "Unsupported"
+
+const CAPABILITY_RANK: Record<ModelCapability, number> = {
+  Supported: 0,
+  Unknown: 1,
+  DiscoveryFailed: 2,
+  Unsupported: Number.MAX_SAFE_INTEGER,
+}
+
+/** Cooldowns longer than this are presumed stale (legacy 24h evictions). */
+export const STALE_COOLDOWN_THRESHOLD_MS = 60 * 60 * 1000
 
 export type AccountEntry = {
   key: string
@@ -83,12 +104,20 @@ type LeaseRecord = {
   createdAt: number
 }
 
+type CapabilityState = {
+  unsupported: Set<string>
+  supported: Set<string>
+  discoveryFailed: boolean
+}
+
 export class AccountPool {
   readonly runtime: Runtime
   private accounts: AccountEntry[] = []
   private waiters: Waiter[] = []
   private leases = new Set<LeaseRecord>()
   private gc: ReturnType<typeof setInterval> | undefined
+  private capabilities = new Map<string, CapabilityState>()
+  private store: RateStore | undefined
 
   /**
    * Max lease lifetime before the GC forcibly releases it. Defaults to the
@@ -96,10 +125,39 @@ export class AccountPool {
    */
   leaseTTL = ACQUIRE_TIMEOUT_MS
 
-  constructor(input: { accounts?: AccountEntry[]; runtime?: Runtime; limit?: number; minIntervalMs?: number } = {}) {
+  constructor(input: {
+    accounts?: AccountEntry[]
+    runtime?: Runtime
+    limit?: number
+    minIntervalMs?: number
+    /** Optional persistence store (see `account-pool-sqlite.ts`). */
+    store?: RateStore
+  } = {}) {
     this.runtime =
       input.runtime ?? owner(input.limit ?? MAX_AGENTS_PER_ACCOUNT, input.minIntervalMs ?? 0)
+    if (input.store) this.attachStore(input.store)
     if (input.accounts) this.setAccounts(input.accounts)
+  }
+
+  /**
+   * Attach a persistence store and hydrate the runtime rate book-keeping
+   * with whatever it returns from {@link RateStore.loadAll}. Subsequent
+   * `recordExhaustion` / `recordSuccess` calls will write through.
+   */
+  attachStore(store: RateStore) {
+    this.store = store
+    for (const row of store.loadAll()) this.hydrateExhaustion(row)
+  }
+
+  /**
+   * Apply a snapshot row read from disk. Mirrors Rust
+   * `AccountPoolPersistence::with_root` boot-time `snapshot.retain` step.
+   */
+  hydrateExhaustion(row: RateRow) {
+    const rate = ensureRate(this.runtime, row.key)
+    if (row.exhaustedUntil !== undefined) hydrateRateState(this.runtime, row.key, row.exhaustedUntil)
+    rate.headerless429Count = row.headerless429Count
+    if (row.last429At !== undefined) rate.last429At = row.last429At
   }
 
   /** Replace the account roster. The primary flag, if absent, defaults to
@@ -316,6 +374,7 @@ export class AccountPool {
       retryAfterMs = parseRetryAfter(options.retryAfter ?? null, now)
     }
     const result = record429(this.runtime, key, { retryAfterMs, now })
+    this.persist(key)
     // An exhaustion shrinks the effective slot budget to 0 — wake waiters
     // targeting other keys so they may pick a different account.
     this.flush()
@@ -324,7 +383,121 @@ export class AccountPool {
 
   recordSuccess(key: string, now = Date.now()) {
     recordSuccess(this.runtime, key, now)
+    this.persist(key)
     this.flush()
+  }
+
+  private persist(key: string) {
+    if (!this.store) return
+    const rate = this.runtime.rate[key]
+    if (!rate) {
+      this.store.remove(key)
+      return
+    }
+    if (rate.exhaustedUntil === undefined && rate.last429At === undefined && rate.headerless429Count === 0) {
+      this.store.remove(key)
+      return
+    }
+    this.store.upsert({
+      key,
+      exhaustedUntil: rate.exhaustedUntil,
+      headerless429Count: rate.headerless429Count,
+      last429At: rate.last429At,
+    })
+  }
+
+  // ---------------------------------------------------------------------------
+  // Model capability tracking + model-aware failover
+  // ---------------------------------------------------------------------------
+
+  private capabilityState(key: string): CapabilityState {
+    let state = this.capabilities.get(key)
+    if (!state) {
+      state = { unsupported: new Set(), supported: new Set(), discoveryFailed: false }
+      this.capabilities.set(key, state)
+    }
+    return state
+  }
+
+  /** Replace the supported-model set for an account; clears the discovery-failed flag. */
+  setAccountCapabilities(key: string, supportedModels: Iterable<string>) {
+    const state = this.capabilityState(key)
+    state.supported = new Set(supportedModels)
+    state.discoveryFailed = false
+    state.unsupported.forEach((model) => {
+      // A model showing up on the supported list outranks a stale unsupported flag.
+      if (state.supported.has(model)) state.unsupported.delete(model)
+    })
+    this.flush()
+  }
+
+  /** Mark capability discovery as failed (network error / non-2xx). */
+  markDiscoveryFailed(key: string) {
+    const state = this.capabilityState(key)
+    state.discoveryFailed = true
+    this.flush()
+  }
+
+  /**
+   * Mark a single model as unsupported on `key`.
+   *
+   * Mirrors Rust `AccountPool::mark_model_unsupported` (`account_pool.rs:1632-1658`).
+   * As a side-effect, clears any rate-limit cooldown longer than 1 hour on
+   * the same account — those are almost certainly leftovers from the legacy
+   * 24-hour `model_not_supported` eviction, not a real 429 backoff.
+   */
+  markModelUnsupported(key: string, modelId: string, now = Date.now()) {
+    const state = this.capabilityState(key)
+    state.unsupported.add(modelId)
+    state.supported.delete(modelId)
+    const rate = this.runtime.rate[key]
+    if (rate?.exhaustedUntil !== undefined && rate.exhaustedUntil > now + STALE_COOLDOWN_THRESHOLD_MS) {
+      rate.exhaustedUntil = undefined
+      rate.headerless429Count = 0
+      rate.requestAvailableAt = undefined
+      this.persist(key)
+    }
+    this.flush()
+  }
+
+  /** Capability classification for a (key, model) pair. */
+  modelCapability(key: string, modelId: string): ModelCapability {
+    const state = this.capabilities.get(key)
+    if (!state) return "Unknown"
+    if (state.unsupported.has(modelId)) return "Unsupported"
+    if (state.supported.has(modelId)) return "Supported"
+    if (state.discoveryFailed) return "DiscoveryFailed"
+    return "Unknown"
+  }
+
+  /**
+   * Pick the best alternate account for `modelId` excluding `currentKey`.
+   * Mirrors Rust `AccountPool::failover_token_for_model`
+   * (`account_pool.rs:1038-1142`).
+   *
+   *   - hard priority on capability rank (Supported > Unknown > DiscoveryFailed)
+   *   - never returns an `Unsupported` account
+   *   - tie-breaks on more available headroom
+   *   - returns `undefined` when no alternate is currently assignable
+   */
+  failoverTokenForModel(currentKey: string, modelId: string, now = Date.now()): string | undefined {
+    let best: { key: string; rank: number; slots: number } | undefined
+    for (const account of this.accounts) {
+      if (account.key === currentKey) continue
+      const cap = this.modelCapability(account.key, modelId)
+      if (cap === "Unsupported") continue
+      const slots = this.availableSlots(account.key, now)
+      if (slots <= 0) continue
+      const rank = CAPABILITY_RANK[cap]
+      if (
+        !best ||
+        rank < best.rank ||
+        (rank === best.rank && slots > best.slots)
+      ) {
+        best = { key: account.key, rank, slots }
+      }
+    }
+    return best?.key
   }
 
   /** Total accounts currently assignable (have >=1 slot). */

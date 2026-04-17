@@ -242,6 +242,15 @@ export function feed(state: Runtime | undefined) {
 // ---------------------------------------------------------------------------
 
 function rateOf(state: Runtime, key: string): RateState {
+  return ensureRate(state, key)
+}
+
+/**
+ * Ensure a `RateState` entry exists for `key`. Public helper used by the
+ * `AccountPool` to hydrate snapshot rows on boot without invoking the
+ * 429-recording side-effects.
+ */
+export function ensureRate(state: Runtime, key: string): RateState {
   const existing = state.rate[key]
   if (existing) return existing
   const created: RateState = { headerless429Count: 0 }
@@ -311,7 +320,7 @@ export function recordSuccess(state: Runtime, key: string, now = Date.now()) {
   if (!rate) return
   rate.exhaustedUntil = undefined
   rate.requestAvailableAt = undefined
-  if (rate.last429At && now - rate.last429At >= HEADERLESS_429_RESET_MS) {
+  if (rate.last429At !== undefined && now - rate.last429At >= HEADERLESS_429_RESET_MS) {
     rate.headerless429Count = 0
     rate.last429At = undefined
   }

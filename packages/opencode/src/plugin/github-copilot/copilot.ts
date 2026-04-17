@@ -12,15 +12,15 @@ import {
   feed,
   load,
   owner,
-  record429,
   recordSuccess,
-  reserve,
-  reserveBatch,
   touch,
   usage,
   type Event,
   type Runtime,
 } from "./runtime"
+import { AccountPool } from "./account-pool"
+import { openRateStore } from "./account-pool-sqlite"
+import path from "path"
 import { classifyPlan, fetchQuota } from "./quota"
 import { MessageV2 } from "@/session/message-v2"
 import { Auth } from "@/auth"
@@ -39,7 +39,9 @@ import {
   filterTestAccounts,
   hasModel,
   isDeactivated,
+  isModelUnsupported,
   markDeactivated,
+  markModelUnsupported,
   rotate,
   routed,
   machine,
@@ -83,12 +85,29 @@ export const CopilotRuntimeState = {
     return summarizeMigration(migrationOutcome.last)
   },
   current: undefined as Runtime | undefined,
+  pool: undefined as AccountPool | undefined,
   info: {} as Record<string, { lane?: string; discovery: number; penalty: number; cooldown: boolean; selected?: boolean; selectedReason?: string[]; rejectedReason?: string[] }>,
   usage() {
     return usage(this.current)
   },
   feed() {
     return feed(this.current).map((item) => ({ ...this.info[item.key], ...item }))
+  },
+  /**
+   * Number of accounts currently assignable (not in cooldown / not in use up
+   * to the per-account cap). Mirrors Rust `AccountPool::available_account_count`.
+   */
+  availableAccountCount(now = Date.now()) {
+    return this.pool?.availableAccountCount(now) ?? 0
+  },
+  /**
+   * Cascade-breaker signal — `true` when more than 50% of accounts are in
+   * cooldown. Callers (e.g. `tool/task.ts`) can use this to defer spawning
+   * new sub-agents.  Mirrors Rust `AccountPool::should_throttle_spawns`
+   * (`account_pool.rs:1422-1430`).
+   */
+  shouldThrottleSpawns(now = Date.now()) {
+    return this.pool?.shouldThrottleSpawns(now) ?? false
   },
 }
 
@@ -669,6 +688,15 @@ export async function dispatch(input: {
   write: (state: State) => Promise<void>
   premium: Map<string, Set<string>>
   runtime: Runtime
+  /**
+   * Optional `AccountPool`. When provided the dispatch path replaces the
+   * legacy flat `reserve()/release()` book-keeping with bounded
+   * `pool.acquire()` (5 min timeout, `preferSecondary: true`) and routes
+   * 429 / model-not-supported signals through the pool's API. Callers
+   * without a pool fall back to the previous flat-reserve behaviour so
+   * legacy tests stay green.
+   */
+  pool?: AccountPool
   request: RequestInfo | URL
   init?: RequestInit
   isVision: boolean
@@ -696,20 +724,19 @@ export async function dispatch(input: {
     fallback,
     runtime: input.runtime,
   })
-  const held =
-    !input.providerID && input.auths.length > 1
-      ? reserveBatch(input.runtime, autobestBatch({
-          auths: input.auths,
-          state,
-          modelId: input.modelId,
-          count: input.runtime.limit,
-        }))
-      : undefined
-  const slot = held?.held.find((item) => item.key === live.key && item.held)
-  if (held) {
-    held.held.filter((item) => item !== slot).forEach((item) => item.release())
-  }
-  const pick = slot ?? reserve(input.runtime, live.key)
+  // Acquire a slot via the AccountPool when available — RAII lease w/
+  // bounded 5-min wait + secondary preference for sub-agents (`isAgent`).
+  // Otherwise fall back to the legacy autobest batch reservation.
+  const release = await reserveSlot({
+    pool: input.pool,
+    runtime: input.runtime,
+    auths: input.auths,
+    state,
+    modelId: input.modelId,
+    providerID: input.providerID,
+    key: live.key,
+    isAgent: input.isAgent,
+  })
   const isPremium = input.modelId ? premiumState(input.premium, live.key, input.modelId) : !input.isAgent
   const fresh = await refreshAccount({ state, key: live.key, token: live.refresh, enterpriseUrl: live.enterpriseUrl })
   const [nextState, machineId] = machine(routed(fresh, live.key), live.key)
@@ -746,20 +773,23 @@ export async function dispatch(input: {
   const res = await routedFetch(input.request, { ...input.init, headers }, cfg)
   const triage = copilotStatus(res)
   if (triage.rateLimited) {
-    pick.release()
+    release()
     // Honor Retry-After when present; else run the headerless-429 escalator
     // (11m → 21m → 41m). `record429` is monotonic — it never shortens an
-    // existing cooldown (Rust `set_exhaustion` semantics).
+    // existing cooldown (Rust `set_exhaustion` semantics). Routed through
+    // `pool.recordExhaustion` when a pool is attached so persistence picks
+    // it up in the background flush.
     const retryAfter = res.headers.get("retry-after") ?? res.headers.get("Retry-After")
-    const { until } = record429(input.runtime, live.key, {
-      retryAfterMs: parseRetryAfterHeader(retryAfter),
-    })
-    await input.write(mark(nextState, live.key, until))
+    const retryAfterMs = parseRetryAfterHeader(retryAfter)
+    const result = input.pool
+      ? input.pool.recordExhaustion(live.key, { retryAfter, ...(retryAfterMs !== undefined ? { delayMs: retryAfterMs } : {}) })
+      : (await import("./runtime")).record429(input.runtime, live.key, { retryAfterMs })
+    await input.write(mark(nextState, live.key, result.until))
     if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
     return res
   }
   if (triage.authError) {
-    pick.release()
+    release()
     // 401/403 means the token is invalid or the account has been deactivated.
     // Flag the account so subsequent dispatches skip it (mirror Rust
     // `check_account_statuses` → `AccountStatus::is_deactivated`).
@@ -770,17 +800,76 @@ export async function dispatch(input: {
   if (triage.networkError) {
     // 5xx is transient server-side: don't mark the account, but roll back
     // the premium stamp so the retry is free to re-claim it.
-    pick.release()
+    release()
     if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
     return res
   }
+  // model_not_supported: server rejects the model on this account. Mark the
+  // account as Unsupported for that model and clear any stale >1h cooldown
+  // (Rust `mark_model_unsupported` semantics, `account_pool.rs:1632-1658`).
+  // We need to peek at the body without consuming it — clone first.
+  let modelUnsupportedNoticed = false
+  if (input.modelId && (res.status === 400 || res.status === 422)) {
+    try {
+      const peek = await res.clone().text()
+      if (/model[_\s-]?not[_\s-]?supported/i.test(peek)) {
+        modelUnsupportedNoticed = true
+        input.pool?.markModelUnsupported(live.key, input.modelId)
+        await input.write(markModelUnsupported(nextState, live.key, input.modelId))
+      }
+    } catch {
+      // body unreadable — silently fall through
+    }
+  }
   if (res.ok) {
-    recordSuccess(input.runtime, live.key)
+    if (input.pool) input.pool.recordSuccess(live.key)
+    else recordSuccess(input.runtime, live.key)
     await input.write(clear(nextState, live.key))
   }
-  pick.release()
+  release()
   touch(input.runtime, live.key)
+  void modelUnsupportedNoticed // surfaced via `markModelUnsupported` side-effects only
   return res
+}
+
+async function reserveSlot(input: {
+  pool?: AccountPool
+  runtime: Runtime
+  auths: CopilotAuth[]
+  state: State
+  modelId: string
+  providerID?: string
+  key: string
+  isAgent: boolean
+}): Promise<() => void> {
+  if (input.pool) {
+    try {
+      const lease = await input.pool.acquire(input.key, {
+        timeoutMs: 5 * 60 * 1000,
+        preferSecondary: input.isAgent,
+      })
+      return () => lease.release()
+    } catch {
+      // fall through to the legacy reservation path so we never deadlock the
+      // dispatcher just because the pool can't immediately give us the slot.
+    }
+  }
+  const { reserve, reserveBatch } = await import("./runtime")
+  const held =
+    !input.providerID && input.auths.length > 1
+      ? reserveBatch(input.runtime, autobestBatch({
+          auths: input.auths,
+          state: input.state,
+          modelId: input.modelId,
+          count: input.runtime.limit,
+        }))
+      : undefined
+  const slot = held?.held.find((item) => item.key === input.key && item.held)
+  if (held) {
+    held.held.filter((item) => item !== slot).forEach((item) => item.release())
+  }
+  const pick = slot ?? reserve(input.runtime, input.key)
+  return () => pick.release()
 }
 
 /**
@@ -875,6 +964,14 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   const runtime = owner(cfg.limit, cfg.minIntervalMs)
   const discoveryBarrier = createDiscoveryBarrier()
   CopilotRuntimeState.current = runtime
+  // Boot the AccountPool against the live runtime + SQLite cooldown store.
+  // The roster is refreshed lazily in `dispatch` (every call observes the
+  // current `auths` + `state.connections.unsupportedModels`).
+  const { Global } = await import("@/global")
+  const sqlitePath = path.join(Global.Path.data, "copilot-rate-state.sqlite")
+  const rateStore = await openRateStore(sqlitePath).catch(() => undefined)
+  const pool = new AccountPool({ runtime, store: rateStore })
+  CopilotRuntimeState.pool = pool
   return {
     provider: {
       id: "github-copilot",
@@ -916,14 +1013,19 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
           planSku,
         )
           .then(async (models) => {
+            const supported = Object.values(models).map((item) => item.api.id)
             const next = discover(storeState, key, {
-              models: Object.values(models).map((item) => item.api.id),
+              models: supported,
               api: apiBase,
               plan: storeState.connections[key]?.plan,
               login: storeState.connections[key]?.login,
               ok: true,
             })
             await writeState(next)
+            // Hand the supported model set to the AccountPool so
+            // `failoverTokenForModel` can rank Supported > Unknown for
+            // this account on subsequent dispatches.
+            pool.setAccountCapabilities(key, supported)
             discoveryBarrier.resolve(key)
             return models
           })
@@ -938,6 +1040,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
               err: error instanceof Error ? error.message : String(error),
             })
             await writeState(next)
+            pool.markDiscoveryFailed(key)
             discoveryBarrier.resolve(key)
             return Object.fromEntries(
               Object.entries(provider.models).map(([id, model]) => [id, fix(model, apiBase)]),
@@ -1024,13 +1127,30 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
             // to complete; subsequent dispatches resolve immediately.
             const barrierKey = (info as any).accountId ?? "github-copilot"
             await discoveryBarrier.wait(barrierKey)
+            const auths = await allAuths()
+            // Keep the pool's roster in sync with the live auth list. This
+            // is cheap (`setAccounts` is a Map rebuild) and ensures
+            // `acquire`/`shouldThrottleSpawns` see freshly-added accounts
+            // without restarting the process.
+            pool.setAccounts(auths.map((a) => ({ key: a.key, label: a.label })))
+            // Hydrate persisted per-account `unsupportedModels` into the
+            // pool capability cache so `failoverTokenForModel` skips
+            // accounts that have already been rejected for the requested
+            // model.
+            const currentState = await readState()
+            for (const auth of auths) {
+              const list = currentState.connections[auth.key]?.unsupportedModels
+              if (!list || list.length === 0) continue
+              for (const m of list) pool.markModelUnsupported(auth.key, m)
+            }
             return dispatch({
               getAuth,
-              auths: await allAuths(),
+              auths,
               read: readState,
               write: writeState,
               premium,
               runtime,
+              pool,
               request,
               init,
               isVision,

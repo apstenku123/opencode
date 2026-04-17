@@ -28,6 +28,13 @@ const Conn = Schema.Struct({
   proxyUrl: Schema.optional(Schema.String),
   proxyToken: Schema.optional(Schema.String),
   discovery: Schema.optional(Discovery),
+  /**
+   * Models the server has rejected with `model_not_supported` for this
+   * account. Mirrors Rust `AccountCapabilityState.unsupported_models`
+   * (`account_pool.rs:1632-1658`).  Used by `failoverTokenForModel` so
+   * routing skips accounts known to fail for the requested model.
+   */
+  unsupportedModels: Schema.optional(Schema.Array(Schema.String)),
 })
 
 const State = Schema.Struct({
@@ -217,6 +224,41 @@ export function clearDiscovery(state: State, key: string) {
 
 export function hasModel(state: State, key: string, model: string) {
   return !!state.connections[key]?.discovery?.models.includes(model)
+}
+
+/**
+ * Add `model` to the per-account `unsupportedModels` list.  Mirrors Rust
+ * `AccountPool::mark_model_unsupported` persistence side-effect — the
+ * runtime in-memory pool also gets the same flag separately.
+ *
+ * As a side-effect, clears any cooldown longer than `STALE_COOLDOWN_THRESHOLD_MS`
+ * (1h) on the same account: those are almost always leftovers from the legacy
+ * 24-hour `model_not_supported` eviction, not real 429 backoff.
+ */
+export const STALE_COOLDOWN_THRESHOLD_MS = 60 * 60 * 1000
+
+export function markModelUnsupported(state: State, key: string, model: string, now = Date.now()): State {
+  const existing = state.connections[key]?.unsupportedModels ?? []
+  const set = new Set(existing)
+  set.add(model)
+  const conn = state.connections[key]
+  const stale = conn?.exhaustedUntil !== undefined && conn.exhaustedUntil > now + STALE_COOLDOWN_THRESHOLD_MS
+  return upsert(state, key, {
+    unsupportedModels: [...set].sort(),
+    ...(stale ? { exhaustedUntil: undefined } : {}),
+  })
+}
+
+/** Remove `model` from `unsupportedModels` (e.g. after a successful re-discovery). */
+export function clearModelUnsupported(state: State, key: string, model: string): State {
+  const existing = state.connections[key]?.unsupportedModels
+  if (!existing || !existing.includes(model)) return state
+  const next = existing.filter((item) => item !== model)
+  return upsert(state, key, { unsupportedModels: next.length > 0 ? next : undefined })
+}
+
+export function isModelUnsupported(state: State, key: string, model: string): boolean {
+  return !!state.connections[key]?.unsupportedModels?.includes(model)
 }
 
 export function staleDiscovery(state: State, key: string, now = Date.now(), max = 30 * 60 * 1000) {

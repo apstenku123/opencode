@@ -221,4 +221,125 @@ describe("AccountPool", () => {
     expect(pool.availableSlots("k", base + PARTIAL_RECOVERY_MS)).toBe(2)
     expect(pool.availableSlots("k", base + FULL_RECOVERY_MS)).toBe(7)
   })
+
+  test("modelCapability defaults to Unknown", () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 1 })
+    expect(pool.modelCapability("k", "claude-opus-4.5")).toBe("Unknown")
+  })
+
+  test("setAccountCapabilities marks models Supported", () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 1 })
+    pool.setAccountCapabilities("k", ["gpt-5", "claude-opus-4.5"])
+    expect(pool.modelCapability("k", "gpt-5")).toBe("Supported")
+    expect(pool.modelCapability("k", "claude-opus-4.5")).toBe("Supported")
+    expect(pool.modelCapability("k", "unknown-model")).toBe("Unknown")
+  })
+
+  test("markDiscoveryFailed shows DiscoveryFailed for unknown models", () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 1 })
+    pool.markDiscoveryFailed("k")
+    expect(pool.modelCapability("k", "anything")).toBe("DiscoveryFailed")
+  })
+
+  test("markModelUnsupported flags model and clears stale >1h cooldown", () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 7 })
+    const now = 5_000_000
+    // Plant a 24h cooldown — the legacy `model_not_supported` 24h eviction
+    // shape that the GC should sweep.
+    pool.recordExhaustion("k", { delayMs: 24 * 60 * 60 * 1000, now })
+    expect(pool.availableSlots("k", now)).toBe(0)
+    pool.markModelUnsupported("k", "broken-model", now)
+    expect(pool.modelCapability("k", "broken-model")).toBe("Unsupported")
+    // Stale-cooldown GC should have fired.
+    expect(pool.availableSlots("k", now)).toBeGreaterThan(0)
+  })
+
+  test("markModelUnsupported preserves recent cooldowns under 1h", () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 7 })
+    const now = 5_000_000
+    pool.recordExhaustion("k", { delayMs: 30 * 60 * 1000, now })
+    pool.markModelUnsupported("k", "broken-model", now)
+    // 30m cooldown is well under the 1h staleness threshold — must remain.
+    expect(pool.availableSlots("k", now)).toBe(0)
+  })
+
+  test("failoverTokenForModel skips current key and Unsupported accounts", () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }, { key: "c" }],
+      limit: 7,
+    })
+    pool.markModelUnsupported("b", "gpt-5")
+    const pick = pool.failoverTokenForModel("a", "gpt-5")
+    expect(pick).toBe("c")
+  })
+
+  test("failoverTokenForModel hard-prefers Supported over Unknown", () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }, { key: "c" }],
+      limit: 7,
+    })
+    pool.setAccountCapabilities("c", ["gpt-5"])
+    // b is Unknown, c is Supported — Supported must win regardless of
+    // ordering / headroom.
+    const pick = pool.failoverTokenForModel("a", "gpt-5")
+    expect(pick).toBe("c")
+  })
+
+  test("failoverTokenForModel falls back to DiscoveryFailed when nothing else fits", () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }],
+      limit: 7,
+    })
+    pool.markModelUnsupported("b", "model")
+    const pick = pool.failoverTokenForModel("a", "model")
+    expect(pick).toBeUndefined()
+  })
+
+  test("failoverTokenForModel returns undefined when no slots", () => {
+    const pool = new AccountPool({ accounts: [{ key: "a" }, { key: "b" }], limit: 1 })
+    // Saturate b; a is current
+    pool.recordExhaustion("b", { delayMs: 60_000, now: 0 })
+    expect(pool.failoverTokenForModel("a", "model", 1_000)).toBeUndefined()
+  })
+
+  test("hydrateExhaustion restores cooldown without advancing escalator", () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 7 })
+    const now = 5_000_000
+    pool.hydrateExhaustion({
+      key: "k",
+      exhaustedUntil: now + 60_000,
+      headerless429Count: 2,
+      last429At: now,
+    })
+    expect(pool.availableSlots("k", now)).toBe(0)
+    // Next 429 *with* retry-after should reset the escalator (matches
+    // `record429` semantics).
+    const result = pool.recordExhaustion("k", { retryAfter: "30", now: now + 100 })
+    expect(result.delayMs).toBe(30_000)
+    expect(result.count).toBe(0)
+  })
+
+  test("attachStore hydrates rows and writes through on recordExhaustion", () => {
+    const writes: Array<{ key: string; exhaustedUntil?: number; headerless429Count: number; last429At?: number }> = []
+    const removes: string[] = []
+    const fakeStore = {
+      loadAll: () => [
+        { key: "preloaded", exhaustedUntil: 9_999_999, headerless429Count: 1, last429At: 1_000 },
+      ],
+      upsert: (row: typeof writes[number]) => writes.push(row),
+      remove: (key: string) => removes.push(key),
+      flush: () => {},
+      close: () => {},
+    }
+    const pool = new AccountPool({ accounts: [{ key: "preloaded" }, { key: "fresh" }], limit: 7, store: fakeStore })
+    // Hydrated cooldown surfaces immediately.
+    expect(pool.availableSlots("preloaded", 1_000_000)).toBe(0)
+    pool.recordExhaustion("fresh", { delayMs: 60_000, now: 0 })
+    expect(writes.find((row) => row.key === "fresh")).toBeDefined()
+    // recordSuccess clears exhaustedUntil but the row remains until the
+    // 24h-clean-run window erases the escalator counter — at which point
+    // `persist` removes the now-empty row.
+    pool.recordSuccess("fresh", 25 * 60 * 60 * 1000)
+    expect(removes).toContain("fresh")
+  })
 })
