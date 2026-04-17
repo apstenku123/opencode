@@ -859,14 +859,39 @@ it.live(
       Effect.fnUntraced(function* ({ llm }) {
         const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
+        const runState = yield* SessionRunState.Service
         const chat = yield* sessions.create({ title: "Pinned" })
         yield* llm.hang
         yield* user(chat.id, "hello")
 
+        // Patch ensureRunning so we can deterministically await b's entry into the queue
+        // instead of relying on a wall-clock sleep. The second ensureRunning call (b's)
+        // signals via `bEntered` right before delegating to the original implementation;
+        // a subsequent Effect.yieldNow lets b's fiber run through SynchronizedRef.modifyEffect
+        // to its Deferred.await suspension point before we issue the cancel.
+        const bEntered = defer<void>()
+        const origEnsure = runState.ensureRunning.bind(runState)
+        let ensureCalls = 0
+        ;(runState as { ensureRunning: SessionRunState.Interface["ensureRunning"] }).ensureRunning = (
+          sessionID,
+          onInterrupt,
+          work,
+        ) => {
+          const mine = ++ensureCalls
+          if (mine !== 2) return origEnsure(sessionID, onInterrupt, work)
+          return Effect.sync(() => bEntered.resolve()).pipe(
+            Effect.andThen(origEnsure(sessionID, onInterrupt, work)),
+          )
+        }
+
         const a = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
         yield* llm.wait(1)
         const b = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-        yield* Effect.sleep(50)
+        yield* Effect.promise(() => bEntered.promise)
+        // Yield the scheduler so b's fiber runs its synchronous SynchronizedRef.modifyEffect
+        // and commits itself as an awaiter of the Running run's Deferred before cancel fires.
+        yield* Effect.yieldNow
+        yield* Effect.yieldNow
 
         yield* prompt.cancel(chat.id)
         const [exitA, exitB] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
