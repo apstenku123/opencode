@@ -17,6 +17,7 @@ import { SessionProcessor } from "../../src/session/processor"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
+import { Skill } from "../../src/skill"
 import { Snapshot } from "../../src/snapshot"
 import { Log } from "../../src/util"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
@@ -161,6 +162,7 @@ const deps = Layer.mergeAll(
   AgentSvc.defaultLayer,
   Permission.defaultLayer,
   Plugin.defaultLayer,
+  Skill.defaultLayer,
   Config.defaultLayer,
   LLM.defaultLayer,
   Provider.defaultLayer,
