@@ -262,6 +262,19 @@ export const Info = z
           .describe("Token buffer for compaction. Leaves enough window to avoid overflow during compaction."),
       })
       .optional(),
+    autosteering: z
+      .object({
+        enabled: z
+          .boolean()
+          .optional()
+          .describe(
+            "Enable autosteering stagnation detection. When true, after two consecutive planning-only or near-duplicate assistant responses a canned user-role nudge is injected asking the model to execute. Defaults to true.",
+          ),
+      })
+      .optional()
+      .describe(
+        "Autosteering configuration. Detects when the model is only planning or repeating itself and nudges it back to action.",
+      ),
     experimental: z
       .object({
         disable_paste_summary: z.boolean().optional(),
