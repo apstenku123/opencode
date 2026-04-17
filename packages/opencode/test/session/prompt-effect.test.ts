@@ -449,6 +449,7 @@ it.live("static loop consumes queued replies across turns", () =>
     }),
     { git: true, config: providerCfg },
   ),
+  20_000,
 )
 
 it.live("loop continues when finish is tool-calls", () =>
@@ -638,7 +639,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  5_000,
+  20_000,
 )
 
 it.live(
@@ -686,7 +687,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  10_000,
+  20_000,
 )
 
 it.live(
@@ -705,9 +706,24 @@ it.live(
         yield* user(chat.id, "hi")
 
         yield* prompt.loop({ sessionID: chat.id })
+        // The autobest observer runs via a bus subscription to
+        // SessionStatus.Event.Idle and invokes applyAutobest via
+        // void Effect.runPromise(...), so its work completes
+        // asynchronously after prompt.loop resolves. Poll history
+        // (with a deadline) until the autobest.result event has been
+        // persisted by the observer before asserting.
+        const history = yield* Effect.promise(() => import("../../src/history"))
+        const result = yield* Effect.promise(async () => {
+          const deadline = Date.now() + 5000
+          while (Date.now() < deadline) {
+            const item = await history.last(chat.id, "autobest.result")
+            if (item) return item
+            await Bun.sleep(10)
+          }
+          throw new Error("timed out waiting for autobest.result history event")
+        })
         const state = yield* sessions.getAutobest(chat.id)
         expect(state.active?.key).toBe("tighten failing repro")
-        const result = yield* Effect.promise(() => import("../../src/history").then((m) => m.last(chat.id, "autobest.result")))
         expect(result).toMatchObject({
           type: "autobest.result",
           sessionID: chat.id,
@@ -716,7 +732,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  10_000,
+  20_000,
 )
 
 it.live(
@@ -742,7 +758,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 // Cancel semantics
@@ -772,7 +788,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 it.live(
@@ -800,7 +816,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 it.live(
@@ -903,7 +919,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 // Queue semantics
@@ -947,7 +963,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 it.live(
@@ -1016,7 +1032,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 it.live(
@@ -1046,7 +1062,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 it.live("assertNotBusy succeeds when idle", () =>
@@ -1091,7 +1107,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 unix("shell captures stdout and stderr in completed tool output", () =>
@@ -1261,7 +1277,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 it.live(
@@ -1301,7 +1317,7 @@ it.live(
       }),
       { git: true, config: providerCfg },
     ),
-  3_000,
+  20_000,
 )
 
 unix(

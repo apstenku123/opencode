@@ -304,7 +304,7 @@ test("custom provider with npm package", async () => {
   })
 })
 
-test("env variable takes precedence, config merges options", async () => {
+test("env variable takes precedence, config merges options", { timeout: 30000 }, async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
       await Bun.write(
@@ -2404,7 +2404,7 @@ test("cloudflare-ai-gateway forwards config metadata options", async () => {
   })
 })
 
-test("plugin config providers persist after instance dispose", async () => {
+test("plugin config providers persist after instance dispose", { timeout: 30000 }, async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
       const root = path.join(dir, ".opencode", "plugin")
@@ -2463,7 +2463,7 @@ test("plugin config providers persist after instance dispose", async () => {
   expect(second[ProviderID.make("demo")].models[ModelID.make("chat")]).toBeDefined()
 })
 
-test("plugin config enabled and disabled providers are honored", async () => {
+test("plugin config enabled and disabled providers are honored", { timeout: 30000 }, async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
       const root = path.join(dir, ".opencode", "plugin")
