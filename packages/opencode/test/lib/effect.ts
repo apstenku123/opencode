@@ -19,6 +19,20 @@ const run = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer
     return yield* exit
   }).pipe(Effect.runPromise)
 
+// `it.live` tests hit the real clock, spawn `provideTmpdirServer` HTTP +
+// git worktree + full prompt loops. On an oversubscribed host (load > cpus,
+// external rustc/bun competing) a 3s bun-test default is insufficient for
+// the HTTP round-trips alone. Enforce a floor so authors can't accidentally
+// write sub-resource-budget deadlines. Raise `opts` explicitly if a test
+// needs a stricter ceiling.
+const LIVE_MIN_TIMEOUT_MS = 30_000
+
+function liveOpts(opts?: number | TestOptions): number | TestOptions {
+  if (opts === undefined) return LIVE_MIN_TIMEOUT_MS
+  if (typeof opts === "number") return Math.max(opts, LIVE_MIN_TIMEOUT_MS)
+  return { ...opts, timeout: Math.max(opts.timeout ?? 0, LIVE_MIN_TIMEOUT_MS) }
+}
+
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
     test(name, () => run(value, testLayer), opts)
@@ -30,13 +44,13 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>) 
     test.skip(name, () => run(value, testLayer), opts)
 
   const live = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, liveLayer), opts)
+    test(name, () => run(value, liveLayer), liveOpts(opts))
 
   live.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, liveLayer), opts)
+    test.only(name, () => run(value, liveLayer), liveOpts(opts))
 
   live.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, liveLayer), opts)
+    test.skip(name, () => run(value, liveLayer), liveOpts(opts))
 
   return { effect, live }
 }

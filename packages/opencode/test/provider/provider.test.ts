@@ -336,7 +336,7 @@ test("env variable takes precedence, config merges options", async () => {
       expect(providers[ProviderID.anthropic].options.chunkTimeout).toBe(15000)
     },
   })
-}, 30000)
+})
 
 test("getModel returns model for valid provider/model", async () => {
   await using tmp = await tmpdir({
@@ -2461,7 +2461,7 @@ test("plugin config providers persist after instance dispose", async () => {
   })
   expect(second[ProviderID.make("demo")]).toBeDefined()
   expect(second[ProviderID.make("demo")].models[ModelID.make("chat")]).toBeDefined()
-}, 30000)
+})
 
 test("plugin config enabled and disabled providers are honored", async () => {
   await using tmp = await tmpdir({
@@ -2498,7 +2498,7 @@ test("plugin config enabled and disabled providers are honored", async () => {
       expect(providers[ProviderID.openai]).toBeUndefined()
     },
   })
-}, 30000)
+})
 
 test("opencode loader keeps paid models when config apiKey is present", async () => {
   await using base = await tmpdir({
