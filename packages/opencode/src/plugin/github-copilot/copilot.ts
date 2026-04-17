@@ -6,7 +6,21 @@ import { Log } from "../../util"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Effect } from "effect"
 import { CopilotModels } from "./models"
-import { cooldown, eligible, feed, load, owner, reserve, reserveBatch, touch, usage, type Event, type Runtime } from "./runtime"
+import {
+  cooldown,
+  eligible,
+  feed,
+  load,
+  owner,
+  record429,
+  recordSuccess,
+  reserve,
+  reserveBatch,
+  touch,
+  usage,
+  type Event,
+  type Runtime,
+} from "./runtime"
 import { classifyPlan, fetchQuota } from "./quota"
 import { MessageV2 } from "@/session/message-v2"
 import { Auth } from "@/auth"
@@ -647,7 +661,14 @@ export async function dispatch(input: {
   const res = await routedFetch(input.request, { ...input.init, headers }, cfg)
   if (res.status === 429) {
     pick.release()
-    await input.write(mark(nextState, live.key, Date.now() + 11 * 60 * 1000))
+    // Honor Retry-After when present; else run the headerless-429 escalator
+    // (11m → 21m → 41m). `record429` is monotonic — it never shortens an
+    // existing cooldown (Rust `set_exhaustion` semantics).
+    const retryAfter = res.headers.get("retry-after") ?? res.headers.get("Retry-After")
+    const { until } = record429(input.runtime, live.key, {
+      retryAfterMs: parseRetryAfterHeader(retryAfter),
+    })
+    await input.write(mark(nextState, live.key, until))
     if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
     return res
   }
@@ -657,11 +678,23 @@ export async function dispatch(input: {
     return res
   }
   if (res.ok) {
+    recordSuccess(input.runtime, live.key)
     await input.write(clear(nextState, live.key))
   }
   pick.release()
   touch(input.runtime, live.key)
   return res
+}
+
+function parseRetryAfterHeader(value: string | null): number | undefined {
+  if (!value) return undefined
+  const trimmed = value.trim()
+  if (!trimmed) return undefined
+  const secs = Number(trimmed)
+  if (Number.isFinite(secs) && secs >= 0) return Math.trunc(secs * 1000)
+  const date = Date.parse(trimmed)
+  if (!Number.isNaN(date)) return Math.max(0, date - Date.now())
+  return undefined
 }
 
 export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
