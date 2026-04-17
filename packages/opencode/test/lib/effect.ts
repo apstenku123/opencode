@@ -25,7 +25,7 @@ const run = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer
 // the HTTP round-trips alone. Enforce a floor so authors can't accidentally
 // write sub-resource-budget deadlines. Raise `opts` explicitly if a test
 // needs a stricter ceiling.
-const LIVE_MIN_TIMEOUT_MS = 30_000
+const LIVE_MIN_TIMEOUT_MS = 60_000
 
 function liveOpts(opts?: number | TestOptions): number | TestOptions {
   if (opts === undefined) return LIVE_MIN_TIMEOUT_MS
