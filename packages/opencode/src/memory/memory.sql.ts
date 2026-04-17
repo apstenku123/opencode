@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, blob, uniqueIndex, index } from "drizzle-orm/sqlite-core"
+import { sqliteTable, text, integer, blob, uniqueIndex, index, primaryKey } from "drizzle-orm/sqlite-core"
 import { Timestamps } from "../storage/schema.sql"
 import type { SextupleSource } from "./schema"
 
@@ -31,5 +31,41 @@ export const MemorySextupleTable = sqliteTable(
     uniqueIndex("memory_sextuple_hash_id_idx").on(table.hash_id),
     index("memory_sextuple_project_id_idx").on(table.project_id),
     index("memory_sextuple_time_created_idx").on(table.time_created),
+  ],
+)
+
+/**
+ * Round-2 foreign-ingest checkpoint table.
+ *
+ * One row per successfully processed foreign-ingest input. Presence of a row
+ * means the work is done; absence means the pipeline should (re)process it.
+ * No state column, no lease — crash safety comes from only inserting after the
+ * full per-session pipeline succeeds. Killed processes leave no row and the
+ * work is redone on the next pass.
+ *
+ * Composite primary key `(tool, source_path, content_hash)` so the same
+ * source file can record multiple snapshots over time (e.g. a Claude session
+ * that grew between ingest runs gets distinct rows). Re-ingesting the same
+ * `(tool, source_path, git_root)` with a new `content_hash` removes any
+ * stale rows for that triple — see `checkpoint.ts#insertDone` for the
+ * dedup invariant.
+ *
+ * Mirrors `codex-rs/state/migrations/0019_foreign_ingest_done.sql` +
+ * `0020_foreign_ingest_done_add_git_root.sql`. Schema lives in
+ * `packages/opencode/migration/20260417130000_foreign_ingest_done/`.
+ */
+export const ForeignIngestDoneTable = sqliteTable(
+  "foreign_ingest_done",
+  {
+    tool: text().notNull(),
+    source_path: text().notNull(),
+    content_hash: text().notNull(),
+    git_root: text().notNull().default(""),
+    done_at: integer().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.tool, table.source_path, table.content_hash] }),
+    index("foreign_ingest_done_tool_idx").on(table.tool),
+    index("foreign_ingest_done_git_root_idx").on(table.git_root),
   ],
 )

@@ -1,0 +1,352 @@
+/**
+ * `/memory/*` HTTP RPC routes.
+ *
+ * Round-2 deliverables:
+ *  - `POST /memory/reset`   — truncate `memory_sextuple` for the current
+ *                             project; emits `Memory.Event.Reset` on the bus.
+ *  - `GET  /memory/status`  — per-project counts (sextuples,
+ *                             foreign-ingest checkpoints by tool).
+ *  - `POST /memory/ingest`  — manually trigger the foreign-ingest pipeline
+ *                             for the current project.
+ *
+ * Routes return JSON. Schemas are declared with Zod + hono-openapi so the
+ * generated OpenAPI spec stays accurate.
+ */
+
+import { Effect, Layer } from "effect"
+import { Hono } from "hono"
+import { describeRoute, resolver, validator } from "hono-openapi"
+import z from "zod"
+
+import { Bus } from "../../bus"
+import { BusEvent } from "../../bus/bus-event"
+import { Database, eq, sql as drizzleSql } from "../../storage"
+import { Instance } from "../../project/instance"
+import {
+  layer as memoryFacadeLayer,
+  memoryRetrievalLayer,
+  memoryStorageLayer,
+  mockEmbeddingLayer,
+} from "../../memory"
+import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
+import { ForeignIngestDoneTable, MemorySextupleTable } from "../../memory/memory.sql"
+import { ingest, type ForeignIngestSources, type SessionExtractor } from "../../memory/foreign-ingest"
+
+// --------------------------------------------------------------------------
+// Bus event
+// --------------------------------------------------------------------------
+
+/**
+ * Fired after a successful `/memory/reset` so subscribers (TUI, sync,
+ * downstream extractors) can flush their caches. Mirrors the Rust
+ * `Memory::Event::Reset` event emitted by `control::reset_all_memories`.
+ */
+export const MemoryResetEvent = BusEvent.define(
+  "memory.reset",
+  z.object({
+    projectID: z.string().nullable(),
+    deletedSextuples: z.number().int().min(0),
+    deletedCheckpoints: z.number().int().min(0),
+  }),
+)
+
+export const MemoryIngestStartedEvent = BusEvent.define(
+  "memory.ingest.started",
+  z.object({ gitRoot: z.string(), projectID: z.string().nullable() }),
+)
+
+export const MemoryIngestCompletedEvent = BusEvent.define(
+  "memory.ingest.completed",
+  z.object({
+    gitRoot: z.string(),
+    projectID: z.string().nullable(),
+    discovered: z.number().int(),
+    inserted: z.number().int(),
+    durationMs: z.number().int(),
+  }),
+)
+
+// --------------------------------------------------------------------------
+// Schemas
+// --------------------------------------------------------------------------
+
+const ResetResponse = z
+  .object({
+    projectID: z.string().nullable(),
+    deletedSextuples: z.number().int(),
+    deletedCheckpoints: z.number().int(),
+  })
+  .meta({ ref: "MemoryResetResponse" })
+
+const StatusResponse = z
+  .object({
+    projectID: z.string().nullable(),
+    sextupleCount: z.number().int(),
+    embeddedCount: z.number().int(),
+    foreignIngest: z.array(
+      z.object({
+        tool: z.string(),
+        count: z.number().int(),
+      }),
+    ),
+  })
+  .meta({ ref: "MemoryStatus" })
+
+const IngestRequestBody = z
+  .object({
+    gitRoot: z.string().optional(),
+    sources: z
+      .object({
+        claudeProjectsDir: z.string().optional(),
+        cursorDir: z.string().optional(),
+        codexDir: z.string().optional(),
+        kiroDbPath: z.string().optional(),
+        opencodeSelf: z.boolean().optional(),
+      })
+      .optional(),
+    concurrency: z.number().int().positive().max(32).optional(),
+  })
+  .meta({ ref: "MemoryIngestRequest" })
+
+const IngestResponse = z
+  .object({
+    skipped: z.boolean(),
+    discovered: z.number().int(),
+    inserted: z.number().int(),
+    skippedDone: z.number().int(),
+    parseFailed: z.number().int(),
+    produced: z.number().int(),
+    durationMs: z.number().int(),
+  })
+  .meta({ ref: "MemoryIngestResponse" })
+
+// --------------------------------------------------------------------------
+// Layer composition
+// --------------------------------------------------------------------------
+
+/**
+ * Round-2 wiring: the Memory facade isn't yet part of `AppLayer`, so we
+ * provide it on a per-request basis. The mock embedding layer is used when
+ * the real provider is not configured — round-3 swaps in the
+ * `openAICompatLayer` once the embedding-config plumbing lands.
+ */
+const memoryStack = Layer.provideMerge(
+  memoryFacadeLayer,
+  Layer.mergeAll(memoryStorageLayer, memoryRetrievalLayer, mockEmbeddingLayer()),
+)
+
+const ingestStack = Layer.provideMerge(memoryStack, foreignIngestCheckpointLayer)
+
+// --------------------------------------------------------------------------
+// Routes
+// --------------------------------------------------------------------------
+
+const NO_OP_EXTRACTOR: SessionExtractor = () => Effect.succeed([])
+
+export const MemoryRoutes = () =>
+  new Hono()
+    .post(
+      "/reset",
+      describeRoute({
+        summary: "Reset memory for the current project",
+        description:
+          "Truncate `memory_sextuple` and `foreign_ingest_done` rows scoped to the current project, then emit `memory.reset` on the bus.",
+        operationId: "memory.reset",
+        responses: {
+          200: {
+            description: "Reset complete",
+            content: { "application/json": { schema: resolver(ResetResponse) } },
+          },
+        },
+      }),
+      async (c) => {
+        const projectID = currentProjectID()
+        const result = await deleteForProject(projectID)
+        await Bus.publish(MemoryResetEvent, {
+          projectID,
+          deletedSextuples: result.deletedSextuples,
+          deletedCheckpoints: result.deletedCheckpoints,
+        })
+        return c.json({
+          projectID,
+          deletedSextuples: result.deletedSextuples,
+          deletedCheckpoints: result.deletedCheckpoints,
+        })
+      },
+    )
+    .get(
+      "/status",
+      describeRoute({
+        summary: "Memory status for the current project",
+        description: "Return per-project sextuple counts plus per-tool foreign-ingest checkpoint counts.",
+        operationId: "memory.status",
+        responses: {
+          200: {
+            description: "Status payload",
+            content: { "application/json": { schema: resolver(StatusResponse) } },
+          },
+        },
+      }),
+      async (c) => {
+        const projectID = currentProjectID()
+        const status = await statusForProject(projectID)
+        return c.json(status)
+      },
+    )
+    .post(
+      "/ingest",
+      describeRoute({
+        summary: "Trigger foreign-ingest for the current project",
+        description:
+          "Run the foreign-ingest pipeline (Claude / Cursor / Codex / OpenCode-self / Kiro) bounded to the current git root. The pipeline acquires a per-git-root advisory writer lock — if another OpenCode instance is already ingesting, this returns `skipped: true`.",
+        operationId: "memory.ingest",
+        responses: {
+          200: {
+            description: "Ingest result",
+            content: { "application/json": { schema: resolver(IngestResponse) } },
+          },
+        },
+      }),
+      validator("json", IngestRequestBody.optional()),
+      async (c) => {
+        const body = (c.req.valid("json") ?? {}) as z.infer<typeof IngestRequestBody>
+        const projectID = currentProjectID()
+        const gitRoot = body.gitRoot ?? Instance.worktree
+        const dataDir = (await import("../../global")).Global.Path.data
+        const sources: ForeignIngestSources = body.sources ?? {}
+
+        await Bus.publish(MemoryIngestStartedEvent, { gitRoot, projectID })
+
+        const program = ingest({
+          gitRoot,
+          dataDir,
+          projectID: projectID ?? undefined,
+          sources,
+          extract: NO_OP_EXTRACTOR,
+          concurrency: body.concurrency,
+        }).pipe(Effect.provide(ingestStack))
+
+        const stats = await Effect.runPromise(program as Effect.Effect<any, any, never>).catch((err) => {
+          // Surface as 500 to caller but keep harness exposure simple.
+          throw err
+        })
+
+        if (!stats) {
+          // Lock held by another process.
+          return c.json({
+            skipped: true,
+            discovered: 0,
+            inserted: 0,
+            skippedDone: 0,
+            parseFailed: 0,
+            produced: 0,
+            durationMs: 0,
+          })
+        }
+        await Bus.publish(MemoryIngestCompletedEvent, {
+          gitRoot,
+          projectID,
+          discovered: stats.discovered,
+          inserted: stats.inserted,
+          durationMs: stats.durationMs,
+        })
+        return c.json({
+          skipped: false,
+          discovered: stats.discovered,
+          inserted: stats.inserted,
+          skippedDone: stats.skippedDone,
+          parseFailed: stats.parseFailed,
+          produced: stats.produced,
+          durationMs: stats.durationMs,
+        })
+      },
+    )
+
+// --------------------------------------------------------------------------
+// Internal helpers (exported for tests)
+// --------------------------------------------------------------------------
+
+export function currentProjectID(): string | null {
+  try {
+    return Instance.current.project.id
+  } catch {
+    return null
+  }
+}
+
+export interface ResetCounts {
+  readonly deletedSextuples: number
+  readonly deletedCheckpoints: number
+}
+
+/**
+ * Truncate `memory_sextuple` and `foreign_ingest_done` for a given project
+ * scope. When `projectID === null`, every row is deleted (used by the
+ * "no project bound" code path so a global reset is always available).
+ *
+ * Foreign-ingest checkpoints are scoped by `git_root === Instance.worktree`
+ * because checkpoint rows aren't keyed by `project_id` — the writer-lock
+ * already binds them to a repo root.
+ */
+export async function deleteForProject(projectID: string | null): Promise<ResetCounts> {
+  return Database.use((db) => {
+    const sxResult = projectID
+      ? db.delete(MemorySextupleTable).where(eq(MemorySextupleTable.project_id, projectID)).run()
+      : db.delete(MemorySextupleTable).run()
+    let chResult: any
+    if (projectID) {
+      let gitRoot: string | undefined
+      try {
+        gitRoot = Instance.worktree
+      } catch {
+        gitRoot = undefined
+      }
+      if (gitRoot) {
+        chResult = db.delete(ForeignIngestDoneTable).where(eq(ForeignIngestDoneTable.git_root, gitRoot)).run()
+      } else {
+        chResult = { changes: 0 }
+      }
+    } else {
+      chResult = db.delete(ForeignIngestDoneTable).run()
+    }
+    return {
+      deletedSextuples: Number((sxResult as unknown as { changes?: number })?.changes ?? 0),
+      deletedCheckpoints: Number((chResult as unknown as { changes?: number })?.changes ?? 0),
+    }
+  })
+}
+
+export async function statusForProject(projectID: string | null) {
+  return Database.use((db) => {
+    const sxQuery = projectID
+      ? db
+          .select({
+            total: drizzleSql<number>`COUNT(*)`,
+            embedded: drizzleSql<number>`SUM(CASE WHEN ${MemorySextupleTable.embedding} IS NOT NULL THEN 1 ELSE 0 END)`,
+          })
+          .from(MemorySextupleTable)
+          .where(eq(MemorySextupleTable.project_id, projectID))
+      : db
+          .select({
+            total: drizzleSql<number>`COUNT(*)`,
+            embedded: drizzleSql<number>`SUM(CASE WHEN ${MemorySextupleTable.embedding} IS NOT NULL THEN 1 ELSE 0 END)`,
+          })
+          .from(MemorySextupleTable)
+    const [counts] = sxQuery.all()
+    const checkpointRows = db
+      .select({
+        tool: ForeignIngestDoneTable.tool,
+        count: drizzleSql<number>`COUNT(*)`,
+      })
+      .from(ForeignIngestDoneTable)
+      .groupBy(ForeignIngestDoneTable.tool)
+      .all()
+
+    return {
+      projectID,
+      sextupleCount: Number(counts?.total ?? 0),
+      embeddedCount: Number(counts?.embedded ?? 0),
+      foreignIngest: checkpointRows.map((r) => ({ tool: String(r.tool), count: Number(r.count) })),
+    }
+  })
+}

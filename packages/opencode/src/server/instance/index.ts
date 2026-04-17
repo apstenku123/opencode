@@ -31,6 +31,7 @@ import { EventRoutes } from "./event"
 import { ErrorMiddleware } from "../middleware"
 import { MessageV2 } from "../../session/message-v2"
 import { SyncRoutes } from "./sync"
+import { MemoryRoutes } from "./memory"
 import { AppRuntime } from "@/effect/app-runtime"
 import { Effect } from "effect"
 import { TimerSvc } from "./timer"
@@ -64,6 +65,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
     .route("/", FileRoutes())
     .route("/", EventRoutes())
     .route("/mcp", McpRoutes())
+    .route("/memory", MemoryRoutes())
     .route("/tui", TuiRoutes())
     .post(
       "/instance/dispose",
