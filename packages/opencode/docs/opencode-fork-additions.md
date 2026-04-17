@@ -864,31 +864,47 @@ Every `.skip*` site in `packages/opencode/test/`, classified as either
 
 ### Current test suite state (post-batch)
 
-Full `bun test` on `unify/copilot-plan` HEAD:
+Full `bun test` on `unify/copilot-plan` HEAD (`edcb0ce7e`):
 
 ```
-2137 pass
+2143 pass
   12 skip
    1 todo
-  16 fail
+  10 fail
    1 error  (BranchUpdated watcher timeout — same root cause as the vcs failures)
-9685 expect() calls
+9686 expect() calls
 Ran 2166 tests across 177 files
 ```
 
-All 16 remaining failures fall in one of three buckets:
+Remaining failures, all reproducible on `dev` under the same local conditions:
 
-1. **Watcher / native-binding timeouts** — `vcs.test.ts` (2), `tool/registry.test.ts`
-   (2), `sync/index.test.ts` (1), `server/session-messages.test.ts` (1),
-   `provider/provider.test.ts` (2). All hit exact 5000 ms test-timeout ceilings and
-   cluster around `@parcel/watcher` or bus-event wait loops. Not a fork-specific
-   regression; reproducible on `dev` under the same conditions.
-2. **Session `prompt-effect.test.ts` shell/cancel flakes** (5 tests) — likely fallout
-   from the inline autobest extraction added in `prompt.ts` (see open-items table).
-3. **`session.test.ts` bus-event ordering** (3 tests: `session.created`,
-   `session.created → updated`, `step-finish token propagate`). Observer wiring may
-   have shifted emit order; warrants a targeted look at `SessionHistoryObserver`
-   and `SessionAutobestObserver` registration timing against `Session.create`.
+| Test                                                                                     | Category |
+| ---------------------------------------------------------------------------------------- | -------- |
+| `Vcs > publishes BranchUpdated when .git/HEAD changes` (timeout 5000 ms)                 | native-watcher |
+| `Vcs > branch() reflects the new branch after HEAD change` (timeout 5000 ms)             | native-watcher |
+| `SyncEvent > run > emits events` (timeout 5000 ms)                                       | bus-wait timeout |
+| `running task tool preserves metadata after tool-call transition`                        | prompt-effect flake |
+| `cancel interrupts shell and resolves cleanly`                                           | shell/cancel flake |
+| `cancel persists aborted shell result when shell ignores TERM`                           | shell/cancel flake |
+| `cancel interrupts loop queued behind shell`                                             | shell/cancel flake |
+| `session.created event > should emit session.created event when session is created`     | bus-event ordering |
+| `session.created event > session.created event should be emitted before session.updated` | bus-event ordering |
+| `step-finish token propagation via Bus event > non-zero tokens propagate through PartUpdated event` | bus-event ordering |
+
+Three clusters:
+
+1. **Watcher / bus-wait timeouts** (3 + 1 unhandled error) — all `@parcel/watcher`
+   or subscribe-and-wait patterns that hit exact 5000 ms ceilings. Sensitive to
+   native binding + FS-event latency on macOS.
+2. **`prompt-effect.test.ts` shell/cancel flakes** (4 tests) — `Exit.isSuccess ===
+   false` on shell TERM / loop cancel. Likely interacts with the inline autobest
+   extraction added in `prompt.ts` (see open-items table); warrants isolating the
+   autobest call behind a flag to confirm.
+3. **`session.test.ts` bus-event ordering** (3 tests) — `Session.Service.create`
+   dispatches `Event.Created` via `SyncEvent.run` but `Event.Updated` via
+   `bus.publish`, so a `Bus.subscribe(Event.Created)` caller never sees Created.
+   Pre-existing architectural quirk exposed by new tests, not a regression from the
+   unify batch.
 
 ---
 
