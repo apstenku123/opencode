@@ -20,11 +20,10 @@ describe("thread request compat", () => {
     const app = Server.Default().app
     const headers = { "content-type": "application/json", "x-opencode-directory": tmp.path }
 
-    let pending!: Promise<any>
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
-        pending = AppRuntime.runPromise(
+        const pending = AppRuntime.runPromise(
           Permission.Service.use((svc) =>
             svc.ask({
               sessionID: SessionID.make("ses_perm"),
@@ -36,26 +35,26 @@ describe("thread request compat", () => {
             }),
           ),
         ).catch(() => undefined)
+
+        const list = await app.request(`/thread/${SessionID.make("ses_perm")}/request_permissions`, { headers })
+        expect(list.status).toBe(200)
+        const items = (await list.json()) as any[]
+        expect(items).toHaveLength(1)
+        expect(items[0].sessionID).toBe(SessionID.make("ses_perm"))
+        void pending
       },
     })
-
-    const list = await app.request(`/thread/${SessionID.make("ses_perm")}/request_permissions`, { headers })
-    expect(list.status).toBe(200)
-    const items = await list.json() as any[]
-    expect(items).toHaveLength(1)
-    expect(items[0].sessionID).toBe(SessionID.make("ses_perm"))
-    void pending
   })
 
   test("request_user_input alias lists and replies", async () => {
     await using tmp = await tmpdir({ git: true })
     const app = Server.Default().app
     const headers = { "content-type": "application/json", "x-opencode-directory": tmp.path }
-    let pending!: Promise<any>
+
     await Instance.provide({
       directory: tmp.path,
       fn: async () => {
-        pending = AppRuntime.runPromise(
+        const pending = AppRuntime.runPromise(
           Question.Service.use((svc) =>
             svc.ask({
               sessionID: SessionID.make("ses_q"),
@@ -69,21 +68,24 @@ describe("thread request compat", () => {
             }),
           ),
         )
+
+        const list = await app.request(`/thread/${SessionID.make("ses_q")}/request_user_input`, { headers })
+        expect(list.status).toBe(200)
+        const items = (await list.json()) as any[]
+        expect(items).toHaveLength(1)
+
+        const reply = await app.request(
+          `/thread/${SessionID.make("ses_q")}/request_user_input/${items[0].id}/reply`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ answers: [["A"]] }),
+          },
+        )
+        expect(reply.status).toBe(200)
+        expect(await reply.json()).toBe(true)
+        expect(await pending).toEqual([["A"]])
       },
     })
-
-    const list = await app.request(`/thread/${SessionID.make("ses_q")}/request_user_input`, { headers })
-    expect(list.status).toBe(200)
-    const items = await list.json() as any[]
-    expect(items).toHaveLength(1)
-
-    const reply = await app.request(`/thread/${SessionID.make("ses_q")}/request_user_input/${items[0].id}/reply`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ answers: [["A"]] }),
-    })
-    expect(reply.status).toBe(200)
-    expect(await reply.json()).toBe(true)
-    expect(await pending).toEqual([["A"]])
   })
 })
