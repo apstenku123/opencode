@@ -50,6 +50,7 @@ import { InstanceState } from "@/effect"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
 import { SessionAutobestObserver } from "./autobest-observer"
+import { AdaptiveHooks } from "./adaptive"
 import { EffectBridge } from "@/effect"
 
 // @ts-ignore
@@ -107,6 +108,7 @@ export namespace SessionPrompt {
       const summary = yield* SessionSummary.Service
       const sys = yield* SystemPrompt.Service
       const llm = yield* LLM.Service
+      const adaptive = yield* AdaptiveHooks.Service
       const runner = Effect.fn("SessionPrompt.runner")(function* () {
         return yield* EffectBridge.make()
       })
@@ -1380,10 +1382,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               lastUser.id < lastAssistant.id
             ) {
               yield* slog.info("exiting loop")
+              // [Adaptive Hook C: pre-break] — behavior-neutral in round 1.
+              // Round-2 observers (auto-wait for active children, stop-hook
+              // follow-up, autobest continuation) can return `inject` or
+              // `continue` here to hold the turn open.
+              yield* adaptive.runPreBreak({ sessionID, step })
               break
             }
 
             step++
+            // [Adaptive Hook A: pre-iteration] — behavior-neutral in round 1.
+            // Observers may seed per-iteration flags on AdaptiveState here.
+            yield* adaptive.runPreIteration({
+              sessionID,
+              step,
+              lastUserID: lastUser.id,
+              lastAssistantID: lastAssistant?.id,
+            })
             if (step === 1)
               yield* title({
                 session,
@@ -1556,6 +1571,30 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
               return "continue" as const
             }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))
+
+            // [Adaptive Hook B: post-iteration] — behavior-neutral in round 1.
+            // Observers may return `break` to force exit, `inject` to emit a
+            // synthetic user follow-up, or `continue` to pass through. In
+            // round 1 no observer is registered so the directive is always
+            // `continue` and the existing `outcome` decides the flow.
+            const assistantText = handle.message
+              ? msgs
+                  .findLast((m) => m.info.role === "assistant" && m.info.id === handle.message.id)
+                  ?.parts.filter((p): p is MessageV2.TextPart => p.type === "text")
+                  .map((p) => p.text)
+                  .join("\n")
+              : undefined
+            const post = yield* adaptive.runPostIteration({
+              sessionID,
+              step,
+              assistantMessageID: handle.message?.id,
+              finish: handle.message?.finish ?? undefined,
+              defaultOutcome: outcome,
+              assistantText,
+            })
+            if (post.kind === "break") break
+            // round-2: if (post.kind === "inject") { injectSynthetic(post.message); continue }
+
             if (outcome === "break") break
             continue
           }
@@ -1739,6 +1778,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       Layer.provide(Session.defaultLayer),
       Layer.provide(SessionRevert.defaultLayer),
       Layer.provide(SessionSummary.defaultLayer),
+      Layer.provide(AdaptiveHooks.defaultLayer),
       Layer.provide(
         Layer.mergeAll(
           Agent.defaultLayer,
