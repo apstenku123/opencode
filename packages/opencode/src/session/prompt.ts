@@ -722,179 +722,203 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput) {
         const ctx = yield* InstanceState.context
         const run = yield* runner()
-        const session = yield* sessions.get(input.sessionID)
-        if (session.revert) {
-          yield* revert.cleanup(session)
-        }
-        const agent = yield* agents.get(input.agent)
-        if (!agent) {
-          const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-          const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-          const error = new NamedError.Unknown({ message: `Agent not found: "${input.agent}".${hint}` })
-          yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
-          throw error
-        }
-        const model = input.model ?? agent.model ?? (yield* lastModel(input.sessionID))
-        const userMsg: MessageV2.User = {
-          id: input.messageID ?? MessageID.ascending(),
-          sessionID: input.sessionID,
-          time: { created: Date.now() },
-          role: "user",
-          agent: input.agent,
-          model: { providerID: model.providerID, modelID: model.modelID },
-        }
-        yield* sessions.updateMessage(userMsg)
-        const userPart: MessageV2.Part = {
-          type: "text",
-          id: PartID.ascending(),
-          messageID: userMsg.id,
-          sessionID: input.sessionID,
-          text: "The following tool was executed by the user",
-          synthetic: true,
-        }
-        yield* sessions.updatePart(userPart)
+        let output = ""
+        let aborted = false
+        // Both the message/tool-part setup AND the finalizer registration MUST happen inside
+        // an uninterruptible region. Reason: cancel uses Fiber.interrupt on this fiber; if we
+        // leave the uninterruptible region before `addFinalizer` actually registers, the
+        // pending interrupt fires on the next yield and the fiber dies WITHOUT the finalizer
+        // ever running. That leaves the tool part stuck in "running" and the cancel path's
+        // onInterrupt (lastAssistant) unable to produce a Success exit. Installing the
+        // finalizer inside the uninterruptible block makes both things atomic with setup.
+        const { msg, part } = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const session = yield* sessions.get(input.sessionID)
+            if (session.revert) {
+              yield* revert.cleanup(session)
+            }
+            const agent = yield* agents.get(input.agent)
+            if (!agent) {
+              const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+              const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+              const error = new NamedError.Unknown({ message: `Agent not found: "${input.agent}".${hint}` })
+              yield* bus.publish(Session.Event.Error, { sessionID: input.sessionID, error: error.toObject() })
+              throw error
+            }
+            const model = input.model ?? agent.model ?? (yield* lastModel(input.sessionID))
+            const userMsg: MessageV2.User = {
+              id: input.messageID ?? MessageID.ascending(),
+              sessionID: input.sessionID,
+              time: { created: Date.now() },
+              role: "user",
+              agent: input.agent,
+              model: { providerID: model.providerID, modelID: model.modelID },
+            }
+            yield* sessions.updateMessage(userMsg)
+            const userPart: MessageV2.Part = {
+              type: "text",
+              id: PartID.ascending(),
+              messageID: userMsg.id,
+              sessionID: input.sessionID,
+              text: "The following tool was executed by the user",
+              synthetic: true,
+            }
+            yield* sessions.updatePart(userPart)
+            const msg: MessageV2.Assistant = {
+              id: MessageID.ascending(),
+              sessionID: input.sessionID,
+              parentID: userMsg.id,
+              mode: input.agent,
+              agent: input.agent,
+              cost: 0,
+              path: { cwd: ctx.directory, root: ctx.worktree },
+              time: { created: Date.now() },
+              role: "assistant",
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: model.modelID,
+              providerID: model.providerID,
+            }
+            yield* sessions.updateMessage(msg)
+            const part: MessageV2.ToolPart = {
+              type: "tool",
+              id: PartID.ascending(),
+              messageID: msg.id,
+              sessionID: input.sessionID,
+              tool: "bash",
+              callID: ulid(),
+              state: {
+                status: "running",
+                time: { start: Date.now() },
+                input: { command: input.command },
+              },
+            }
+            yield* sessions.updatePart(part)
+            // Register the finalizer while still uninterruptible — see comment above.
+            yield* Effect.addFinalizer((exit) =>
+              Effect.gen(function* () {
+                const interrupted = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
+                if (aborted || interrupted) {
+                  output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
+                }
+                if (!msg.time.completed) {
+                  msg.time.completed = Date.now()
+                  yield* sessions.updateMessage(msg)
+                }
+                if (part.state.status === "running") {
+                  part.state = {
+                    status: "completed",
+                    time: { ...part.state.time, end: Date.now() },
+                    input: part.state.input,
+                    title: "",
+                    metadata: { output, description: "" },
+                    output,
+                  }
+                  yield* sessions.updatePart(part)
+                }
+              }),
+            )
+            return { msg, part }
+          }),
+        )
 
-        const msg: MessageV2.Assistant = {
-          id: MessageID.ascending(),
-          sessionID: input.sessionID,
-          parentID: userMsg.id,
-          mode: input.agent,
-          agent: input.agent,
-          cost: 0,
-          path: { cwd: ctx.directory, root: ctx.worktree },
-          time: { created: Date.now() },
-          role: "assistant",
-          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-          modelID: model.modelID,
-          providerID: model.providerID,
-        }
-        yield* sessions.updateMessage(msg)
-        const part: MessageV2.ToolPart = {
-          type: "tool",
-          id: PartID.ascending(),
-          messageID: msg.id,
-          sessionID: input.sessionID,
-          tool: "bash",
-          callID: ulid(),
-          state: {
-            status: "running",
-            time: { start: Date.now() },
-            input: { command: input.command },
-          },
-        }
-        yield* sessions.updatePart(part)
-
-        const sh = Shell.preferred()
-        const shellName = (
-          process.platform === "win32" ? path.win32.basename(sh, ".exe") : path.basename(sh)
-        ).toLowerCase()
-        const invocations: Record<string, { args: string[] }> = {
-          nu: { args: ["-c", input.command] },
-          fish: { args: ["-c", input.command] },
-          zsh: {
-            args: [
-              "-l",
-              "-c",
-              `
+        return yield* Effect.gen(function* () {
+          const sh = Shell.preferred()
+          const shellName = (
+            process.platform === "win32" ? path.win32.basename(sh, ".exe") : path.basename(sh)
+          ).toLowerCase()
+          const invocations: Record<string, { args: string[] }> = {
+            nu: { args: ["-c", input.command] },
+            fish: { args: ["-c", input.command] },
+            zsh: {
+              args: [
+                "-l",
+                "-c",
+                `
                 __oc_cwd=$PWD
                 [[ -f ~/.zshenv ]] && source ~/.zshenv >/dev/null 2>&1 || true
                 [[ -f "\${ZDOTDIR:-$HOME}/.zshrc" ]] && source "\${ZDOTDIR:-$HOME}/.zshrc" >/dev/null 2>&1 || true
                 cd "$__oc_cwd"
                 eval ${JSON.stringify(input.command)}
               `,
-            ],
-          },
-          bash: {
-            args: [
-              "-l",
-              "-c",
-              `
+              ],
+            },
+            bash: {
+              args: [
+                "-l",
+                "-c",
+                `
                 __oc_cwd=$PWD
                 shopt -s expand_aliases
                 [[ -f ~/.bashrc ]] && source ~/.bashrc >/dev/null 2>&1 || true
                 cd "$__oc_cwd"
                 eval ${JSON.stringify(input.command)}
               `,
-            ],
-          },
-          cmd: { args: ["/c", input.command] },
-          powershell: { args: ["-NoProfile", "-Command", input.command] },
-          pwsh: { args: ["-NoProfile", "-Command", input.command] },
-          "": { args: ["-c", input.command] },
-        }
+              ],
+            },
+            cmd: { args: ["/c", input.command] },
+            powershell: { args: ["-NoProfile", "-Command", input.command] },
+            pwsh: { args: ["-NoProfile", "-Command", input.command] },
+            "": { args: ["-c", input.command] },
+          }
 
-        const args = (invocations[shellName] ?? invocations[""]).args
-        const cwd = ctx.directory
-        const shellEnv = yield* plugin.trigger(
-          "shell.env",
-          { cwd, sessionID: input.sessionID, callID: part.callID },
-          { env: {} },
-        )
-
-        const cmd = ChildProcess.make(sh, args, {
-          cwd,
-          extendEnv: true,
-          env: { ...shellEnv.env, TERM: "dumb" },
-          stdin: "ignore",
-          forceKillAfter: "3 seconds",
-        })
-
-        let output = ""
-        let aborted = false
-
-        const finish = Effect.uninterruptible(
-          Effect.gen(function* () {
-            if (aborted) {
-              output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
-            }
-            if (!msg.time.completed) {
-              msg.time.completed = Date.now()
-              yield* sessions.updateMessage(msg)
-            }
-            if (part.state.status === "running") {
-              part.state = {
-                status: "completed",
-                time: { ...part.state.time, end: Date.now() },
-                input: part.state.input,
-                title: "",
-                metadata: { output, description: "" },
-                output,
-              }
-              yield* sessions.updatePart(part)
-            }
-          }),
-        )
-
-        const exit = yield* Effect.gen(function* () {
-          const handle = yield* spawner.spawn(cmd)
-          yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
-            Effect.sync(() => {
-              output += chunk
-              if (part.state.status === "running") {
-                part.state.metadata = { output, description: "" }
-                void run.fork(sessions.updatePart(part))
-              }
-            }),
+          const args = (invocations[shellName] ?? invocations[""]).args
+          const cwd = ctx.directory
+          const shellEnv = yield* plugin.trigger(
+            "shell.env",
+            { cwd, sessionID: input.sessionID, callID: part.callID },
+            { env: {} },
           )
-          yield* handle.exitCode
+
+          const cmd = ChildProcess.make(sh, args, {
+            cwd,
+            extendEnv: true,
+            env: { ...shellEnv.env, TERM: "dumb" },
+            stdin: "ignore",
+            forceKillAfter: "3 seconds",
+          })
+
+          const exit = yield* Effect.gen(function* () {
+            const handle = yield* spawner.spawn(cmd)
+            yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+              Effect.sync(() => {
+                output += chunk
+                if (part.state.status === "running") {
+                  part.state.metadata = { output, description: "" }
+                  void run.fork(sessions.updatePart(part))
+                }
+              }),
+            )
+            yield* handle.exitCode
+          }).pipe(
+            Effect.scoped,
+            Effect.onInterrupt(() =>
+              Effect.sync(() => {
+                aborted = true
+              }),
+            ),
+            Effect.orDie,
+            Effect.exit,
+          )
+
+          if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
+            return yield* Effect.failCause(exit.cause)
+          }
+
+          return { info: msg, parts: [part] }
         }).pipe(
-          Effect.scoped,
+          // Set aborted=true on outer-level interrupt so the scope finalizer appends the
+          // "User aborted the command" metadata. The subprocess effect's own Effect.onInterrupt
+          // only fires when the spawn itself has been entered; if cancel arrives after setup
+          // but before the spawn, we still need to mark aborted=true for the finalizer.
           Effect.onInterrupt(() =>
             Effect.sync(() => {
               aborted = true
             }),
           ),
-          Effect.orDie,
-          Effect.ensuring(finish),
-          Effect.exit,
         )
-
-        if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
-          return yield* Effect.failCause(exit.cause)
-        }
-
-        return { info: msg, parts: [part] }
       })
+
+      const shellImplScoped = (input: ShellInput) => Effect.scoped(shellImpl(input))
 
       const getModel = Effect.fn("SessionPrompt.getModel")(function* (
         providerID: ProviderID,
@@ -1564,7 +1588,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.shell")(
         function* (input: ShellInput) {
-          return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input))
+          return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImplScoped(input))
         },
       )
 

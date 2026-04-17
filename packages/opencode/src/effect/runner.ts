@@ -183,8 +183,13 @@ export const make = <A, E = never>(
       case "ShellThenRun":
         return [
           Effect.gen(function* () {
-            yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
+            // Interrupt the shell first and wait for it to finalize. The pending run's
+            // onInterrupt handler (e.g. lastAssistant) typically reads state written by the
+            // shell's finalizers, so we must not surface the Cancelled signal to the awaiter
+            // until the shell fiber has observed its interrupt and completed its finalizers.
             yield* stopShell(st.shell)
+            yield* Fiber.await(st.shell.fiber).pipe(Effect.exit, Effect.asVoid)
+            yield* Deferred.fail(st.run.done, new Cancelled()).pipe(Effect.asVoid)
             yield* idleIfCurrent()
           }),
           { _tag: "Idle" } as const,
