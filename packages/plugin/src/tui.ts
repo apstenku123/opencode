@@ -275,6 +275,7 @@ export type TuiState = {
     count: () => number
     diff: (sessionID: string) => ReadonlyArray<TuiSidebarFileItem>
     todo: (sessionID: string) => ReadonlyArray<TuiSidebarTodoItem>
+    autobest: (sessionID: string) => TuiSessionAutobest | undefined
     messages: (sessionID: string) => ReadonlyArray<Message>
     status: (sessionID: string) => SessionStatus | undefined
     permission: (sessionID: string) => ReadonlyArray<PermissionRequest>
@@ -316,6 +317,20 @@ export type TuiSidebarFileItem = {
   file: string
   additions: number
   deletions: number
+}
+
+export type TuiSessionAutobest = {
+  active?: {
+    key: string
+    ts?: number
+    source?: "manual" | "auto"
+    score?: number
+  }
+  selected?: {
+    key: string
+    score?: number
+    reason?: ReadonlyArray<string>
+  }
 }
 
 export type TuiHostSlotMap = {
