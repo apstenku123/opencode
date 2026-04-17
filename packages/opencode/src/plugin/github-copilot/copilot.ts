@@ -96,6 +96,26 @@ export function base(enterpriseUrl?: string) {
   return enterpriseUrl ? `https://copilot-api.${normalizeDomain(enterpriseUrl)}` : "https://api.githubcopilot.com"
 }
 
+/**
+ * Resolve the discovered API base + plan SKU for an account via
+ * `/copilot_internal/user`. Mirrors the first leg of Rust
+ * `fetch_account_model_catalog_with_discovery` in `models.rs:439-567`.
+ * Returns `{api, sku}` on success; silently swallows errors so callers
+ * can fall back to the static `base(enterpriseUrl)`.
+ */
+export async function discoverEndpoints(input: {
+  token: string
+  enterpriseUrl?: string
+  proxy?: { url?: string; token?: string }
+}): Promise<{ api?: string; sku?: string }> {
+  try {
+    const quota = await fetchQuota(input.token, input.enterpriseUrl, input.proxy)
+    return { api: quota.api, sku: quota.sku }
+  } catch {
+    return {}
+  }
+}
+
 export async function aliasModels(input: {
   provider: { id: string; models: Record<string, Model> }
   auth?: { type: string; refresh?: string; enterpriseUrl?: string }
@@ -109,8 +129,16 @@ export async function aliasModels(input: {
   const match = key ? input.auths.find((item) => item.key === key) : undefined
   if (!match) return
   const cfg = proxyConfig(input.state, match.key)
+  // Step 1: two-step discovery — resolve dynamic API base + plan SKU.
+  const disc = await discoverEndpoints({
+    token: match.refresh,
+    enterpriseUrl: match.enterpriseUrl,
+    proxy: cfg,
+  })
+  const apiBase = disc.api ?? base(match.enterpriseUrl)
+  const planSku = disc.sku
   return CopilotModels.get(
-    base(match.enterpriseUrl),
+    apiBase,
     {
       Authorization: `Bearer ${match.refresh}`,
       "User-Agent": `opencode/${InstallationVersion}`,
@@ -118,11 +146,12 @@ export async function aliasModels(input: {
     },
     input.provider.models,
     cfg?.url,
+    planSku,
   )
     .then(async (models) => {
       const next = discover(input.state, match.key, {
         models: Object.values(models).map((item) => item.api.id),
-        api: base(match.enterpriseUrl),
+        api: apiBase,
         plan: input.state.connections[match.key]?.plan,
         login: input.state.connections[match.key]?.login,
         ok: true,
@@ -133,14 +162,14 @@ export async function aliasModels(input: {
     .catch(async (error) => {
       const next = discover(input.state, match.key, {
         models: [],
-        api: base(match.enterpriseUrl),
+        api: apiBase,
         plan: input.state.connections[match.key]?.plan,
         login: input.state.connections[match.key]?.login,
         ok: false,
         err: error instanceof Error ? error.message : String(error),
       })
       await input.write(next)
-      return Object.fromEntries(Object.entries(input.provider.models).map(([id, model]) => [id, fix(model, base(match.enterpriseUrl))]))
+      return Object.fromEntries(Object.entries(input.provider.models).map(([id, model]) => [id, fix(model, apiBase)]))
     })
 }
 
@@ -664,6 +693,76 @@ export async function dispatch(input: {
   return res
 }
 
+/**
+ * Per-account discovery barrier. The first dispatch for a given account key
+ * `await`s the promise (bounded by `DISCOVERY_TIMEOUT_MS`); `resolve(key)`
+ * releases all waiters once endpoint discovery has completed. Mirrors Rust
+ * `AccountPool::wait_for_discovery` / `mark_discovery_complete` in
+ * `core/src/account_pool.rs:1576-1610`.
+ */
+export const DISCOVERY_TIMEOUT_MS = 10_000
+
+export type DiscoveryBarrier = {
+  /**
+   * Block until discovery resolves for `key`. Returns immediately if the
+   * barrier was never `start()`ed for this key (i.e. there's no pending
+   * work to wait on) or if `resolve()` has already been called.
+   */
+  wait(key: string, timeoutMs?: number): Promise<void>
+  /**
+   * Mark discovery as "in flight" for `key`. Must be called before any
+   * `wait()` can actually block — mirrors the Rust pool's implicit
+   * "discovery was scheduled" signal from `fetch_account_model_catalog*`.
+   */
+  start(key: string): void
+  /** Release all waiters for `key`. Idempotent. */
+  resolve(key: string): void
+  done(key: string): boolean
+}
+
+export function createDiscoveryBarrier(): DiscoveryBarrier {
+  const waiters = new Map<
+    string,
+    { promise: Promise<void>; resolve: () => void; done: boolean; started: boolean }
+  >()
+  function slot(key: string) {
+    const existing = waiters.get(key)
+    if (existing) return existing
+    let resolver: () => void = () => {}
+    const promise = new Promise<void>((r) => {
+      resolver = r
+    })
+    const entry = { promise, resolve: resolver, done: false, started: false }
+    waiters.set(key, entry)
+    return entry
+  }
+  return {
+    async wait(key, timeoutMs = DISCOVERY_TIMEOUT_MS) {
+      const entry = slot(key)
+      if (entry.done) return
+      if (!entry.started) return
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeout = new Promise<void>((r) => {
+        timer = setTimeout(r, timeoutMs)
+      })
+      await Promise.race([entry.promise, timeout])
+      if (timer) clearTimeout(timer)
+    },
+    start(key) {
+      slot(key).started = true
+    },
+    resolve(key) {
+      const entry = slot(key)
+      if (entry.done) return
+      entry.done = true
+      entry.resolve()
+    },
+    done(key) {
+      return waiters.get(key)?.done ?? false
+    },
+  }
+}
+
 export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   const sdk = input.client
   await Effect.runPromise(migrate().pipe(Effect.provide(Auth.defaultLayer), Effect.provide(AppFileSystem.defaultLayer))).catch(() => [])
@@ -673,6 +772,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
     await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.get())).catch(() => undefined),
   )
   const runtime = owner(cfg.limit, cfg.minIntervalMs)
+  const discoveryBarrier = createDiscoveryBarrier()
   CopilotRuntimeState.current = runtime
   return {
     provider: {
@@ -690,8 +790,21 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
         const key = match?.key ?? "github-copilot"
         const cfg = proxyConfig(storeState, key)
 
+        // Two-step discovery chain: `/copilot_internal/user` → `/models`.
+        // Announce start *before* the first network call so concurrent
+        // `dispatch` calls block in `wait_for_discovery` until either
+        // `.resolve(key)` runs or the bounded timeout fires.
+        discoveryBarrier.start(key)
+        const disc = await discoverEndpoints({
+          token: auth.refresh,
+          enterpriseUrl: auth.enterpriseUrl,
+          proxy: cfg,
+        })
+        const apiBase = disc.api ?? base(auth.enterpriseUrl)
+        const planSku = disc.sku
+
         return CopilotModels.get(
-          base(auth.enterpriseUrl),
+          apiBase,
           {
             Authorization: `Bearer ${auth.refresh}`,
             "User-Agent": `opencode/${InstallationVersion}`,
@@ -699,31 +812,34 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
           },
           provider.models,
           cfg?.url,
+          planSku,
         )
           .then(async (models) => {
             const next = discover(storeState, key, {
               models: Object.values(models).map((item) => item.api.id),
-              api: base(auth.enterpriseUrl),
+              api: apiBase,
               plan: storeState.connections[key]?.plan,
               login: storeState.connections[key]?.login,
               ok: true,
             })
             await writeState(next)
+            discoveryBarrier.resolve(key)
             return models
           })
           .catch(async (error) => {
             log.error("failed to fetch copilot models", { error })
             const next = discover(storeState, key, {
               models: [],
-              api: base(auth.enterpriseUrl),
+              api: apiBase,
               plan: storeState.connections[key]?.plan,
               login: storeState.connections[key]?.login,
               ok: false,
               err: error instanceof Error ? error.message : String(error),
             })
             await writeState(next)
+            discoveryBarrier.resolve(key)
             return Object.fromEntries(
-              Object.entries(provider.models).map(([id, model]) => [id, fix(model, base(auth.enterpriseUrl))]),
+              Object.entries(provider.models).map(([id, model]) => [id, fix(model, apiBase)]),
             )
           })
       },
@@ -801,6 +917,12 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
                 return undefined
               }
             })
+            // Bounded wait for endpoint discovery. Mirrors Rust
+            // `AccountPool::wait_for_discovery` — first dispatch blocks up
+            // to 10 s for the `/copilot_internal/user` + `/models` chain
+            // to complete; subsequent dispatches resolve immediately.
+            const barrierKey = (info as any).accountId ?? "github-copilot"
+            await discoveryBarrier.wait(barrierKey)
             return dispatch({
               getAuth,
               auths: await allAuths(),
