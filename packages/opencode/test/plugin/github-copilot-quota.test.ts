@@ -91,3 +91,51 @@ test("fetchQuota routes through proxy and forwards proxy token header", async ()
     globalThis.fetch = prev
   }
 })
+
+describe("fetchQuota dynamic endpoint + SKU (step 1 of discovery chain)", () => {
+  test("parses endpoints.api and access_type_sku for downstream /models routing", async () => {
+    const prev = globalThis.fetch
+    globalThis.fetch = mock(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            user_login: "corp",
+            copilot_plan: "enterprise",
+            access_type_sku: "enterprise",
+            endpoints: { api: "https://api.enterprise.githubcopilot.com" },
+            entitlements: { premium_requests: 1500 },
+            quota_snapshots: [
+              { quota_id: "premium_requests", remaining: 900, total: 1500, percent_remaining: 0.6 },
+            ],
+          }),
+          { status: 200 },
+        ),
+      ),
+    ) as unknown as typeof fetch
+    try {
+      const out = await fetchQuota("tok")
+      // Downstream discovery uses quota.api as the dynamic /models base
+      // and quota.sku as the `retain_for_plan` filter.
+      expect(out.api).toBe("https://api.enterprise.githubcopilot.com")
+      expect(out.sku).toBe("enterprise")
+      expect(out.plan).toBe("enterprise")
+      expect(out.premium?.total).toBe(1500)
+    } finally {
+      globalThis.fetch = prev
+    }
+  })
+
+  test("omits api/sku when the server doesn't return them", async () => {
+    const prev = globalThis.fetch
+    globalThis.fetch = mock(() =>
+      Promise.resolve(new Response(JSON.stringify({ user_login: "octo" }), { status: 200 })),
+    ) as unknown as typeof fetch
+    try {
+      const out = await fetchQuota("tok")
+      expect(out.api).toBeUndefined()
+      expect(out.sku).toBeUndefined()
+    } finally {
+      globalThis.fetch = prev
+    }
+  })
+})
