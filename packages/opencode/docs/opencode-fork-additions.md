@@ -21,7 +21,7 @@ All paths below are relative to the repository root unless an absolute path is g
 10. [Providers CLI changes](#providers-cli-changes)
 11. [Configuration and environment variables](#configuration-and-environment-variables)
 12. [Testing surface](#testing-surface)
-13. [Known technical debt (`TODO(unify)`)](#known-technical-debt-todounify)
+13. [Known technical debt](#known-technical-debt)
 14. [Migration notes](#migration-notes)
 
 ---
@@ -35,22 +35,22 @@ history, and timer work forward from `port/copilot-plan`. It diverges from the
 
 Commits unique to this fork branch (`git log --oneline 9f201d637..unify/copilot-plan`):
 
-| SHA (short) | Message |
-| --- | --- |
-| `56bc93a0d` | `fix(unify): patch scattered Effect R-channel drift in tests + app-runtime` |
-| `9858c5469` | `fix(unify): github-copilot/copilot.ts Auth API + quota.ts typing` |
-| `556d23544` | `fix(unify): stub history/index.ts type issues; skip history test pending Session.Interface autobest port` |
-| `48f288bf9` | `fix(unify): drop duplicate ThreadRoutes wiring; point providers.ts to nested quota; skip providers-quota test` |
-| `6c0c9b7c9` | `chore(unify): drop flat plugin/copilot-*.ts; skip providers-quota.test.ts pending API realignment` |
-| `c31ad4ca3` | `fix(unify): align providers.ts with current auth/config/process API` |
-| `56c0ea259` | `fix(unify): align server/instance/{session,index}.ts with current namespaces; stub autobest endpoints` |
-| `167cdf4fd` | `fix(unify): align server/instance/{timer,thread}.ts with current runtime API` |
-| `5ea2ef46c` | `fix(unify): easy typecheck fixes — imports aligned with current dev` |
-| `be6bc2db1` | `merge: port/copilot-plan into unify — autobest, history, timer, copilot nested layout` |
-| `ad483e648` | `merge: wip/dev-copilot-nested — copilot dispatch rewrite + thread/turn routes` |
-| `3f170b032` | `wip: port copilot-plan — autobest, history, timer, copilot routing` |
-| `4a96db395` | `wip: copilot nested-layout migration + thread/turn routes` |
-| `b804debb3` | `Record current codex_git parity frontier` |
+| SHA (short) | Message                                                                                                                 |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `56bc93a0d` | `fix(unify): patch scattered Effect R-channel drift in tests + app-runtime`                                             |
+| `9858c5469` | `fix(unify): github-copilot/copilot.ts Auth API + quota.ts typing`                                                      |
+| `556d23544` | `fix(unify): stub history/index.ts type issues; skip history test pending Session.Interface autobest port`              |
+| `48f288bf9` | `fix(unify): drop duplicate ThreadRoutes wiring; point providers.ts to nested quota; skip providers-quota test`         |
+| `6c0c9b7c9` | `chore(unify): drop flat plugin/copilot-*.ts; skip providers-quota.test.ts pending API realignment`                     |
+| `c31ad4ca3` | `fix(unify): align providers.ts with current auth/config/process API`                                                   |
+| `56c0ea259` | `fix(unify): align server/instance/{session,index}.ts with current namespaces; stub autobest endpoints`                 |
+| `167cdf4fd` | `fix(unify): align server/instance/{timer,thread}.ts with current runtime API`                                          |
+| `5ea2ef46c` | `fix(unify): easy typecheck fixes — imports aligned with current dev`                                                   |
+| `be6bc2db1` | `merge: port/copilot-plan into unify — autobest, history, timer, copilot nested layout`                                 |
+| `ad483e648` | `merge: wip/dev-copilot-nested — copilot dispatch rewrite + thread/turn routes`                                         |
+| `3f170b032` | `wip: port copilot-plan — autobest, history, timer, copilot routing`                                                    |
+| `4a96db395` | `wip: copilot nested-layout migration + thread/turn routes`                                                             |
+| `b804debb3` | `Record current codex_git parity frontier`                                                                              |
 | `16538ae80` | `feat: implement Copilot model discovery, adaptive rate limiting, and persistent state tracking for hooks and metrics.` |
 
 Aggregate changeset: ~10k LOC added across ~90 files, primarily under
@@ -59,14 +59,14 @@ Aggregate changeset: ~10k LOC added across ~90 files, primarily under
 
 ### High-level additions
 
-| Area | Directory | What is new |
-| --- | --- | --- |
-| Copilot routing | `packages/opencode/src/plugin/github-copilot/` | 7 new files, plus a rewritten `copilot.ts` (~1k lines) and a touched `models.ts`. |
-| Autobest | `packages/opencode/src/autobest/`, `packages/opencode/src/session/autobest*.ts` | New domain namespace + session integration/observer. |
-| History | `packages/opencode/src/history/`, `packages/opencode/src/session/history-observer.ts` | JSONL event store + analytics, KB, search, timeline overlays. |
-| Timer | `packages/opencode/src/timer/`, `packages/opencode/src/tool/timer.ts`, `packages/opencode/src/server/{instance,protocol}/timer.ts` | Managed timer service + agent tool + REST surface. |
-| Threads | `packages/opencode/src/server/instance/thread.ts` | `/thread` and `/turn` aliases on top of existing `/session`. |
-| Copilot sidebar | `packages/opencode/src/cli/cmd/tui/feature-plugins/sidebar/copilot.tsx` | TUI widget showing per-account runtime/lane state. |
+| Area            | Directory                                                                                                                          | What is new                                                                       |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Copilot routing | `packages/opencode/src/plugin/github-copilot/`                                                                                     | 7 new files, plus a rewritten `copilot.ts` (~1k lines) and a touched `models.ts`. |
+| Autobest        | `packages/opencode/src/autobest/`, `packages/opencode/src/session/autobest*.ts`                                                    | New domain namespace + session integration/observer.                              |
+| History         | `packages/opencode/src/history/`, `packages/opencode/src/session/history-observer.ts`                                              | JSONL event store + analytics, KB, search, timeline overlays.                     |
+| Timer           | `packages/opencode/src/timer/`, `packages/opencode/src/tool/timer.ts`, `packages/opencode/src/server/{instance,protocol}/timer.ts` | Managed timer service + agent tool + REST surface.                                |
+| Threads         | `packages/opencode/src/server/instance/thread.ts`                                                                                  | `/thread` and `/turn` aliases on top of existing `/session`.                      |
+| Copilot sidebar | `packages/opencode/src/cli/cmd/tui/feature-plugins/sidebar/copilot.tsx`                                                            | TUI widget showing per-account runtime/lane state.                                |
 
 ---
 
@@ -78,16 +78,16 @@ in-process concurrency limits for the GitHub Copilot provider.
 
 ### File inventory
 
-| File | Lines | Responsibility |
-| --- | --- | --- |
-| `auth.ts` | 194 | `CopilotAuth` type, legacy `~/.copilot/auth/credential.json` migration, `list`/`legacy`/`migrate` helpers, `MigrationState` bookkeeping. |
-| `connections.ts` | 183 | Persistent connection state: `State`, `Conn`, `Discovery`, upsert/mark/clear, proxy config, plan lookup, `Store` (Effect-based JSON store), `staleDiscovery`. |
-| `copilot.ts` | 1025 | Plugin entrypoint `CopilotAuthPlugin`, routing policy (`preferPlan`, `preferPolicy`, `preferDiscovery`, `batchOrder`, `autobestBatch`, `routeAccount`), `dispatch`, proxy fetch, OAuth device flow, `CopilotRuntimeState`. |
-| `machine.ts` | 6 | Thin re-export of `connections.machine` for call sites needing per-account machine IDs. |
-| `models.ts` | 148 | Zod schema for Copilot model discovery API + model fetching. |
-| `paths.ts` | 7 | `connectionFile`, `legacyCredentialFile`, `migrationFile` path constants. |
-| `quota.ts` | 99 | `Quota`/`Premium` parse, `fetchQuota`, `classifyPlan` → `edu`/`enterprise`/`business`/`team`/`individual`/`free`/`unknown`, `formatQuotaBar`. |
-| `runtime.ts` | 141 | In-memory runtime: `Runtime`, `Pool`, `reserve`, `reserveBatch`, `touch`, `cooldown`, `eligible`, `Event` feed (24-entry ring). |
+| File             | Lines | Responsibility                                                                                                                                                                                                             |
+| ---------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `auth.ts`        | 194   | `CopilotAuth` type, legacy `~/.copilot/auth/credential.json` migration, `list`/`legacy`/`migrate` helpers, `MigrationState` bookkeeping.                                                                                   |
+| `connections.ts` | 183   | Persistent connection state: `State`, `Conn`, `Discovery`, upsert/mark/clear, proxy config, plan lookup, `Store` (Effect-based JSON store), `staleDiscovery`.                                                              |
+| `copilot.ts`     | 1025  | Plugin entrypoint `CopilotAuthPlugin`, routing policy (`preferPlan`, `preferPolicy`, `preferDiscovery`, `batchOrder`, `autobestBatch`, `routeAccount`), `dispatch`, proxy fetch, OAuth device flow, `CopilotRuntimeState`. |
+| `machine.ts`     | 6     | Thin re-export of `connections.machine` for call sites needing per-account machine IDs.                                                                                                                                    |
+| `models.ts`      | 148   | Zod schema for Copilot model discovery API + model fetching.                                                                                                                                                               |
+| `paths.ts`       | 7     | `connectionFile`, `legacyCredentialFile`, `migrationFile` path constants.                                                                                                                                                  |
+| `quota.ts`       | 99    | `Quota`/`Premium` parse, `fetchQuota`, `classifyPlan` → `edu`/`enterprise`/`business`/`team`/`individual`/`free`/`unknown`, `formatQuotaBar`.                                                                              |
+| `runtime.ts`     | 141   | In-memory runtime: `Runtime`, `Pool`, `reserve`, `reserveBatch`, `touch`, `cooldown`, `eligible`, `Event` feed (24-entry ring).                                                                                            |
 
 ### Key types
 
@@ -171,13 +171,13 @@ if (res.status === 429) {
 `policyPlan(modelId)` (`copilot.ts:204`) derives a lane hint from the model id. Keywords
 map to the following lanes (checked in this order):
 
-| Keyword in model id | Lane |
-| --- | --- |
-| `edu` | `edu` |
-| `enterprise` | `enterprise` |
-| `business` | `business` |
-| `team` | `team` |
-| `personal` / `free` | `free` |
+| Keyword in model id | Lane         |
+| ------------------- | ------------ |
+| `edu`               | `edu`        |
+| `enterprise`        | `enterprise` |
+| `business`          | `business`   |
+| `team`              | `team`       |
+| `personal` / `free` | `free`       |
 
 `classifyPlan()` (`quota.ts:89`) performs the reverse on the authenticated user's
 `copilot_plan` + `access_type_sku` fields returned from `/copilot_internal/user` and
@@ -269,12 +269,12 @@ deliberately lightweight so the core session machinery stays untouched.
 
 ### File inventory
 
-| File | Purpose |
-| --- | --- |
-| `packages/opencode/src/autobest/index.ts` | Pure domain logic: `Candidate`, `Pick`, `State`, `Decision`, `decide`, `apply`, `setActive`. |
-| `packages/opencode/src/session/autobest.ts` | Bridges `Autobest` decisions into the History event stream (`autobest.state` events). |
-| `packages/opencode/src/session/autobest-observer.ts` | Effect service that listens for `SessionStatus.Event.Idle` and applies autobest extraction. |
-| `packages/opencode/src/v2/session-event.ts` | Schema-Class `SessionEvent.Autobest` carrying `active`, `selected`, `changed`, `candidates`. |
+| File                                                 | Purpose                                                                                      |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `packages/opencode/src/autobest/index.ts`            | Pure domain logic: `Candidate`, `Pick`, `State`, `Decision`, `decide`, `apply`, `setActive`. |
+| `packages/opencode/src/session/autobest.ts`          | Bridges `Autobest` decisions into the History event stream (`autobest.state` events).        |
+| `packages/opencode/src/session/autobest-observer.ts` | Effect service that listens for `SessionStatus.Event.Idle` and applies autobest extraction.  |
+| `packages/opencode/src/v2/session-event.ts`          | Schema-Class `SessionEvent.Autobest` carrying `active`, `selected`, `changed`, `candidates`. |
 
 ### Key types
 
@@ -317,9 +317,9 @@ export function decide(state: State, input: { candidates: Candidate[]; ts?: numb
    list items; assigns a descending score starting from 100; keeps the first 5.
 4. Call `applyAutobest({ sessionID, candidates, ts })` on the Session service.
 
-> The `(session as any)` casts and `@ts-expect-error` in the observer signal pending
-> work — the `Session.Interface` does not yet expose the autobest-aware methods, which
-> is why several server endpoints return `501` (see *Known technical debt*).
+> The observer uses the typed `Session.Service` directly — `getAutobestEnabled`,
+> `findMessage`, and `applyAutobest` are first-class members of `Session.Interface`
+> (restored in `df811c5ec`). Prior `as any` casts have been removed (`a9dcda88e`).
 
 ### History bridge
 
@@ -338,13 +338,13 @@ a knowledge-base view, and a free-text search endpoint.
 
 ### File inventory
 
-| File | Purpose |
-| --- | --- |
-| `packages/opencode/src/history/index.ts` | Event union (20+ variants), JSONL file IO, `append`/`read`/`readByType`/`last`. |
-| `packages/opencode/src/history/analytics.ts` | Aggregated view: tool counts by state/name, step totals, cost/tokens, latest-of-each-kind. |
-| `packages/opencode/src/history/kb.ts` | Knowledge-base shape: counts + latest snapshot of key event kinds. |
-| `packages/opencode/src/history/search.ts` | Tokenise+query across all event types; row projection with text blob per event. |
-| `packages/opencode/src/history/timeline.ts` | Chronological view with per-event kind ("session"/"message"/"prompt"/"tool"/"autobest") and title derivation; `changes()` surface for summary deltas. |
+| File                                                | Purpose                                                                                                                                                       |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/opencode/src/history/index.ts`            | Event union (20+ variants), JSONL file IO, `append`/`read`/`readByType`/`last`.                                                                               |
+| `packages/opencode/src/history/analytics.ts`        | Aggregated view: tool counts by state/name, step totals, cost/tokens, latest-of-each-kind.                                                                    |
+| `packages/opencode/src/history/kb.ts`               | Knowledge-base shape: counts + latest snapshot of key event kinds.                                                                                            |
+| `packages/opencode/src/history/search.ts`           | Tokenise+query across all event types; row projection with text blob per event.                                                                               |
+| `packages/opencode/src/history/timeline.ts`         | Chronological view with per-event kind ("session"/"message"/"prompt"/"tool"/"autobest") and title derivation; `changes()` surface for summary deltas.         |
 | `packages/opencode/src/session/history-observer.ts` | Effect service subscribing to `MessageV2.Event.PartUpdated` to emit `prompt.reminder.inserted`, `prompt.subtask.state_changed`, `prompt.shell.state_changed`. |
 
 ### Storage model
@@ -449,10 +449,10 @@ core (`Timer.create`), an Effect-based service used by the server
 
 ### File inventory
 
-| File | Purpose |
-| --- | --- |
-| `packages/opencode/src/timer/index.ts` | Pure `Timer.create(clock?)` factory; supports arm/disarm, repeat, drain, clear. |
-| `packages/opencode/src/tool/timer.ts` | `TimerTool` (ai-sdk tool) with action verbs `create`/`pause`/`resume`/`delete`/`get`/`list`/`drain`/`clear`. |
+| File                                             | Purpose                                                                                                                          |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/opencode/src/timer/index.ts`           | Pure `Timer.create(clock?)` factory; supports arm/disarm, repeat, drain, clear.                                                  |
+| `packages/opencode/src/tool/timer.ts`            | `TimerTool` (ai-sdk tool) with action verbs `create`/`pause`/`resume`/`delete`/`get`/`list`/`drain`/`clear`.                     |
 | `packages/opencode/src/server/instance/timer.ts` | `TimerSvc` Effect service + zod schemas (`Info`, `Fired`, `CreateInput`, `ItemInput`) with an `InstanceState`-scoped shared map. |
 | `packages/opencode/src/server/protocol/timer.ts` | Protocol-only types: `ListResponse`, `CreateResponse`, `PauseResponse`, `ResumeResponse`, `DeleteResponse`, `FiredNotification`. |
 
@@ -499,19 +499,22 @@ Server routes are split across `/timer` (instance-wide) and `/session/:sessionID
 (session-scoped). Duplicate routes exist because the thread alias layer reuses the
 underlying service.
 
-| Method | Path | Operation ID |
-| --- | --- | --- |
-| GET | `/timer` | `timer.list` |
-| GET | `/session/:sessionID/timer` | `session.timer.list` |
-| POST | `/session/:sessionID/timer` | `session.timer.create` |
-| POST | `/session/:sessionID/timer/drain` | `session.timer.drain` (optional `?inject=true` query marker) |
-| POST | `/session/:sessionID/timer/:id/pause` | `session.timer.pause` |
-| POST | `/session/:sessionID/timer/:id/resume` | `session.timer.resume` |
-| DELETE | `/session/:sessionID/timer/:id` | `session.timer.delete` |
-| POST | `/tui/timer-fired` | `tui.timerFired` (publishes `TuiEvent.TimerFired` into the bus) |
+| Method | Path                                   | Operation ID                                                    |
+| ------ | -------------------------------------- | --------------------------------------------------------------- |
+| GET    | `/timer`                               | `timer.list`                                                    |
+| GET    | `/session/:sessionID/timer`            | `session.timer.list`                                            |
+| POST   | `/session/:sessionID/timer`            | `session.timer.create`                                          |
+| POST   | `/session/:sessionID/timer/drain`      | `session.timer.drain` (optional `?inject=true` query marker)    |
+| POST   | `/session/:sessionID/timer/:id/pause`  | `session.timer.pause`                                           |
+| POST   | `/session/:sessionID/timer/:id/resume` | `session.timer.resume`                                          |
+| DELETE | `/session/:sessionID/timer/:id`        | `session.timer.delete`                                          |
+| POST   | `/tui/timer-fired`                     | `tui.timerFired` (publishes `TuiEvent.TimerFired` into the bus) |
 
-The `?inject=true` drain flag is present but currently a no-op while autobest
-injection is pending (`session.ts:269` — see *Known technical debt*).
+The `?inject=true` drain flag appends a synthesised user message (`[timer:<id>]
+fired`) per drained timer via `Session.appendUserText` (see
+`server/instance/session.ts:268`). This is the closed form of a previously stubbed
+hook — it now surfaces fired-timer state into the conversation transcript rather
+than being silently dropped.
 
 ### TUI bus event
 
@@ -540,29 +543,29 @@ onto the existing `Session` / `SessionPrompt` services. It is aliased in
 
 ### Thread routes
 
-| Method | Path | Behaviour |
-| --- | --- | --- |
-| GET | `/thread` | List sessions (mirrors `/session`). Accepts `directory`, `roots`, `start`, `search`, `limit`. |
-| GET | `/thread/:threadID` | Fetch a single session. |
-| POST | `/thread/start` | Create a session. Takes `Session.CreateInput`. |
-| POST | `/thread/:threadID/fork` | Fork from an optional `messageID`. |
-| POST | `/thread/:threadID/setName` | Rename. Takes `{ title }`. |
-| POST | `/thread/:threadID/autobest/setActive` | Toggle session autobest enabled flag. |
-| POST | `/thread/:threadID/autobest/extract` | Apply a candidate batch and return the decision. |
-| GET | `/thread/:threadID/request_permissions` | Pending permission prompts scoped to this thread. |
-| GET | `/thread/:threadID/request_user_input` | Pending question prompts scoped to this thread. |
-| POST | `/thread/:threadID/request_user_input/:requestID/reply` | Answer a pending question. |
+| Method | Path                                                    | Behaviour                                                                                     |
+| ------ | ------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| GET    | `/thread`                                               | List sessions (mirrors `/session`). Accepts `directory`, `roots`, `start`, `search`, `limit`. |
+| GET    | `/thread/:threadID`                                     | Fetch a single session.                                                                       |
+| POST   | `/thread/start`                                         | Create a session. Takes `Session.CreateInput`.                                                |
+| POST   | `/thread/:threadID/fork`                                | Fork from an optional `messageID`.                                                            |
+| POST   | `/thread/:threadID/setName`                             | Rename. Takes `{ title }`.                                                                    |
+| POST   | `/thread/:threadID/autobest/setActive`                  | Toggle session autobest enabled flag.                                                         |
+| POST   | `/thread/:threadID/autobest/extract`                    | Apply a candidate batch and return the decision.                                              |
+| GET    | `/thread/:threadID/request_permissions`                 | Pending permission prompts scoped to this thread.                                             |
+| GET    | `/thread/:threadID/request_user_input`                  | Pending question prompts scoped to this thread.                                               |
+| POST   | `/thread/:threadID/request_user_input/:requestID/reply` | Answer a pending question.                                                                    |
 
 Notably absent vs. the issue description: `archive`/`unarchive`. Archival is still
 done via `PATCH /session/:id` with `{ time: { archived } }` (see `session.ts:693`).
 
 ### Turn routes
 
-| Method | Path | Behaviour |
-| --- | --- | --- |
-| POST | `/turn/start` | `SessionPrompt.prompt(input)` — start a new turn. |
-| POST | `/turn/interrupt` | `SessionPrompt.cancel(sessionID)` — cancel the in-flight turn. |
-| POST | `/turn/steer` | `SessionPrompt.prompt(input)` — add steering input to the current turn (same signature as start). |
+| Method | Path              | Behaviour                                                                                         |
+| ------ | ----------------- | ------------------------------------------------------------------------------------------------- |
+| POST   | `/turn/start`     | `SessionPrompt.prompt(input)` — start a new turn.                                                 |
+| POST   | `/turn/interrupt` | `SessionPrompt.cancel(sessionID)` — cancel the in-flight turn.                                    |
+| POST   | `/turn/steer`     | `SessionPrompt.prompt(input)` — add steering input to the current turn (same signature as start). |
 
 Covered by `packages/opencode/test/server/thread-turn-compat.test.ts` and
 `packages/opencode/test/server/thread-request-compat.test.ts`.
@@ -570,11 +573,11 @@ Covered by `packages/opencode/test/server/thread-turn-compat.test.ts` and
 ### Relationship to legacy `/session`
 
 Thread/turn routes do not replace `/session` — both are mounted on `InstanceRoutes`
-simultaneously. Consumers can migrate by operation without a big-bang cutover. The
-autobest endpoints under `/session/:sessionID/autobest*` currently return
-`501 { skipped: true, reason: "pending autobest port integration" }` (see *Known
-technical debt*); the `/thread/:threadID/autobest/*` variants are wired through the
-full `Session.applyAutobest` path instead.
+simultaneously. Consumers can migrate by operation without a big-bang cutover. Both
+the `/session/:sessionID/autobest*` and `/thread/:threadID/autobest/*` endpoints are
+now wired through the full `Session.applyAutobest` / `setAutobestEnabled` path
+(closed by commit `d37c7ea64`); the earlier `501 { skipped: true }` stubs have been
+removed.
 
 ---
 
@@ -608,10 +611,10 @@ Session.ts grew by ~400 lines with the following new routes (operation IDs in it
 - *session.timer.pause* — `POST /:sessionID/timer/:id/pause`.
 - *session.timer.resume* — `POST /:sessionID/timer/:id/resume`.
 - *session.timer.delete* — `DELETE /:sessionID/timer/:id`.
-- *session.autobest.get* — `GET /:sessionID/autobest` (returns 501 pending port).
-- *session.autobest.apply* — `POST /:sessionID/autobest` (returns 501 pending port).
-- `POST /:sessionID/autobest/enabled` (returns 501 pending port).
-- `POST /:sessionID/autobest/extract` (returns 501 pending port).
+- *session.autobest.get* — `GET /:sessionID/autobest`. Returns `{ state, log, result }` from the history-backed autobest record.
+- *session.autobest.apply* — `POST /:sessionID/autobest`. Accepts a candidate batch or manual pick and persists via `Session.applyAutobest`.
+- `POST /:sessionID/autobest/enabled` — toggles the per-session autobest enabled flag.
+- `POST /:sessionID/autobest/extract` — runs extraction on the last assistant message and applies the top pick.
 
 ### `server/instance/tui.ts` additions
 
@@ -684,40 +687,39 @@ const tui: TuiPlugin = async (api) => {
 
 ## Providers CLI changes
 
-`packages/opencode/src/cli/cmd/providers.ts` is partially aligned with the unified
-architecture but intentionally does not yet expose the full fork feature set. The
-current state:
+`packages/opencode/src/cli/cmd/providers.ts` now carries the full fork surface —
+the initial alignment with nested Copilot modules (`48f288bf9`, `c31ad4ca3`) was
+completed by `f408471a9`, which restored the extended commands and helpers from
+`port/copilot-plan`:
 
 - `ProvidersListCommand` — unchanged in shape from upstream.
-- `ProvidersLoginCommand` — unchanged flow, but now uses the nested
-  `CopilotAuthPlugin` via the plugin loader.
+- `ProvidersLoginCommand` — unchanged flow, uses the nested `CopilotAuthPlugin`.
 - `ProvidersLogoutCommand` — unchanged.
-- `ProvidersQuotaCommand` — wired to the **nested** copilot quota module
-  (`plugin/github-copilot/quota`), prints a `formatQuotaBar` for each configured
-  Copilot account with plan, login, optional enterprise host.
+- `ProvidersQuotaCommand` — wired to the nested Copilot quota module
+  (`plugin/github-copilot/quota`), prints a `formatQuotaBar` per configured account.
+- `ProvidersAccountsCommand` — lists per-account status with plan, quota, proxy, and
+  migration state (JSON output available).
+- `ProvidersRouteDebugCommand` — emits `routeDebug()` output for a given model id,
+  surfacing lane, discovery rank, penalty, and selected/rejected reasons.
+- `applyProxy(state, key, { proxyUrl, proxyToken })` — updates per-account proxy in
+  the connections store.
+- `copilotAliasLabel` / `copilotAliasName` — label helpers for
+  `github-copilot#<lane>` aliases.
+- `accountStatus` / `renderAccountStatus` / `jsonStatus` / `jsonMigration` — shared
+  status projection used by both interactive and JSON outputs
+  (`ACCOUNT_STATUS_SCHEMA_VERSION` is pinned).
 
-> Commits `48f288bf9` and `c31ad4ca3` re-point `providers.ts` at the nested Copilot
-> modules and align with the current `Auth`/`Config`/`Process` APIs.
-
-The broader `port/copilot-plan` providers surface (`accountStatus`,
-`ProvidersAccountsCommand`, `ProvidersRouteDebugCommand`, `copilotAlias*`, `applyProxy`,
-`jsonMigration`) is not yet exposed — tests for it are skipped. See
-`test/cli/cmd/providers-quota.test.ts:2`:
-
-```ts
-// SKIPPED: depends on port/copilot-plan providers.ts exports not yet ported.
-// Revisit after unify branch aligns providers CLI (accountStatus, jsonMigration,
-// ProvidersAccountsCommand, ProvidersRouteDebugCommand, copilotAlias*, proxy*, etc.).
-```
+The corresponding test `test/cli/cmd/providers-quota.test.ts` was un-skipped in
+`9021ae3fc` and realigned with the current implementation in `f8ae678f0`.
 
 ---
 
 ## Configuration and environment variables
 
-| Name | Source | Default | Effect |
-| --- | --- | --- | --- |
-| `OPENCODE_COPILOT_RUNTIME_LIMIT` | `process.env`, overridden by `config.provider.github-copilot.options.runtimeLimit` | `1` | Per-account concurrent-request cap used as `Runtime.limit` at plugin boot. |
-| `OPENCODE_COPILOT_RUNTIME_MIN_INTERVAL_MS` | `process.env`, overridden by `config.provider.github-copilot.options.runtimeMinIntervalMs` | `0` | Minimum interval between successive requests to the same account. Used by `cooldown(state, key)`. |
+| Name                                       | Source                                                                                     | Default | Effect                                                                                            |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------- |
+| `OPENCODE_COPILOT_RUNTIME_LIMIT`           | `process.env`, overridden by `config.provider.github-copilot.options.runtimeLimit`         | `1`     | Per-account concurrent-request cap used as `Runtime.limit` at plugin boot.                        |
+| `OPENCODE_COPILOT_RUNTIME_MIN_INTERVAL_MS` | `process.env`, overridden by `config.provider.github-copilot.options.runtimeMinIntervalMs` | `0`     | Minimum interval between successive requests to the same account. Used by `cooldown(state, key)`. |
 
 Resolution logic lives in `copilotRuntimeConfig()`:
 
@@ -746,91 +748,147 @@ New tests added by the fork, grouped by target area:
 
 ### Copilot plugin
 
-| File | Coverage |
-| --- | --- |
-| `test/plugin/github-copilot-auth.test.ts` | 1406 lines. Legacy migration from `~/.copilot/auth/credential.json`, plan-suffix key derivation (`#edu`, `#enterprise`, `#free`), idempotent migration marker, `list()` sort order. |
-| `test/plugin/github-copilot-connections.test.ts` | State upsert, `rotate`/`routed`/`mark`/`clear`, `discover`/`staleDiscovery`/`hasModel`, `proxy`. |
-| `test/plugin/github-copilot-models.test.ts` | 766 lines. Model schema parsing + discovery endpoint. |
-| `test/plugin/github-copilot-quota.test.ts` | `parse`/`premium`/`classifyPlan`/`formatQuotaBar`. |
-| `test/plugin/github-copilot-runtime.test.ts` | `acquire`/`release`/`available`/`eligible`/`reserve`/`reserveBatch`/`touch`/`cooldown`/`usage`. |
+| File                                             | Coverage                                                                                                                                                                            |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test/plugin/github-copilot-auth.test.ts`        | 1406 lines. Legacy migration from `~/.copilot/auth/credential.json`, plan-suffix key derivation (`#edu`, `#enterprise`, `#free`), idempotent migration marker, `list()` sort order. |
+| `test/plugin/github-copilot-connections.test.ts` | State upsert, `rotate`/`routed`/`mark`/`clear`, `discover`/`staleDiscovery`/`hasModel`, `proxy`.                                                                                    |
+| `test/plugin/github-copilot-models.test.ts`      | 766 lines. Model schema parsing + discovery endpoint.                                                                                                                               |
+| `test/plugin/github-copilot-quota.test.ts`       | `parse`/`premium`/`classifyPlan`/`formatQuotaBar`.                                                                                                                                  |
+| `test/plugin/github-copilot-runtime.test.ts`     | `acquire`/`release`/`available`/`eligible`/`reserve`/`reserveBatch`/`touch`/`cooldown`/`usage`.                                                                                     |
 
 ### Autobest
 
-| File | Coverage |
-| --- | --- |
-| `test/autobest/autobest.test.ts` | `decide`/`apply`/`extract` behaviour, `setActive`. |
-| `test/session/autobest-history.test.ts` | History event bridge, `fromEvent` shape parity. |
+| File                                    | Coverage                                           |
+| --------------------------------------- | -------------------------------------------------- |
+| `test/autobest/autobest.test.ts`        | `decide`/`apply`/`extract` behaviour, `setActive`. |
+| `test/session/autobest-history.test.ts` | History event bridge, `fromEvent` shape parity.    |
 
 ### History
 
-| File | Coverage |
-| --- | --- |
-| `test/history/history.test.ts` | 331 lines. File IO, append/read, `readByType`, `last`. |
-| `test/history/timeline.test.ts` | Kind classification, title derivation, `changes()` deltas. |
-| `test/session/history.test.ts` | **Skipped** (`describe.skip`) pending `Session.Interface` autobest port. |
+| File                            | Coverage                                                                 |
+| ------------------------------- | ------------------------------------------------------------------------ |
+| `test/history/history.test.ts`  | 331 lines. File IO, append/read, `readByType`, `last`.                   |
+| `test/history/timeline.test.ts` | Kind classification, title derivation, `changes()` deltas.               |
+| `test/session/history.test.ts`  | Covers the session history observer end-to-end; un-skipped in `9021ae3fc` after `Session.Interface` regained autobest methods. |
 
 ### Timer
 
-| File | Coverage |
-| --- | --- |
-| `test/timer/timer.test.ts` | Core clock-driven lifecycle (arm/disarm, repeat, drain, clear). |
-| `test/timer/service.test.ts` | Effect service semantics, per-directory sharing. |
-| `test/timer/tool.test.ts` | Tool action verbs. |
-| `test/server/session-timer.test.ts` | REST lifecycle via `Server.Default()`. |
-| `test/server/tui-timer-fired.test.ts` | `/tui/timer-fired` publish path. |
-| `test/server/tui-timer-fired-runtime.test.ts` | End-to-end timer→TUI bus integration. |
+| File                                          | Coverage                                                        |
+| --------------------------------------------- | --------------------------------------------------------------- |
+| `test/timer/timer.test.ts`                    | Core clock-driven lifecycle (arm/disarm, repeat, drain, clear). |
+| `test/timer/service.test.ts`                  | Effect service semantics, per-directory sharing.                |
+| `test/timer/tool.test.ts`                     | Tool action verbs.                                              |
+| `test/server/session-timer.test.ts`           | REST lifecycle via `Server.Default()`.                          |
+| `test/server/tui-timer-fired.test.ts`         | `/tui/timer-fired` publish path.                                |
+| `test/server/tui-timer-fired-runtime.test.ts` | End-to-end timer→TUI bus integration.                           |
 
 ### Thread/Turn
 
-| File | Coverage |
-| --- | --- |
-| `test/server/thread-turn-compat.test.ts` | list/get/setName/fork/autobest toggle+extract, `/turn/start`+`/turn/interrupt`. |
-| `test/server/thread-request-compat.test.ts` | request_permissions and request_user_input scoping. |
-| `test/server/session-actions.test.ts` | 208 lines. Regression coverage for session mutation endpoints. |
+| File                                        | Coverage                                                                        |
+| ------------------------------------------- | ------------------------------------------------------------------------------- |
+| `test/server/thread-turn-compat.test.ts`    | list/get/setName/fork/autobest toggle+extract, `/turn/start`+`/turn/interrupt`. |
+| `test/server/thread-request-compat.test.ts` | request_permissions and request_user_input scoping.                             |
+| `test/server/session-actions.test.ts`       | 208 lines. Regression coverage for session mutation endpoints.                  |
 
 ### Other session tests
 
-| File | Coverage |
-| --- | --- |
-| `test/session/llm.test.ts` | LLM-level behaviour with autobest/history wiring. |
-| `test/session/prompt-effect.test.ts` | Effect-layer prompt service sanity. |
-| `test/session/session-entry.test.ts` | v2 session entry serialisation. |
-| `test/session/system.test.ts` | Expanded to 216 lines — system prompt + skills. |
+| File                                 | Coverage                                          |
+| ------------------------------------ | ------------------------------------------------- |
+| `test/session/llm.test.ts`           | LLM-level behaviour with autobest/history wiring. |
+| `test/session/prompt-effect.test.ts` | Effect-layer prompt service sanity.               |
+| `test/session/session-entry.test.ts` | v2 session entry serialisation.                   |
+| `test/session/system.test.ts`        | Expanded to 216 lines — system prompt + skills.   |
 
 ### Skipped tests
 
-The following tests are explicitly skipped on this branch (they import APIs not yet
-re-surfaced after the nested-layout migration):
-
-- `test/session/history.test.ts` — waits on `Session.Interface` autobest methods.
-- `test/cli/cmd/providers-quota.test.ts` — waits on the extended providers CLI surface.
+See the skip audit table in [Known technical debt](#known-technical-debt) below for
+the current classification of every `.skip` site in `packages/opencode/test/`. The
+former blockers — `test/session/history.test.ts` and
+`test/cli/cmd/providers-quota.test.ts` — were un-skipped in commit `9021ae3fc`
+once `Session.Interface` and `providers.ts` regained the missing exports.
 
 ---
 
-## Known technical debt (`TODO(unify)`)
+## Known technical debt
 
-Seven `TODO(unify)` markers remain on this branch. All cluster around the same root
-cause: the `Session.Interface` has not yet been re-opened to expose the autobest
-methods the observers and routes expect.
+> Status as of the post-parity audit (April 2026). All original `TODO(unify)` markers
+> in `packages/opencode/src/**` have been closed by the autobest/providers restore
+> batch (`df811c5ec`, `a9dcda88e`, `d37c7ea64`, `f408471a9`, `9021ae3fc`). `rg
+> 'TODO\(unify\)' packages/opencode/src packages/opencode/test` now returns empty.
 
-| Location | Description |
-| --- | --- |
-| `packages/opencode/src/server/instance/session.ts:269` | `POST /session/:sessionID/timer/drain?inject=true` should re-inject fired timers into autobest, but the hook is stubbed with `void param; void items;`. |
-| `packages/opencode/src/server/instance/session.ts:420` | `GET /session/:sessionID/autobest` returns `501 { skipped: true, reason: "pending autobest port integration" }`. |
-| `packages/opencode/src/server/instance/session.ts:498` | `POST /session/:sessionID/autobest` — same stub. |
-| `packages/opencode/src/server/instance/session.ts:520` | `POST /session/:sessionID/autobest/enabled` — same stub. |
-| `packages/opencode/src/server/instance/session.ts:548` | `POST /session/:sessionID/autobest/extract` — same stub. |
-| `packages/opencode/src/session/autobest-observer.ts:32,35,48` | Session service cast to `any` and `@ts-expect-error` on the Effect generator — expected methods are `getAutobestEnabled`, `applyAutobest`. |
-| `packages/opencode/test/session/history.test.ts:3` | Whole file is skipped pending `setAutobest`, `getAutobest`, `setAutobestEnabled`, `getAutobestEnabled`, `applyAutobest`. |
+### Closed items (for historical reference)
 
-An additional note in `packages/opencode/src/effect/app-runtime.ts:101` flags an
-unrelated Effect R-channel drift (one default layer surfaces `any` — this is a known
-typecheck accommodation, not a runtime issue).
+| Item                                                                                     | Closed by     |
+| ---------------------------------------------------------------------------------------- | ------------- |
+| `Session.Interface` autobest methods (`setAutobest`, `getAutobestEnabled`, `applyAutobest`, `appendUserText`) | `df811c5ec`   |
+| `@ts-expect-error` / `as any` casts in `session/autobest-observer.ts`                    | `a9dcda88e`   |
+| `/session/:sessionID/autobest*` endpoints returning `501 { skipped: true }`              | `d37c7ea64`   |
+| `/session/:sessionID/timer/drain?inject=true` stubbed with `void param; void items;`     | `d37c7ea64` (now calls `Session.appendUserText`, see `server/instance/session.ts:268`) |
+| Restored `providers.ts` CLI surface (`accountStatus`, `ProvidersAccountsCommand`, `ProvidersRouteDebugCommand`, `copilotAlias*`, `applyProxy`, `jsonMigration`) | `f408471a9`   |
+| `test/session/history.test.ts` and `test/cli/cmd/providers-quota.test.ts` un-skipped     | `9021ae3fc`   |
+| Effect R-channel drift in `app-runtime.ts`                                               | `6c1dcb8a9`   |
+| History subsystem behavior alignment with tests                                          | `92e75a8ec`   |
+| `thread.ts` `/request_permissions` + `/request_user_input` alias wiring                  | `5e4e08857`   |
+| Providers-quota tests alignment                                                          | `f8ae678f0`   |
 
-The `/thread/:threadID/autobest/*` endpoints in `thread.ts` do **not** hit these
-stubs; they call `setAutobestEnabled` and `applyAutobest` directly on the Session
-service. Once the Session service is re-aligned, the `/session` endpoints can simply
-drop the `501` bodies.
+### Open items
+
+| Severity | Location                                                           | Description                                                                                                           |
+| -------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| low      | `packages/opencode/src/cli/cmd/tui/plugin/api.tsx:158-160`         | `state.session.autobest()` casts sync data via `as ReturnType<…>` — the sync-layer shape for `session_autobest` is typed loosely. Fine at runtime; tighten when the sync payload schema is formalised. |
+| low      | `packages/opencode/src/session/prompt.ts:1537-1554`                | Inline autobest extraction duplicates the observer logic; both paths run in parallel after an idle session, wasting a scan. Consolidate once the observer is proven redundant (or drop the inline path). |
+| low      | `packages/opencode/test/session/session.test.ts:52,83,140`         | `session.created` + step-finish token bus-event assertions fail intermittently — the observer additions may have altered emit ordering. Needs investigation, not a fork-specific regression per se. |
+| low      | `packages/opencode/test/session/prompt-effect.test.ts:1304-1421`   | Five shell/cancel/loop tests flake with `Exit.isSuccess === false`. Likely fallout from autobest inline extraction running after `lastAssistant`. Re-evaluate after prompt.ts consolidation above. |
+| env      | `packages/opencode/test/project/vcs.test.ts` (`BranchUpdated`)     | Native `@parcel/watcher` binding required; flakes under local bun runner with the current FS events layer. Gated by `FileWatcher.hasNativeBinding() && !process.env.CI`; occasional timeout when native watcher stalls on macOS. |
+
+### Test skip audit
+
+Every `.skip*` site in `packages/opencode/test/`, classified as either
+**environment-conditional** (will run on the right host) or **permanent tech debt**
+(not gated on environment, requires code action to re-enable).
+
+| File / line                                                                 | Kind         | Classification | Rationale |
+| --------------------------------------------------------------------------- | ------------ | -------------- | --------- |
+| `test/session/structured-output-integration.test.ts:31,85,154,196`          | `test.skipIf(!hasApiKey)` | env-conditional | Requires a real provider API key; runs when `ANTHROPIC_API_KEY`/equivalent is set. |
+| `test/session/llm.test.ts:1275` "github copilot alias provider ids resolve…" | `test.skip`  | **permanent tech debt** | Alias resolver isn't wired through `getModel()` for `github-copilot#edu`/`#enterprise`/`#personal`/`#free`; needs ProviderRegistry.alias work. |
+| `test/file/watcher.test.ts:14`                                              | `describe.skip` via `FileWatcher.hasNativeBinding() && !process.env.CI` | env-conditional | Native `@parcel/watcher` binding missing on Linux CI, flaky on Windows. Runs locally on macOS/Linux with binding. |
+| `test/project/vcs.test.ts:14`                                               | `describe.skip` via `FileWatcher.hasNativeBinding() && !process.env.CI` | env-conditional | Same native-binding gate as watcher.test. |
+| `test/project/worktree.test.ts:13`                                          | `it.live.skip` on `win32` | env-conditional | POSIX-only worktree test. |
+| `test/project/worktree-remove.test.ts:12`                                   | `it.live.skip` when **not** `win32` | env-conditional | Windows-only worktree-remove test. |
+| `test/file/fsmonitor.test.ts:15`                                            | `test.skip` when **not** `win32` | env-conditional | Windows-only fsmonitor code path. |
+| `test/config/tui.test.ts:15`                                                | `test.skip` when **not** `win32` | env-conditional | Windows-only TUI config invalidation path. |
+| `test/tool/bash.test.ts:1032` "captures stderr in output"                   | `test.skipIf(win32)` | env-conditional | Relies on POSIX shell semantics for stderr capture. |
+| `test/session/prompt-effect.test.ts:215`                                    | `it.live.skip` on `win32` | env-conditional | Local `unix`-only alias used in subsequent tests. |
+| `test/snapshot/snapshot.test.ts:374` "unicode filenames modification and restore" | `test.skip` | **permanent tech debt** | Never gated on env; flagged broken at authoring time. Unicode paths (CJK, Cyrillic) don't round-trip through the snapshot store; needs encoding fix in `Snapshot.track()`. |
+| `test/lib/effect.ts:29,38`                                                  | library helper | n/a | Re-exports `test.skip` as `effect.skip`/`live.skip` for use by other tests. Not a skip itself. |
+
+### Current test suite state (post-batch)
+
+Full `bun test` on `unify/copilot-plan` HEAD:
+
+```
+2137 pass
+  12 skip
+   1 todo
+  16 fail
+   1 error  (BranchUpdated watcher timeout — same root cause as the vcs failures)
+9685 expect() calls
+Ran 2166 tests across 177 files
+```
+
+All 16 remaining failures fall in one of three buckets:
+
+1. **Watcher / native-binding timeouts** — `vcs.test.ts` (2), `tool/registry.test.ts`
+   (2), `sync/index.test.ts` (1), `server/session-messages.test.ts` (1),
+   `provider/provider.test.ts` (2). All hit exact 5000 ms test-timeout ceilings and
+   cluster around `@parcel/watcher` or bus-event wait loops. Not a fork-specific
+   regression; reproducible on `dev` under the same conditions.
+2. **Session `prompt-effect.test.ts` shell/cancel flakes** (5 tests) — likely fallout
+   from the inline autobest extraction added in `prompt.ts` (see open-items table).
+3. **`session.test.ts` bus-event ordering** (3 tests: `session.created`,
+   `session.created → updated`, `step-finish token propagate`). Observer wiring may
+   have shifted emit order; warrants a targeted look at `SessionHistoryObserver`
+   and `SessionAutobestObserver` registration timing against `Session.create`.
 
 ---
 
@@ -843,14 +901,14 @@ Before this branch, Copilot code lived at `packages/opencode/src/plugin/copilot-
 nested `packages/opencode/src/plugin/github-copilot/` package. Consumers who imported
 from the old flat paths must update to the new nested module:
 
-| Old import | New import |
-| --- | --- |
-| `@/plugin/copilot-auth` | `@/plugin/github-copilot/auth` |
-| `@/plugin/copilot-quota` | `@/plugin/github-copilot/quota` |
-| `@/plugin/copilot-models` | `@/plugin/github-copilot/models` |
-| `@/plugin/copilot-runtime` | `@/plugin/github-copilot/runtime` |
-| `@/plugin/copilot-connections` | `@/plugin/github-copilot/connections` |
-| `@/plugin/copilot` | `@/plugin/github-copilot/copilot` (`CopilotAuthPlugin`, `CopilotRuntimeState`) |
+| Old import                     | New import                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------ |
+| `@/plugin/copilot-auth`        | `@/plugin/github-copilot/auth`                                                 |
+| `@/plugin/copilot-quota`       | `@/plugin/github-copilot/quota`                                                |
+| `@/plugin/copilot-models`      | `@/plugin/github-copilot/models`                                               |
+| `@/plugin/copilot-runtime`     | `@/plugin/github-copilot/runtime`                                              |
+| `@/plugin/copilot-connections` | `@/plugin/github-copilot/connections`                                          |
+| `@/plugin/copilot`             | `@/plugin/github-copilot/copilot` (`CopilotAuthPlugin`, `CopilotRuntimeState`) |
 
 `src/cli/cmd/providers.ts` was updated to the new nested path in commit `c31ad4ca3`.
 
@@ -881,9 +939,9 @@ eagerly. This is a compatibility fix introduced while aligning the R-channel (co
 ### HTTP consumer guidance
 
 - Prefer `/thread/*` and `/turn/*` for new code — they carry session autobest support today.
-- `/session/:id/autobest*` returns `501` until the Session service port lands; do not rely on it.
+- `/session/:id/autobest*` is fully wired to `Session.applyAutobest` / `setAutobestEnabled` (since `d37c7ea64`); the prior `501 { skipped: true }` stubs are gone.
 - `GET /timer` returns an instance-wide list; `GET /session/:id/timer` returns the same because timers are scoped to the instance directory rather than the session. This is intentional and will stay that way until sessions grow their own timer scope.
-- `/session/:id/timer/drain?inject=true` is accepted but does not re-inject fired timers into autobest yet.
+- `/session/:id/timer/drain?inject=true` re-injects fired timers as synthesised user text via `Session.appendUserText`.
 
 ### Operational notes for Copilot
 
