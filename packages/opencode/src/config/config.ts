@@ -262,6 +262,22 @@ export const Info = z
           .describe("Token buffer for compaction. Leaves enough window to avoid overflow during compaction."),
       })
       .optional(),
+    autobest: z
+      .object({
+        enabled: z.boolean().optional().describe("Enable post-turn autobest continuation pipeline"),
+        model: z
+          .string()
+          .optional()
+          .describe("Model id (provider/model form) used for Step A LLM extraction. Default: gpt-4.1"),
+        maxIterations: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe("Maximum auto-continue iterations before the cycle terminates. Default 3."),
+      })
+      .optional()
+      .describe("Autobest feedback-loop tuning (ports `codex-rs` autobest_* config knobs)"),
     experimental: z
       .object({
         disable_paste_summary: z.boolean().optional(),

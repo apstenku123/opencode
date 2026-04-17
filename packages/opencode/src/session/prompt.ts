@@ -49,7 +49,7 @@ import { EffectLogger } from "@/effect"
 import { InstanceState } from "@/effect"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
-import { SessionAutobestObserver } from "./autobest-observer"
+import { SessionAutobestObserver, shouldContinue as autobestShouldContinue } from "./autobest-observer"
 import { EffectBridge } from "@/effect"
 
 // @ts-ignore
@@ -68,6 +68,26 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
   const elog = EffectLogger.create({ service: "session.prompt" })
+
+  /**
+   * Module-level per-session autobest cycle state.
+   * Tracks iteration count and last stepKind to gate the auto-continue loop.
+   * Reset on explicit user prompt via `prompt()` so each user-initiated turn
+   * starts a fresh cycle.
+   *
+   * NB: round-1 uses a Map for simplicity. Round-2 should migrate this into
+   * durable history events (cf. `docs/codex-rs-migration-plan.md` §3.2).
+   */
+  export const autobestCycleState = new Map<string, { iteration: number; stepKind: "a" | "b" | "c" | "d" }>()
+  export const DEFAULT_AUTOBEST_MAX_ITERATIONS = 3
+  /**
+   * Session ids with an in-flight autobest continuation.
+   * When `prompt()` sees the sessionID is NOT in this set, the incoming prompt
+   * is treated as user-initiated and resets the cycle counter. When it IS in
+   * the set, we leave the cycle counter alone and remove the entry so the next
+   * `prompt()` call resets again.
+   */
+  export const autobestPendingContinuations = new Set<string>()
 
   export interface Interface {
     readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
@@ -1306,6 +1326,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
         function* (input: PromptInput) {
+          // Reset autobest cycle on user-initiated prompts (not autobest continuations).
+          if (autobestPendingContinuations.has(input.sessionID)) {
+            autobestPendingContinuations.delete(input.sessionID)
+          } else {
+            autobestCycleState.delete(input.sessionID)
+          }
+
           const session = yield* sessions.get(input.sessionID)
           yield* revert.cleanup(session)
           const message = yield* createUserMessage(input)
@@ -1571,14 +1598,56 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               .join("\n")
             const picks = SessionAutobestObserver.extract(text)
             if (picks.length) {
-              yield* sessions
+              const applied = yield* sessions
                 .applyAutobest({ sessionID, candidates: picks, ts: Date.now() })
-                .pipe(Effect.ignore)
+                .pipe(Effect.match({ onFailure: () => null, onSuccess: (v) => v }))
+
+              if (applied && applied.decision.changed && applied.decision.active) {
+                // Auto-continue feedback loop — port of
+                // `chatwidget.rs::on_autobest_result::submit_user_message`.
+                // Per-session iteration is tracked in-memory and gated by shouldContinue.
+                const prev = autobestCycleState.get(sessionID) ?? { iteration: 0, stepKind: "a" as const }
+                const decision = autobestShouldContinue({
+                  enabled: autobestEnabled,
+                  changed: true,
+                  activeKey: applied.decision.active.key,
+                  cycle: prev,
+                  maxIterations: DEFAULT_AUTOBEST_MAX_ITERATIONS,
+                })
+                if (decision.shouldContinue) {
+                  autobestCycleState.set(sessionID, {
+                    iteration: prev.iteration + 1,
+                    stepKind: "a",
+                  })
+                  yield* continuePrompt(sessionID, applied.decision.active.key).pipe(
+                    Effect.ignore,
+                    Effect.forkIn(scope),
+                  )
+                } else if (decision.reason === "max-iterations-reached") {
+                  // Reset so the next user-initiated turn starts a fresh cycle.
+                  autobestCycleState.delete(sessionID)
+                }
+              }
             }
           }
           return out
         },
       )
+
+      // Continuation submitter — schedules a synthetic user prompt carrying
+      // the autobest top candidate. Delegates to the public `prompt()` helper
+      // so the full run-loop pipeline (including compaction / autobest) re-runs.
+      const continuePrompt = Effect.fn("SessionPrompt.autobestContinue")(function* (
+        sessionID: SessionID,
+        text: string,
+      ) {
+        yield* elog.info("autobest.continue", { sessionID, text })
+        autobestPendingContinuations.add(sessionID)
+        yield* prompt({
+          sessionID,
+          parts: [{ type: "text" as const, text }],
+        } as PromptInput).pipe(Effect.ignore)
+      })
 
       const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
         "SessionPrompt.loop",
