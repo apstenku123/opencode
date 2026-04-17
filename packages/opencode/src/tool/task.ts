@@ -7,7 +7,8 @@ import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "../config"
-import { Effect } from "effect"
+import { SubagentRegistry } from "../subagent/registry"
+import { Cause, Effect, Fiber } from "effect"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): void
@@ -28,6 +29,12 @@ const parameters = z.object({
     )
     .optional(),
   command: z.string().describe("The command that triggered this task").optional(),
+  async: z
+    .boolean()
+    .describe(
+      "When true, spawn the sub-agent asynchronously and return immediately with its session id. The parent loop's pre-break hook may choose to wait for active children before exiting (round 2).",
+    )
+    .optional(),
 })
 
 export const TaskTool = Tool.define(
@@ -36,6 +43,7 @@ export const TaskTool = Tool.define(
     const agent = yield* Agent.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
+    const subagents = yield* SubagentRegistry.Service
 
     const run = Effect.fn("TaskTool.execute")(function* (params: z.infer<typeof parameters>, ctx: Tool.Context) {
       const cfg = yield* config.get()
@@ -143,6 +151,68 @@ export const TaskTool = Tool.define(
         ops.cancel(nextSession.id)
       }
 
+      const childTools = {
+        ...(canTodo ? {} : { todowrite: false }),
+        ...(canTask ? {} : { task: false }),
+        ...Object.fromEntries((cfg.experimental?.primary_tools ?? []).map((item) => [item, false])),
+      }
+
+      // Async variant (round 1 scaffold):
+      // Register the child with SubagentRegistry, fork the child prompt under
+      // the ambient scope, and return immediately with the child session id.
+      // The parent loop's preBreak hook (round 2) will call
+      // `subagents.waitForAll(parent)` before exiting if any children are
+      // still active. Cancel propagation still flows via `ops.cancel`.
+      if (params.async === true) {
+        yield* subagents.spawn(SessionID.make(ctx.sessionID), nextSession.id)
+        const runChild = Effect.gen(function* () {
+          const parts = yield* ops.resolvePromptParts(params.prompt)
+          return yield* ops.prompt({
+            messageID,
+            sessionID: nextSession.id,
+            model: {
+              modelID: model.modelID,
+              providerID: model.providerID,
+            },
+            agent: next.name,
+            tools: childTools,
+            parts,
+          })
+        })
+        const fiber = yield* Effect.forkChild(
+          runChild.pipe(
+            Effect.matchCauseEffect({
+              onSuccess: (result) =>
+                subagents.close(nextSession.id, {
+                  status: "completed",
+                  result: result.parts.findLast((item) => item.type === "text")?.text ?? "",
+                }),
+              onFailure: (cause) =>
+                subagents.close(nextSession.id, {
+                  status: Cause.hasInterruptsOnly(cause) ? "cancelled" : "error",
+                  error: Cause.pretty(cause),
+                }),
+            }),
+          ),
+        )
+        ctx.abort.addEventListener("abort", () => {
+          void Effect.runPromise(Fiber.interrupt(fiber))
+        })
+        return {
+          title: params.description,
+          metadata: {
+            sessionId: nextSession.id,
+            model,
+            async: true,
+          },
+          output: [
+            `task_id: ${nextSession.id} (async; use task_id to resume or poll)`,
+            "",
+            "<task_async>Child spawned; parent loop will rendezvous at pre-break.</task_async>",
+          ].join("\n"),
+        }
+      }
+
       return yield* Effect.acquireUseRelease(
         Effect.sync(() => {
           ctx.abort.addEventListener("abort", cancel)
@@ -158,11 +228,7 @@ export const TaskTool = Tool.define(
                 providerID: model.providerID,
               },
               agent: next.name,
-              tools: {
-                ...(canTodo ? {} : { todowrite: false }),
-                ...(canTask ? {} : { task: false }),
-                ...Object.fromEntries((cfg.experimental?.primary_tools ?? []).map((item) => [item, false])),
-              },
+              tools: childTools,
               parts,
             })
 

@@ -46,6 +46,7 @@ import { Bus } from "../bus"
 import { Agent } from "../agent/agent"
 import { Skill } from "../skill"
 import { Permission } from "@/permission"
+import { SubagentRegistry } from "@/subagent/registry"
 
 const log = Log.create({ service: "tool.registry" })
 
@@ -89,6 +90,7 @@ export const layer: Layer.Layer<
   | Ripgrep.Service
   | Format.Service
   | Truncate.Service
+  | SubagentRegistry.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -335,5 +337,6 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(CrossSpawnSpawner.defaultLayer),
     Layer.provide(Ripgrep.defaultLayer),
     Layer.provide(Truncate.defaultLayer),
+    Layer.provide(SubagentRegistry.defaultLayer),
   ),
 )
