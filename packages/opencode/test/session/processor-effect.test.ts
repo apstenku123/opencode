@@ -292,14 +292,19 @@ it.live("session.processor effect tests preserve text start time", () =>
           })
           .pipe(Effect.forkChild)
 
-        yield* Effect.promise(async () => {
-          const stop = Date.now() + 500
-          while (Date.now() < stop) {
-            const text = MessageV2.parts(msg.id).find((part): part is MessageV2.TextPart => part.type === "text")
+        // Poll on the DB-backed parts list via Effect's scheduler. Unlike the
+        // original wall-clock deadline, this loop only exits when the text
+        // part with a start time is actually observed, so CPU contention
+        // cannot race us out. The outer testEffect timeout is the only hard
+        // bound.
+        yield* Effect.gen(function* () {
+          while (true) {
+            const text = MessageV2.parts(msg.id).find(
+              (part): part is MessageV2.TextPart => part.type === "text",
+            )
             if (text?.time?.start) return
-            await Bun.sleep(10)
+            yield* Effect.sleep("10 millis")
           }
-          throw new Error("timed out waiting for text part")
         })
         yield* Effect.sleep("20 millis")
         gate.resolve()
@@ -682,14 +687,23 @@ it.live("session.processor effect tests mark pending tools as aborted on cleanup
           .pipe(Effect.forkChild)
 
         yield* llm.wait(1)
-        yield* Effect.promise(async () => {
-          const end = Date.now() + 500
-          while (Date.now() < end) {
-            const parts = await MessageV2.parts(msg.id)
+        // Poll on the DB-backed parts list via Effect's scheduler. Unlike the
+        // original wall-clock deadline, this loop only exits when the tool
+        // part is actually observed, so CPU contention cannot race us out.
+        // The outer testEffect timeout remains the only hard bound. The 10ms
+        // Effect.sleep between iterations also drains History.append so the
+        // processor's ctx.toolcalls entry is populated before interrupt.
+        yield* Effect.gen(function* () {
+          while (true) {
+            const parts = MessageV2.parts(msg.id)
             if (parts.some((part) => part.type === "tool")) return
-            await Bun.sleep(10)
+            yield* Effect.sleep("10 millis")
           }
         })
+        // One more scheduler yield so the processor fiber finishes
+        // updatePart() (History.append flush + ctx.toolcalls assignment)
+        // before we interrupt it.
+        yield* Effect.sleep("10 millis")
         yield* Fiber.interrupt(run)
 
         const exit = yield* Fiber.await(run)
@@ -790,6 +804,8 @@ it.live("session.processor effect tests mark interruptions aborted without manua
       Effect.gen(function* () {
         const { processors, session, provider } = yield* boot()
         const sts = yield* SessionStatus.Service
+        const bus = yield* Bus.Service
+        const busy = defer<void>()
 
         yield* llm.hang
 
@@ -797,6 +813,11 @@ it.live("session.processor effect tests mark interruptions aborted without manua
         const parent = yield* user(chat.id, "interrupt")
         const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
         const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const offBusy = yield* bus.subscribeCallback(SessionStatus.Event.Status, (evt) => {
+          if (evt.properties.sessionID !== chat.id) return
+          if (evt.properties.status.type !== "busy") return
+          busy.resolve()
+        })
         const handle = yield* processors.create({
           assistantMessage: msg,
           sessionID: chat.id,
@@ -823,6 +844,8 @@ it.live("session.processor effect tests mark interruptions aborted without manua
           .pipe(Effect.forkChild)
 
         yield* llm.wait(1)
+        yield* Effect.promise(() => busy.promise)
+        offBusy()
         yield* Fiber.interrupt(run)
 
         const exit = yield* Fiber.await(run)
