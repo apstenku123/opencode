@@ -15,7 +15,7 @@
  *   - `Stop` (existing opencode behaviour — `stopHooks`)
  *   - `SubagentStart` / `SubagentStop`
  *   - `PermissionRequest`
- *   - `PreCompact`
+ *   - `PreCompact` / `PostCompact`
  *   - `Notification` / `ConfigChange` / `InstructionsLoaded`
  *   - `TeammateIdle` / `TaskCompleted`
  *   - `WorktreeCreate` / `WorktreeRemove`
@@ -39,6 +39,7 @@ export const HookEventName = z.enum([
   "SubagentStop",
   "PermissionRequest",
   "PreCompact",
+  "PostCompact",
   "Notification",
   "ConfigChange",
   "InstructionsLoaded",
@@ -189,6 +190,23 @@ const EventPreCompact = z.object({
   hook_event_name: z.literal("PreCompact"),
   trigger: z.string(),
   custom_instructions: z.string(),
+  /** Number of messages present in the session prior to compaction. */
+  message_count: z.number().int().nonnegative().optional(),
+  /** Estimated token count of the session before compaction runs. */
+  token_count_before: z.number().int().nonnegative().optional(),
+})
+
+const EventPostCompact = z.object({
+  hook_event_name: z.literal("PostCompact"),
+  trigger: z.string(),
+  /** Count of messages retained post-compaction (summary + replay + continue). */
+  kept_messages: z.number().int().nonnegative(),
+  /** Count of messages collapsed into the summary. */
+  dropped_messages: z.number().int().nonnegative(),
+  /** Estimated token count after compaction (summary + any retained turns). */
+  token_count_after: z.number().int().nonnegative(),
+  /** Text of the generated compaction summary. May be empty if none found. */
+  summary: z.string(),
 })
 
 const EventNotification = z.object({
@@ -253,6 +271,7 @@ export const HookEvent = z.discriminatedUnion("hook_event_name", [
   EventSubagentStop,
   EventPermissionRequest,
   EventPreCompact,
+  EventPostCompact,
   EventNotification,
   EventConfigChange,
   EventInstructionsLoaded,
@@ -287,6 +306,7 @@ export function matchTargetFor(event: HookEvent): string | undefined {
     case "SubagentStop":
       return event.agent_type
     case "PreCompact":
+    case "PostCompact":
       return event.trigger
     case "Stop":
       return event.last_assistant_message ?? undefined
