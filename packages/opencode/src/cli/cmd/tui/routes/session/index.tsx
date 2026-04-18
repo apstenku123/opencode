@@ -79,6 +79,8 @@ import { Filesystem } from "@/util"
 import { Global } from "@/global"
 import { PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
+import { QuestionForwardedPrompt } from "./question-forwarded"
+import { ForwardedQueue } from "./forwarded-queue"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
 import { formatTranscript } from "../../util/transcript"
@@ -141,8 +143,21 @@ export function Session() {
     if (session()?.parentID) return []
     return children().flatMap((x) => sync.data.question[x.id] ?? [])
   })
-  const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
-  const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
+  const forwardedQuestions = createMemo(() => {
+    // Only the top-level parent session renders forwarded prompts.
+    if (session()?.parentID) return []
+    return ForwardedQueue.list(sync.data.forwarded_question, route.sessionID)
+  })
+  const visible = createMemo(
+    () =>
+      !session()?.parentID &&
+      permissions().length === 0 &&
+      questions().length === 0 &&
+      forwardedQuestions().length === 0,
+  )
+  const disabled = createMemo(
+    () => permissions().length > 0 || questions().length > 0 || forwardedQuestions().length > 0,
+  )
 
   const pending = createMemo(() => {
     return messages().findLast((x) => x.role === "assistant" && !x.time.completed)?.id
@@ -1328,6 +1343,13 @@ export function Session() {
               </Show>
               <Show when={permissions().length === 0 && questions().length > 0}>
                 <QuestionPrompt request={questions()[0]} />
+              </Show>
+              <Show
+                when={
+                  permissions().length === 0 && questions().length === 0 && forwardedQuestions().length > 0
+                }
+              >
+                <QuestionForwardedPrompt entry={forwardedQuestions()[0]} />
               </Show>
               <Show when={session()?.parentID}>
                 <SubagentFooter />

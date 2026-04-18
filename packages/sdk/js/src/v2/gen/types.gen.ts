@@ -307,6 +307,18 @@ export type EventQuestionRejected = {
   properties: QuestionRejected
 }
 
+export type QuestionForwardedToParent = {
+  parentID: string
+  childID: string
+  requestID: string
+  request: QuestionRequest
+}
+
+export type EventQuestionForwardedToParent = {
+  type: "question.forwarded_to_parent"
+  properties: QuestionForwardedToParent
+}
+
 export type Todo = {
   /**
    * Brief description of the task
@@ -1127,6 +1139,7 @@ export type GlobalEvent = {
     | EventQuestionAsked
     | EventQuestionReplied
     | EventQuestionRejected
+    | EventQuestionForwardedToParent
     | EventTodoUpdated
     | EventSessionStatus
     | EventSessionIdle
@@ -2040,6 +2053,7 @@ export type Event =
   | EventQuestionAsked
   | EventQuestionReplied
   | EventQuestionRejected
+  | EventQuestionForwardedToParent
   | EventTodoUpdated
   | EventSessionStatus
   | EventSessionIdle
