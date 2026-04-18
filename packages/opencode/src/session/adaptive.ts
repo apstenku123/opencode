@@ -189,6 +189,18 @@ export namespace AdaptiveHooks {
     readonly stateFor: (sessionID: SessionID) => Effect.Effect<AdaptiveState.Value>
     /** Drop a session's state bag (call on session delete). */
     readonly clear: (sessionID: SessionID) => Effect.Effect<void>
+    /**
+     * Reset per-cycle counters on a fresh user-message boundary. Called by
+     * `SessionPrompt.prompt` when a new user-initiated turn begins (not on
+     * synthetic injections). Preserves cross-cycle scratch state.
+     */
+    readonly resetCycleFor: (sessionID: SessionID) => Effect.Effect<void>
+    /**
+     * Notify the runner that a synthetic user message was injected by a
+     * directive. Bumps the per-session inject counter; observers may read
+     * this from `state.scratch.injectCount` for diagnostics / loop guards.
+     */
+    readonly noteInject: (sessionID: SessionID, source: string) => Effect.Effect<void>
     /** Run all registered `preIteration` observers in registration order. */
     readonly runPreIteration: (args: PreIterationArgs) => Effect.Effect<void>
     /** Run all registered `postIteration` observers and merge directives. */
@@ -257,6 +269,20 @@ export namespace AdaptiveHooks {
           state.sessions.delete(sessionID)
         })
 
+      const resetCycleFor: Interface["resetCycleFor"] = (sessionID) =>
+        Effect.map(getState, (state) => {
+          const v = state.sessions.get(sessionID)
+          if (v) AdaptiveState.resetCycle(v)
+        })
+
+      const noteInject: Interface["noteInject"] = (sessionID, source) =>
+        Effect.gen(function* () {
+          const bag = yield* stateFor(sessionID)
+          const prior = (bag.scratch.injectCount as number | undefined) ?? 0
+          bag.scratch.injectCount = prior + 1
+          bag.scratch.lastInjectSource = source
+        })
+
       const runPreIteration: Interface["runPreIteration"] = (args) =>
         Effect.gen(function* () {
           const bag = yield* stateFor(args.sessionID)
@@ -295,6 +321,8 @@ export namespace AdaptiveHooks {
         registered,
         stateFor,
         clear,
+        resetCycleFor,
+        noteInject,
         runPreIteration,
         runPostIteration,
         runPreBreak,

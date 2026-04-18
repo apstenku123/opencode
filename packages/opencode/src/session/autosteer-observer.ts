@@ -6,41 +6,58 @@ import { Effect, Layer, Context } from "effect"
 import z from "zod"
 import { Session } from "./index"
 import type { SessionID } from "./schema"
-import { SessionStatus } from "./status"
 import { MessageV2 } from "./message-v2"
 import { SessionAutosteer } from "./autosteer"
+import { AdaptiveHooks } from "./adaptive"
 
 /**
- * Observer layer mirroring {@link SessionAutobestObserver}: subscribes to
- * `SessionStatus.Event.Idle`, inspects the last two assistant replies,
- * runs {@link SessionAutosteer.evaluate}, and when a nudge fires injects
- * a canned user-role message via `Session.Service.appendUserText`.
+ * Autosteer observer (round 3).
  *
- * Gated by `autosteering.enabled` in config (default: true).
- * Counter state is kept per-session in an in-memory Map.
+ * Ported to the {@link AdaptiveHooks} pipeline — round 1's
+ * `Bus.subscribeCallback(SessionStatus.Event.Idle)` has been removed.
+ * Stagnation detection now runs in a `postIteration` observer so the hook
+ * runner arbitrates directive precedence (`break` > `inject` > `continue`)
+ * between autosteer, autobest, and any other registered observers.
+ *
+ * The observer no longer calls `Session.Service.appendUserText` itself —
+ * that is now the runLoop's responsibility via the `Inject` directive
+ * plumbing in `prompt.ts`. This avoids racing a bus-thread `appendUserText`
+ * against the runLoop's next iteration.
+ *
+ * The Service interface is preserved for the TUI sidebar + server routes
+ * (autosteering toggle, cumulative nudge count). Tests call
+ * `evaluateSession` with `{inject: true}` to retain the round-2
+ * append-user-message side-effect; the hook pathway passes `{inject: false}`.
  */
 export namespace SessionAutosteerObserver {
   export interface Interface {
     /** Inspect current counter for a session. */
     readonly getCount: (sessionID: SessionID) => Effect.Effect<number>
     /**
-     * Evaluate now against the last two assistant messages and (if triggered)
-     * inject a nudge. Returns the evaluation outcome. Exposed for tests /
-     * manual triggering; the bus subscription also calls through here.
+     * Evaluate now against the last two assistant messages. Returns the
+     * evaluation outcome plus (optionally) the text the runner should
+     * inject as a synthetic user turn.
+     *
+     * @param opts.inject — when `true` (the default, for back-compat with
+     *   the round-2 test suite), performs the legacy side-effect of
+     *   appending a synthetic user message via `Session.Service.appendUserText`
+     *   when a nudge fires. The hook-driven path passes `false`.
      */
-    readonly evaluateSession: (sessionID: SessionID) => Effect.Effect<{
+    readonly evaluateSession: (
+      sessionID: SessionID,
+      opts?: { inject?: boolean },
+    ) => Effect.Effect<{
       stagnant: boolean
       nudge: boolean
       count: number
+      nudgeText?: string
     }>
     /**
-     * Runtime override for `autosteering.enabled`. When set, takes
-     * precedence over the value loaded from `opencode.json`. `undefined`
-     * clears the override and reverts to the config value.
+     * Runtime override for `autosteering.enabled`. Set → takes precedence
+     * over `opencode.json`. `undefined` clears the override.
      *
      * Powers the `/autosteering on|off` slash command and the
-     * `POST /config/autosteering` server route — both want a *runtime*
-     * toggle that does not require rewriting `opencode.json`.
+     * `POST /config/autosteering` server route.
      */
     readonly setEnabledOverride: (enabled: boolean | undefined) => Effect.Effect<void>
     /** Read the effective enabled value (override > config > default true). */
@@ -78,26 +95,20 @@ export namespace SessionAutosteerObserver {
       const bus = yield* Bus.Service
       const session = yield* Session.Service
       const config = yield* Config.Service
+      const adaptive = yield* AdaptiveHooks.Service
 
-      // Per-session counter map. previousResponse is derived from the
-      // second-most-recent assistant message on demand, so we only persist
-      // the stagnation count here.
+      // Per-session counter map.
       const states = yield* InstanceState.make(
         Effect.fn("SessionAutosteerObserver.states")(() => Effect.succeed(new Map<SessionID, SessionAutosteer.State>())),
       )
 
-      // Cumulative-nudge tracker. Mirrors the Rust right-panel
-      // `autosteering_count` per agent (right_panel.rs:194-195, 804-807).
-      // Reset of `state.stagnationCount` after a nudge fires is the
-      // detection counter — separate from this lifetime tally.
+      // Cumulative-nudge tracker (lifetime tally, separate from detection counter).
       const nudgeCounts = yield* InstanceState.make(
         Effect.fn("SessionAutosteerObserver.nudgeCounts")(() =>
           Effect.succeed(new Map<SessionID, number>()),
         ),
       )
 
-      // Runtime override. Plain ref-style cell — single fiber writes,
-      // many read; no need for an Effect-managed primitive.
       const overrideRef: { value: boolean | undefined } = { value: undefined }
 
       const getCount: Interface["getCount"] = (sessionID) =>
@@ -129,11 +140,10 @@ export namespace SessionAutosteerObserver {
       const perSessionNudgeCounts: Interface["perSessionNudgeCounts"] = () =>
         Effect.gen(function* () {
           const map = yield* InstanceState.get(nudgeCounts)
-          // Return a clone so callers can't mutate observer state.
           return new Map(map) as ReadonlyMap<SessionID, number>
         })
 
-      const evaluateSession: Interface["evaluateSession"] = (sessionID) =>
+      const evaluateSession: Interface["evaluateSession"] = (sessionID, opts) =>
         Effect.gen(function* () {
           const enabled = yield* isEnabled()
           if (!enabled) return { stagnant: false, nudge: false, count: 0 }
@@ -174,10 +184,16 @@ export namespace SessionAutosteerObserver {
           map.set(sessionID, out.nextState)
 
           if (out.nudge) {
-            yield* session.appendUserText({
-              sessionID,
-              text: SessionAutosteer.NUDGE_TEXT,
-            })
+            // Backwards-compatible side-effect path — when the caller opts
+            // into direct injection (default), persist the nudge as a
+            // synthetic user message exactly as round-2 did.
+            if (opts?.inject !== false) {
+              yield* session.appendUserText({
+                sessionID,
+                text: SessionAutosteer.NUDGE_TEXT,
+                synthetic: true,
+              })
+            }
             const counts = yield* InstanceState.get(nudgeCounts)
             const nextLifetime = (counts.get(sessionID) ?? 0) + 1
             counts.set(sessionID, nextLifetime)
@@ -190,19 +206,29 @@ export namespace SessionAutosteerObserver {
             stagnant: out.stagnant,
             nudge: out.nudge,
             count: out.nextState.stagnationCount,
+            nudgeText: out.nudge ? SessionAutosteer.NUDGE_TEXT : undefined,
           }
         })
 
-      const off = yield* bus.subscribeCallback(SessionStatus.Event.Idle, (evt) => {
-        void Effect.runPromise(
+      // Register postIteration observer — replaces the round-2
+      // Bus.subscribeCallback(SessionStatus.Event.Idle) path. The runLoop
+      // invokes `runPostIteration` at the end of each assistant step; we
+      // evaluate stagnation and surface `Inject` so the runner appends the
+      // synthetic user message and continues the loop. We pass
+      // `inject: false` to `evaluateSession` so the runner (not this
+      // observer) performs the append — prevents double-injection.
+      yield* adaptive.register({
+        name: "autosteer",
+        postIteration: (_state, args) =>
           Effect.gen(function* () {
-            yield* evaluateSession(evt.properties.sessionID as SessionID)
-          }).pipe(
-            Effect.catchCause(() => Effect.void),
-          ),
-        )
+            const out = yield* evaluateSession(args.sessionID, { inject: false })
+            if (!out.nudge || !out.nudgeText) return AdaptiveHooks.Continue
+            return AdaptiveHooks.Inject({
+              text: out.nudgeText,
+              source: "autosteer:nudge",
+            })
+          }),
       })
-      yield* Effect.addFinalizer(() => Effect.sync(off))
 
       return Service.of({
         getCount,
@@ -215,9 +241,18 @@ export namespace SessionAutosteerObserver {
     }),
   )
 
+  /**
+   * Default layer. Bundles `AdaptiveHooks.defaultLayer` via `Layer.provideMerge`
+   * so the Service is re-exported to consumers of this layer. Combined with
+   * the fact that `SessionPrompt.defaultLayer` also consumes this same
+   * `AdaptiveHooks.defaultLayer` identity (ManagedRuntime memoMap), the
+   * runLoop observer registration and the hook invocation pathway share a
+   * single in-process registry.
+   */
   export const defaultLayer = layer.pipe(
     Layer.provide(Bus.layer),
     Layer.provide(Session.defaultLayer),
     Layer.provide(Config.defaultLayer),
+    Layer.provideMerge(AdaptiveHooks.defaultLayer),
   )
 }

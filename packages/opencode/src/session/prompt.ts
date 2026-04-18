@@ -53,6 +53,8 @@ import { SessionAutobestObserver, shouldContinue as autobestShouldContinue } fro
 import { AdaptiveHooks } from "./adaptive"
 import { SessionMemoryObserver } from "./memory-observer"
 import { dequeueEnrichmentBlock } from "@/memory/turn-hooks"
+import { SubagentRegistry } from "@/subagent/registry"
+import { Config } from "@/config"
 import { EffectBridge } from "@/effect"
 import { Skill } from "@/skill"
 import { SkillInjection } from "@/skill/injection"
@@ -94,6 +96,71 @@ export namespace SessionPrompt {
    * `prompt()` call resets again.
    */
   export const autobestPendingContinuations = new Set<string>()
+
+  /**
+   * Default per-hook timeout (ms) for {@link runStopHook} when the config
+   * entry doesn't specify one. Mirrors Rust `codex.rs:7227-7261`'s 5-second
+   * guard on stop-hook execution.
+   */
+  export const DEFAULT_STOP_HOOK_TIMEOUT_MS = 5_000
+
+  export interface StopHookEntry {
+    readonly name: string
+    readonly command: string | ReadonlyArray<string>
+    readonly timeoutMs?: number
+  }
+
+  /**
+   * Execute a single stop-hook entry and return its captured stdout. On
+   * timeout, spawn failure, or non-zero exit the function returns the
+   * stdout captured so far (possibly empty). Stderr is discarded. Does
+   * NOT throw — callers treat empty stdout as "no-op".
+   *
+   * Exported for unit tests in `test/session/prompt-stop-hook.test.ts`.
+   *
+   * Command resolution:
+   * - When `command` is an array, it's argv. The first element is the
+   *   program and the rest are arguments. No shell interpolation.
+   * - When `command` is a string, it's run through the platform's
+   *   preferred shell (`sh -c <string>`). Env is inherited from the
+   *   current process with `TERM=dumb`.
+   */
+  export const runStopHook = Effect.fnUntraced(function* (input: {
+    hook: StopHookEntry
+    cwd: string
+    spawner: ChildProcessSpawner.ChildProcessSpawner["Service"]
+  }) {
+    const { hook, cwd, spawner } = input
+    const timeoutMs = hook.timeoutMs ?? DEFAULT_STOP_HOOK_TIMEOUT_MS
+    let program: string
+    let args: string[]
+    if (Array.isArray(hook.command)) {
+      if (hook.command.length === 0) return ""
+      program = hook.command[0]
+      args = hook.command.slice(1)
+    } else {
+      const sh = Shell.preferred()
+      program = sh
+      args = ["-c", hook.command as string]
+    }
+    return yield* Effect.gen(function* () {
+      const proc = ChildProcess.make(program, args, {
+        cwd,
+        extendEnv: true,
+        env: { TERM: "dumb" },
+        stdin: "ignore",
+        forceKillAfter: "1 second",
+      })
+      const handle = yield* spawner.spawn(proc)
+      const stdout = yield* Stream.mkString(Stream.decodeText(handle.stdout))
+      yield* handle.exitCode
+      return stdout
+    }).pipe(
+      Effect.scoped,
+      Effect.timeout(timeoutMs),
+      Effect.catchCause(() => Effect.succeed("")),
+    )
+  })
 
   export interface Interface {
     readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
@@ -137,6 +204,72 @@ export namespace SessionPrompt {
       const llm = yield* LLM.Service
       const adaptive = yield* AdaptiveHooks.Service
       const memoryObserver = yield* SessionMemoryObserver.Service
+      const subagents = yield* SubagentRegistry.Service
+      const config = yield* Config.Service
+
+      // preBreak observer: if the parent turn has any active sub-agent
+      // children, wait for them to finish (bounded by
+      // `experimental.subagent.autoWaitTimeoutMs`, default 300_000) and emit
+      // a synthetic `[Sub-agent results] …` Inject so the runner re-enters
+      // the loop with the summaries. Mirrors Rust
+      // `codex_fork::auto_wait_for_active_children`.
+      yield* adaptive.register({
+        name: "subagent:auto-wait",
+        preBreak: (_state, args) =>
+          Effect.gen(function* () {
+            const active = yield* subagents.active(args.sessionID)
+            if (active.size === 0) return AdaptiveHooks.Continue
+            const cfg = yield* config.get()
+            const timeoutMs = cfg.experimental?.subagent?.autoWaitTimeoutMs ?? 300_000
+            const summaries = yield* subagents.waitForAll(args.sessionID, { timeoutMs })
+            if (summaries.length === 0) return AdaptiveHooks.Continue
+            return AdaptiveHooks.Inject({
+              text: SubagentRegistry.summarize(summaries),
+              source: "subagent:auto-wait",
+            })
+          }),
+      })
+
+      // preBreak observer: run user-configured stop hooks. This mirrors
+      // Rust `codex.rs:7227-7261` — each entry in
+      // `experimental.hooks.stopHooks` runs sequentially via the shared
+      // `ChildProcessSpawner`. If ANY hook prints to stdout, we emit
+      // `Inject(stdout)` so the turn stays open with the aggregated hook
+      // output as the next synthetic user turn. Exit codes are ignored
+      // (only stdout matters); a hook whose stdout is empty is treated
+      // as "no-op" regardless of exit status.
+      yield* adaptive.register({
+        name: "stop-hooks",
+        preBreak: (_state, _args) =>
+          Effect.gen(function* () {
+            const cfg = yield* config.get()
+            const hooks = cfg.experimental?.hooks?.stopHooks
+            if (!hooks || hooks.length === 0) return AdaptiveHooks.Continue
+            const ctx = yield* InstanceState.context
+            const cwd = ctx.directory
+            const parts: string[] = []
+            for (const hook of hooks) {
+              const out = yield* runStopHook({
+                hook: {
+                  name: hook.name,
+                  command: hook.command,
+                  timeoutMs: hook.timeoutMs,
+                },
+                cwd,
+                spawner,
+              })
+              const trimmed = out.trim()
+              if (trimmed.length === 0) continue
+              parts.push(`<stop-hook name="${hook.name}">\n${trimmed}\n</stop-hook>`)
+            }
+            if (parts.length === 0) return AdaptiveHooks.Continue
+            return AdaptiveHooks.Inject({
+              text: parts.join("\n\n"),
+              source: "stop-hooks",
+            })
+          }),
+      })
+
       const runner = Effect.fn("SessionPrompt.runner")(function* () {
         return yield* EffectBridge.make()
       })
@@ -1341,6 +1474,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             autobestPendingContinuations.delete(input.sessionID)
           } else {
             autobestCycleState.delete(input.sessionID)
+            // Fresh user-message boundary — reset per-cycle AdaptiveState
+            // counters. Preserves cross-cycle scratch state such as the
+            // injectCount diagnostic counter.
+            yield* adaptive.resetCycleFor(input.sessionID)
           }
 
           const session = yield* sessions.get(input.sessionID)
@@ -1425,11 +1562,31 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               lastUser.id < lastAssistant.id
             ) {
               yield* slog.info("exiting loop")
-              // [Adaptive Hook C: pre-break] — behavior-neutral in round 1.
-              // Round-2 observers (auto-wait for active children, stop-hook
-              // follow-up, autobest continuation) can return `inject` or
-              // `continue` here to hold the turn open.
-              yield* adaptive.runPreBreak({ sessionID, step })
+              // [Adaptive Hook C: pre-break] — observers may return `inject`
+              // (subagent auto-wait summary, stop-hook follow-up, autobest
+              // continuation) or `break`/`continue` to mutate the turn.
+              const pre = yield* adaptive.runPreBreak({ sessionID, step })
+              if (pre.kind === "inject") {
+                yield* sessions.appendUserText({
+                  sessionID,
+                  text: pre.message.text,
+                  synthetic: true,
+                  // Carry forward the current turn's agent/model so the
+                  // next iteration's provider lookup resolves against a
+                  // real provider (not the "manual"/"manual" stub).
+                  agent: lastUser.agent,
+                  model: {
+                    providerID: lastUser.model.providerID,
+                    modelID: lastUser.model.modelID,
+                  },
+                })
+                yield* adaptive.noteInject(sessionID, pre.message.source)
+                yield* slog.info("preBreak.inject", {
+                  source: pre.message.source,
+                  length: pre.message.text.length,
+                })
+                continue
+              }
               break
             }
 
@@ -1675,7 +1832,24 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               assistantText,
             })
             if (post.kind === "break") break
-            // round-2: if (post.kind === "inject") { injectSynthetic(post.message); continue }
+            if (post.kind === "inject") {
+              yield* sessions.appendUserText({
+                sessionID,
+                text: post.message.text,
+                synthetic: true,
+                agent: lastUser.agent,
+                model: {
+                  providerID: lastUser.model.providerID,
+                  modelID: lastUser.model.modelID,
+                },
+              })
+              yield* adaptive.noteInject(sessionID, post.message.source)
+              yield* slog.info("postIteration.inject", {
+                source: post.message.source,
+                length: post.message.text.length,
+              })
+              continue
+            }
 
             if (outcome === "break") break
             continue
@@ -1913,6 +2087,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           Skill.defaultLayer,
           SkillEvolution.defaultLayer,
           SessionMemoryObserver.defaultLayer,
+          SubagentRegistry.defaultLayer,
+          Config.defaultLayer,
         ),
       ),
     ),

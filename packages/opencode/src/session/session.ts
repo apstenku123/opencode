@@ -399,6 +399,15 @@ export interface Interface {
     text: string
     time?: number
     synthetic?: boolean
+    /**
+     * Optional agent/model override. Defaults to `"user"` / `"manual"` so
+     * callers that don't know the active turn's agent still produce valid
+     * `MessageV2.User` rows. The runLoop's adaptive-inject path passes the
+     * live turn's agent + model so the next iteration's provider lookup
+     * (via `lastUser.model`) resolves correctly.
+     */
+    agent?: string
+    model?: { providerID: string; modelID: string }
   }) => Effect.Effect<MessageID>
 }
 
@@ -869,13 +878,14 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
     const appendUserText: Interface["appendUserText"] = Effect.fn("Session.appendUserText")(function* (input) {
       const id = MessageID.ascending()
       const partID = PartID.ascending()
+      const model = input.model ?? { providerID: "manual", modelID: "manual" }
       const msg = yield* updateMessage({
         id,
         sessionID: input.sessionID,
         role: "user",
         time: { created: input.time ?? Date.now() },
-        agent: "user",
-        model: { providerID: "manual" as never, modelID: "manual" as never },
+        agent: input.agent ?? "user",
+        model: { providerID: model.providerID as never, modelID: model.modelID as never },
       } satisfies MessageV2.User)
       yield* updatePart({
         id: partID,

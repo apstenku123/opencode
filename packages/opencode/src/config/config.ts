@@ -416,20 +416,30 @@ export const Info = z
           .describe(
             "Async sub-agent tuning (ports `agent::exceeds_thread_spawn_depth_limit` + `auto_wait_for_active_children`).",
           ),
-        stop_hooks: z
-          .array(
-            z.object({
-              name: z.string(),
-              command: z
-                .union([z.string(), z.array(z.string())])
-                .describe("Shell command (string or argv) to run at the parent loop's pre-break point."),
-              timeoutMs: z.number().int().positive().optional().describe("Per-hook timeout. Default 5000ms."),
-            }),
-          )
+        hooks: z
+          .object({
+            stopHooks: z
+              .array(
+                z.object({
+                  name: z.string(),
+                  command: z
+                    .union([z.string(), z.array(z.string())])
+                    .describe("Shell command (string or argv) to run at the parent loop's pre-break point."),
+                  timeoutMs: z
+                    .number()
+                    .int()
+                    .positive()
+                    .optional()
+                    .describe("Per-hook timeout. Default 5000ms."),
+                }),
+              )
+              .optional()
+              .describe(
+                "User-defined stop hooks (port of `codex.rs:7227-7261`). Each hook runs sequentially at the parent loop's pre-break point. If ANY hook writes a non-empty string to stdout, the loop injects that text as a synthetic user turn to hold the turn open.",
+              ),
+          })
           .optional()
-          .describe(
-            "User-defined stop hooks (port of `codex.rs:7227-7261`). When a hook exits non-zero or prints `Continue: <reason>`, the parent loop holds the turn open by injecting a synthetic user message.",
-          ),
+          .describe("Experimental loop-level hooks (stop hooks, etc.)."),
       })
       .optional(),
   })

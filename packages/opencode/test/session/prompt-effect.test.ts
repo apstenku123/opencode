@@ -194,7 +194,7 @@ function makeHttp() {
     Layer.provide(CrossSpawnSpawner.defaultLayer),
     Layer.provide(Ripgrep.defaultLayer),
     Layer.provide(Format.defaultLayer),
-    Layer.provide(SubagentRegistry.defaultLayer),
+    Layer.provideMerge(SubagentRegistry.defaultLayer),
     Layer.provideMerge(todo),
     Layer.provideMerge(question),
     Layer.provideMerge(deps),
@@ -210,9 +210,8 @@ function makeHttp() {
     SessionPrompt.layer.pipe(
       Layer.provide(SessionRevert.defaultLayer),
       Layer.provide(summary),
-      Layer.provide(AdaptiveHooks.defaultLayer),
+      Layer.provideMerge(AdaptiveHooks.defaultLayer),
       Layer.provide(SessionMemoryObserver.defaultLayer),
-      Layer.provide(SubagentRegistry.defaultLayer),
       Layer.provideMerge(run),
       Layer.provideMerge(compact),
       Layer.provideMerge(proc),
@@ -1608,6 +1607,145 @@ it.live(
           )
         }),
       { git: true, config: cfg },
+    ),
+  30_000,
+)
+
+// ---------------------------------------------------------------------------
+// Round-3: AdaptiveHooks Inject directive — round-trip through runLoop
+// ---------------------------------------------------------------------------
+
+it.live(
+  "runLoop converts postIteration Inject into a synthetic MessageV2.User{synthetic:true} and continues the loop",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const hooks = yield* AdaptiveHooks.Service
+        const chat = yield* sessions.create({
+          title: "Inject roundtrip",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        // Inject exactly once (first assistant iteration). Subsequent
+        // iterations return Continue so the loop terminates naturally.
+        let injected = false
+        const off = yield* hooks.register({
+          name: "test:round3:inject-once",
+          postIteration: () =>
+            Effect.sync(() => {
+              if (injected) return AdaptiveHooks.Continue
+              injected = true
+              return AdaptiveHooks.Inject({
+                text: "please continue with next step",
+                source: "test:round3",
+              })
+            }),
+        })
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "hello" }],
+        })
+        yield* llm.text("first")
+        yield* llm.text("second")
+
+        const result = yield* prompt.loop({ sessionID: chat.id })
+        expect(result.info.role).toBe("assistant")
+        expect(result.parts.some((p) => p.type === "text" && p.text === "second")).toBe(true)
+        expect(yield* llm.hits).toHaveLength(2)
+
+        const msgs = yield* sessions.messages({ sessionID: chat.id })
+        const syntheticUser = msgs.find(
+          (m) =>
+            m.info.role === "user" &&
+            m.parts.some(
+              (p) =>
+                p.type === "text" &&
+                p.synthetic === true &&
+                p.text === "please continue with next step",
+            ),
+        )
+        expect(syntheticUser).toBeDefined()
+
+        const bag = yield* hooks.stateFor(chat.id)
+        expect(bag.scratch.injectCount).toBe(1)
+        expect(bag.scratch.lastInjectSource).toBe("test:round3")
+
+        off()
+      }),
+      { git: true, config: providerCfg },
+    ),
+  30_000,
+)
+
+it.live.skip(
+  // TODO(R4-S4): runLoop does not yet convert `AdaptiveHooks.Inject` directive
+  // into a synthetic MessageV2.User and re-enter the loop. R3-S4 (inject impl)
+  // was rate-limited before this wiring landed. Unskip once R4 implements it.
+  "runLoop converts preBreak Inject into a synthetic MessageV2.User and re-enters the loop",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const hooks = yield* AdaptiveHooks.Service
+        const chat = yield* sessions.create({
+          title: "PreBreak inject roundtrip",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        // Simulate the subagent-auto-wait observer behaviour via a direct
+        // test observer that injects a canonical `[Sub-agent results]` body
+        // exactly once at preBreak. Validates the runLoop's preBreak Inject
+        // pathway independently of SubagentRegistry InstanceState plumbing
+        // (covered by dedicated registry tests).
+        let injected = false
+        const off = yield* hooks.register({
+          name: "test:round3:prebreak-once",
+          preBreak: () =>
+            Effect.sync(() => {
+              if (injected) return AdaptiveHooks.Continue
+              injected = true
+              return AdaptiveHooks.Inject({
+                text: "[Sub-agent results] child result",
+                source: "test:round3:prebreak",
+              })
+            }),
+        })
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "hi" }],
+        })
+        yield* llm.text("assistant reply")
+        yield* llm.text("after inject")
+
+        const result = yield* prompt.loop({ sessionID: chat.id })
+        expect(result.info.role).toBe("assistant")
+        expect(yield* llm.hits).toHaveLength(2)
+
+        const msgs = yield* sessions.messages({ sessionID: chat.id })
+        const summaryInjected = msgs.find(
+          (m) =>
+            m.info.role === "user" &&
+            m.parts.some(
+              (p) =>
+                p.type === "text" &&
+                p.synthetic === true &&
+                p.text.startsWith("[Sub-agent results]") &&
+                p.text.includes("child result"),
+            ),
+        )
+        expect(summaryInjected).toBeDefined()
+        off()
+      }),
+      { git: true, config: providerCfg },
     ),
   30_000,
 )

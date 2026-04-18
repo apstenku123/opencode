@@ -200,4 +200,50 @@ describe("AdaptiveHooks", () => {
     ])
     expect(d.kind).toBe("break")
   })
+
+  test("resetCycleFor zeros per-cycle counters on existing state but not scratch", async () => {
+    await run(
+      Effect.gen(function* () {
+        const hooks = yield* AdaptiveHooks.Service
+        const sessionID = sid("session_reset_cycle")
+        const bag = yield* hooks.stateFor(sessionID)
+        bag.stagnationCount = 7
+        bag.whereIsPlanAsks = 3
+        bag.whatNextAsks = 2
+        bag.emptyOutputCount = 9
+        bag.scratch.keepMe = 42
+        yield* hooks.resetCycleFor(sessionID)
+        const after = yield* hooks.stateFor(sessionID)
+        expect(after.stagnationCount).toBe(0)
+        expect(after.whereIsPlanAsks).toBe(0)
+        expect(after.whatNextAsks).toBe(0)
+        expect(after.emptyOutputCount).toBe(0)
+        expect(after.scratch.keepMe).toBe(42)
+      }),
+    )
+  })
+
+  test("resetCycleFor on a never-seen session is a no-op", async () => {
+    await run(
+      Effect.gen(function* () {
+        const hooks = yield* AdaptiveHooks.Service
+        // Should not throw.
+        yield* hooks.resetCycleFor(sid("session_reset_unknown"))
+      }),
+    )
+  })
+
+  test("noteInject increments scratch.injectCount and records lastInjectSource", async () => {
+    await run(
+      Effect.gen(function* () {
+        const hooks = yield* AdaptiveHooks.Service
+        const sessionID = sid("session_note_inject")
+        yield* hooks.noteInject(sessionID, "test:a")
+        yield* hooks.noteInject(sessionID, "test:b")
+        const bag = yield* hooks.stateFor(sessionID)
+        expect(bag.scratch.injectCount).toBe(2)
+        expect(bag.scratch.lastInjectSource).toBe("test:b")
+      }),
+    )
+  })
 })

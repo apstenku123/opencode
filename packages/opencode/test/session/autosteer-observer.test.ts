@@ -6,6 +6,7 @@ import { AppRuntime } from "../../src/effect/app-runtime"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionAutosteer } from "../../src/session/autosteer"
 import { SessionAutosteerObserver } from "../../src/session/autosteer-observer"
+import { AdaptiveHooks } from "../../src/session/adaptive"
 import { MessageID, PartID } from "../../src/session/schema"
 
 const projectRoot = path.join(__dirname, "../..")
@@ -206,6 +207,47 @@ describe("SessionAutosteerObserver", () => {
         await AppRuntime.runPromise(
           SessionAutosteerObserver.Service.use((svc) => svc.setEnabledOverride(undefined)),
         )
+      },
+    })
+  })
+
+  test("registered postIteration observer emits Inject directive on nudge", async () => {
+    await Instance.provide({
+      directory: projectRoot,
+      fn: async () => {
+        const session = await createSession({})
+        // First stagnant reply — postIteration fires once and increments
+        // the detection counter but no nudge (count: 1 < trigger: 2).
+        await appendAssistantText(session.id, "My plan is to refactor.")
+        const first = await AppRuntime.runPromise(
+          AdaptiveHooks.Service.use((svc) =>
+            svc.runPostIteration({
+              sessionID: session.id as any,
+              step: 1,
+              defaultOutcome: "continue",
+            }),
+          ),
+        )
+        expect(first.kind).toBe("continue")
+
+        // Second stagnant reply — postIteration crosses the trigger and
+        // emits Inject via the autosteer observer. The runLoop (not this
+        // observer) owns the appendUserText side-effect.
+        await appendAssistantText(session.id, "Here's my plan: refactor again.")
+        const merged = await AppRuntime.runPromise(
+          AdaptiveHooks.Service.use((svc) =>
+            svc.runPostIteration({
+              sessionID: session.id as any,
+              step: 2,
+              defaultOutcome: "continue",
+            }),
+          ),
+        )
+        expect(merged.kind).toBe("inject")
+        if (merged.kind === "inject") {
+          expect(merged.message.source).toBe("autosteer:nudge")
+          expect(merged.message.text).toBe(SessionAutosteer.NUDGE_TEXT)
+        }
       },
     })
   })

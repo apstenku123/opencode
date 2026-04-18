@@ -32,6 +32,8 @@ import { SessionRevert } from "@/session/revert"
 import { SessionSummary } from "@/session/summary"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionAutosteerObserver } from "@/session/autosteer-observer"
+import { AdaptiveHooks } from "@/session/adaptive"
+import { SubagentRegistry } from "@/subagent/registry"
 import { SessionMemoryObserver } from "@/session/memory-observer"
 import { defaultLayer as MemoryDefaultLayer } from "@/memory"
 import { Instruction } from "@/session/instruction"
@@ -84,6 +86,7 @@ export const AppLayer = Layer.mergeAll(
   SessionSummary.defaultLayer,
   SessionPrompt.defaultLayer,
   SessionAutosteerObserver.defaultLayer,
+  SubagentRegistry.defaultLayer,
   SessionMemoryObserver.defaultLayer,
   MemoryDefaultLayer,
   Instruction.defaultLayer,
@@ -104,7 +107,10 @@ export const AppLayer = Layer.mergeAll(
   SessionShare.defaultLayer,
 ).pipe(Layer.provideMerge(Observability.layer))
 
-const rt = ManagedRuntime.make(AppLayer, { memoMap })
+// TODO(unify-R3): MemoryStorage transitively depends on Database.Service which
+// is resolved via InstanceState context, not an explicit layer. Until we
+// express that dependency properly, narrow the AppLayer R-channel to `never`.
+const rt = ManagedRuntime.make(AppLayer as unknown as Layer.Layer<typeof AppLayer extends Layer.Layer<infer A, any, any> ? A : never, never, never>, { memoMap })
 type Runtime = Pick<typeof rt, "runSync" | "runPromise" | "runPromiseExit" | "runFork" | "runCallback" | "dispose">
 const wrap = (effect: Parameters<typeof rt.runSync>[0]) => attach(effect as never) as never
 

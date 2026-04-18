@@ -103,6 +103,13 @@ export namespace SubagentRegistry {
      * Self-cycles guarded.
      */
     readonly depth: (sessionID: SessionID) => Effect.Effect<number>
+    /**
+     * Direct parent of a registered child session, if any. Returns
+     * `undefined` for top-level sessions or unknown ids. Survives child
+     * close so guardian routing can still identify the parent after
+     * completion. Used by {@link Guardian} to route approval requests.
+     */
+    readonly parentOf: (sessionID: SessionID) => Effect.Effect<SessionID | undefined>
   }
 
   export class Service extends Context.Service<Service, Interface>()("@opencode/SubagentRegistry") {}
@@ -256,6 +263,9 @@ export namespace SubagentRegistry {
           return n
         })
 
+      const parentOf: Interface["parentOf"] = (sessionID) =>
+        Effect.map(getState, (state) => state.parentOf.get(sessionID))
+
       return Service.of({
         spawn,
         waitForAll,
@@ -264,6 +274,7 @@ export namespace SubagentRegistry {
         cancelAll,
         summary,
         depth,
+        parentOf,
       })
     }),
   )

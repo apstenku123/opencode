@@ -94,10 +94,25 @@ export namespace Question {
     requestID: QuestionID,
   }) {}
 
+  /**
+   * Emitted by the sub-agent {@link Guardian} when a child session's
+   * question cannot be auto-approved against the parent's permission ruleset
+   * and must be surfaced to the parent's UI. The `parentID` is the session
+   * that should render the follow-up prompt; `childID` identifies the
+   * source of the original request.
+   */
+  class ForwardedToParent extends Schema.Class<ForwardedToParent>("QuestionForwardedToParent")({
+    parentID: SessionID,
+    childID: SessionID,
+    requestID: QuestionID,
+    request: Request,
+  }) {}
+
   export const Event = {
     Asked: BusEvent.define("question.asked", Request.zod),
     Replied: BusEvent.define("question.replied", zod(Replied)),
     Rejected: BusEvent.define("question.rejected", zod(Rejected)),
+    ForwardedToParent: BusEvent.define("question.forwarded_to_parent", zod(ForwardedToParent)),
   }
 
   export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("QuestionRejectedError", {}) {
