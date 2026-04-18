@@ -8,37 +8,55 @@ afterEach(() => {
 })
 
 describe("github-copilot quota", () => {
-  test("premium parses premium request snapshot", () => {
+  test("premium parses premium_interactions snapshot (object keyed, not array)", () => {
+    // Mirrors Rust `QuotaSnapshots { premium_interactions: QuotaSnapshot {...} }`
     expect(
       premium({
-        entitlements: { premium_requests: 300 },
-        quota_snapshots: [{ quota_id: "premium_requests", remaining: 120, percent_remaining: 0.4 }],
+        quota_snapshots: {
+          premium_interactions: { entitlement: 300, remaining: 120, percent_remaining: 40, unlimited: false },
+        },
       }),
-    ).toEqual({ used: 180, total: 300, remaining: 120, percent: 0.4 })
+    ).toEqual({ used: 180, total: 300, remaining: 120, percent: 0.4, unlimited: false })
   })
 
-  test("parse extracts login, plan, sku and api base", () => {
+  test("premium recognises unlimited free plans", () => {
+    expect(
+      premium({
+        quota_snapshots: {
+          premium_interactions: { entitlement: 0, remaining: 0, percent_remaining: 100, unlimited: true },
+        },
+      }),
+    ).toMatchObject({ unlimited: true })
+  })
+
+  test("parse extracts login, plan, sku, api base and quota_reset_date", () => {
     expect(
       parse({
-        user_login: "octo",
+        login: "octo",
         copilot_plan: "copilot_pro",
         access_type_sku: "copilot_edu",
         endpoints: { api: "https://api.individual.githubcopilot.com" },
-        entitlements: { premium_requests: 100 },
-        quota_snapshots: [{ quota_id: "premium_requests", remaining: 25, total: 100, reset_date: "2026-05-01" }],
+        quota_reset_date: "2026-05-01",
+        quota_snapshots: {
+          premium_interactions: { entitlement: 100, remaining: 25, percent_remaining: 25, unlimited: false },
+        },
       }),
     ).toEqual({
       login: "octo",
       plan: "copilot_pro",
       sku: "copilot_edu",
       api: "https://api.individual.githubcopilot.com",
-      premium: { used: 75, total: 100, remaining: 25, percent: 0.25 },
+      premium: { used: 75, total: 100, remaining: 25, percent: 0.25, unlimited: false },
       resetDate: "2026-05-01",
     })
   })
 
+  test("parse accepts legacy user_login field as fallback", () => {
+    expect(parse({ user_login: "octo" })).toMatchObject({ login: "octo" })
+  })
+
   test("formatQuotaBar renders compact quota bar", () => {
-    expect(formatQuotaBar({ used: 80, total: 100, remaining: 20, percent: 0.2 }, "2026-05-01")).toContain("20/100 20%")
+    expect(formatQuotaBar({ used: 80, total: 100, remaining: 20, percent: 0.2, unlimited: false }, "2026-05-01")).toContain("20/100 20%")
   })
 
   test("fetchQuota reads /copilot_internal/user", async () => {
@@ -46,11 +64,12 @@ describe("github-copilot quota", () => {
       Promise.resolve(
         new Response(
           JSON.stringify({
-            user_login: "octo",
+            login: "octo",
             copilot_plan: "free",
             access_type_sku: "copilot_free",
-            entitlements: { premium_requests: 50 },
-            quota_snapshots: [{ quota_id: "premium_requests", remaining: 50, total: 50 }],
+            quota_snapshots: {
+              premium_interactions: { entitlement: 50, remaining: 50, percent_remaining: 100, unlimited: true },
+            },
           }),
           { status: 200 },
         ),
@@ -61,6 +80,7 @@ describe("github-copilot quota", () => {
     expect(out.login).toBe("octo")
     expect(out.sku).toBe("copilot_free")
     expect(out.plan).toBe("free")
+    expect(out.premium?.unlimited).toBe(true)
   })
 
   test("fetchQuota throws on network status", async () => {
@@ -99,14 +119,13 @@ describe("fetchQuota dynamic endpoint + SKU (step 1 of discovery chain)", () => 
       Promise.resolve(
         new Response(
           JSON.stringify({
-            user_login: "corp",
+            login: "corp",
             copilot_plan: "enterprise",
             access_type_sku: "enterprise",
             endpoints: { api: "https://api.enterprise.githubcopilot.com" },
-            entitlements: { premium_requests: 1500 },
-            quota_snapshots: [
-              { quota_id: "premium_requests", remaining: 900, total: 1500, percent_remaining: 0.6 },
-            ],
+            quota_snapshots: {
+              premium_interactions: { entitlement: 1500, remaining: 900, percent_remaining: 60, unlimited: false },
+            },
           }),
           { status: 200 },
         ),

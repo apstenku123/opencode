@@ -6,6 +6,7 @@ export type Premium = {
   total: number
   remaining: number
   percent: number
+  unlimited: boolean
 }
 
 export type Quota = {
@@ -17,47 +18,67 @@ export type Quota = {
   resetDate?: string
 }
 
-type Snap = {
-  quota_id?: string
+// Matches Rust `github-copilot/src/quota.rs::QuotaSnapshot`
+type Snapshot = {
+  entitlement?: number
   remaining?: number
-  total?: number
   percent_remaining?: number
-  reset_date?: string
+  unlimited?: boolean
+}
+
+// Matches Rust `QuotaSnapshots` — a keyed object, NOT an array.
+type Snapshots = {
+  premium_interactions?: Snapshot
+  chat?: Snapshot
+  completions?: Snapshot
 }
 
 type Payload = {
+  // Rust uses `login` (not `user_login`). Accept both for resiliency.
+  login?: string
   user_login?: string
   copilot_plan?: string
   access_type_sku?: string
   endpoints?: { api?: string }
-  entitlements?: { premium_requests?: number }
-  quota_snapshots?: Snap[]
+  // Rust exposes `quota_reset_date` at the top level.
+  quota_reset_date?: string
+  quota_snapshots?: Snapshots
 }
 
 export function premium(input: Payload) {
-  const total = input.entitlements?.premium_requests
-  const snap = input.quota_snapshots?.find((item) => item.quota_id === "premium_requests")
+  const snap = input.quota_snapshots?.premium_interactions
   if (!snap) return
-  if (typeof total !== "number") return
-  if (typeof snap.remaining !== "number") return
-  const remaining = snap.remaining
+  const remaining = typeof snap.remaining === "number" ? snap.remaining : undefined
+  const total = typeof snap.entitlement === "number" ? snap.entitlement : undefined
+  if (remaining === undefined || total === undefined) return
   const used = Math.max(total - remaining, 0)
+  const unlimited = snap.unlimited === true
+  const pct =
+    typeof snap.percent_remaining === "number"
+      ? snap.percent_remaining > 1 // Rust expresses as 0-100; TS historically used 0-1
+        ? snap.percent_remaining / 100
+        : snap.percent_remaining
+      : total === 0
+        ? 0
+        : remaining / total
   return {
     used,
     total,
     remaining,
-    percent: typeof snap.percent_remaining === "number" ? snap.percent_remaining : total === 0 ? 0 : remaining / total,
+    percent: pct,
+    unlimited,
   } satisfies Premium
 }
 
 export function parse(input: Payload): Quota {
+  const login = typeof input.login === "string" ? input.login : typeof input.user_login === "string" ? input.user_login : undefined
   return {
-    login: typeof input.user_login === "string" ? input.user_login : undefined,
+    login,
     plan: typeof input.copilot_plan === "string" ? input.copilot_plan : undefined,
     sku: typeof input.access_type_sku === "string" ? input.access_type_sku : undefined,
     api: typeof input.endpoints?.api === "string" ? input.endpoints.api : undefined,
     premium: premium(input),
-    resetDate: input.quota_snapshots?.find((item) => item.quota_id === "premium_requests")?.reset_date,
+    resetDate: typeof input.quota_reset_date === "string" ? input.quota_reset_date : undefined,
   }
 }
 
