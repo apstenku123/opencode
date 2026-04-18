@@ -16,8 +16,34 @@
  * plain data. The `Service` that owns live MCP clients lives in `mcp/index.ts`.
  */
 
-import type { Tool } from "ai"
+import { Effect } from "effect"
+import type { Tool, ToolExecutionOptions } from "ai"
 import type { AppInfo } from "../apps/directory"
+import { Service as MCPService } from "./index"
+
+/**
+ * Result of invoking a connector tool via {@link invokeConnector}. Mirrors
+ * the `CallToolResult` shape returned by `@modelcontextprotocol/sdk` so the
+ * caller does not have to import the MCP SDK types at the callsite.
+ */
+export interface ConnectorInvocationResult {
+  readonly app: AppInfo
+  readonly toolKey: string
+  readonly toolName: string
+  readonly result: unknown
+}
+
+export class ConnectorNotResolvedError extends Error {
+  readonly _tag = "ConnectorNotResolvedError"
+  constructor(
+    readonly app: AppInfo,
+    readonly toolName: string,
+    readonly reason: "no-mcp-server" | "tool-not-found" | "not-executable",
+  ) {
+    super(`Connector "${app.id}" tool "${toolName}" is not resolved: ${reason}`)
+    this.name = "ConnectorNotResolvedError"
+  }
+}
 
 /**
  * Tool keys in `MCP.Service.tools()` are `${sanitize(serverName)}_${sanitize(toolName)}`
@@ -148,12 +174,79 @@ export function resolveFromApps(
   return resolveConnectors(apps, tools)
 }
 
+/**
+ * Look up the `Tool` in `tools` that belongs to `app.mcpServer` and whose
+ * unprefixed name equals `toolName`. Returns `undefined` if the app has no
+ * MCP binding or the tool is not live.
+ */
+export function findConnectorTool(
+  app: AppInfo,
+  toolName: string,
+  tools: Record<string, Tool>,
+): { key: string; tool: Tool } | undefined {
+  if (!app.mcpServer) return undefined
+  const key = sanitize(app.mcpServer) + "_" + sanitize(toolName)
+  const tool = tools[key]
+  if (!tool) return undefined
+  return { key, tool }
+}
+
+/**
+ * Invoke the connector tool `toolName` for `app` with `args` by routing
+ * through `MCP.Service.tools()` and calling the resolved tool's `execute`.
+ *
+ * This is the runtime wiring that turns a resolved app mention into an
+ * actual MCP tool call. The matching logic above (`resolveConnectors`
+ * etc.) is pure; this function is the Effect-flavoured I/O edge that
+ * reaches into the live MCP client registry.
+ *
+ * Fails with {@link ConnectorNotResolvedError} when:
+ *   - the app lacks an `mcpServer` binding (documentation-only);
+ *   - no tool with the expected sanitized key is live;
+ *   - the resolved tool has no `execute` (abstract / provider-side).
+ *
+ * Any error raised by the underlying `execute` is rethrown verbatim so
+ * upstream permission / retry handling behaves the same as a regular
+ * session tool call.
+ */
+export function invokeConnector(
+  app: AppInfo,
+  toolName: string,
+  args: Record<string, unknown>,
+  options?: Partial<ToolExecutionOptions>,
+): Effect.Effect<ConnectorInvocationResult, ConnectorNotResolvedError | Error, MCPService> {
+  return Effect.gen(function* () {
+    const mcp = yield* MCPService
+    const tools = yield* mcp.tools()
+    if (!app.mcpServer) return yield* Effect.fail(new ConnectorNotResolvedError(app, toolName, "no-mcp-server"))
+    const match = findConnectorTool(app, toolName, tools)
+    if (!match) return yield* Effect.fail(new ConnectorNotResolvedError(app, toolName, "tool-not-found"))
+    const execute = match.tool.execute
+    if (!execute) return yield* Effect.fail(new ConnectorNotResolvedError(app, toolName, "not-executable"))
+    const execOpts: ToolExecutionOptions = {
+      toolCallId: options?.toolCallId ?? `connector_${app.id}_${Date.now()}`,
+      messages: options?.messages ?? [],
+      abortSignal: options?.abortSignal ?? new AbortController().signal,
+      ...(options ?? {}),
+    } as ToolExecutionOptions
+    const result = yield* Effect.tryPromise({
+      try: () => Promise.resolve(execute(args, execOpts)),
+      catch: (err) => (err instanceof Error ? err : new Error(String(err))),
+    })
+    return { app, toolKey: match.key, toolName, result } satisfies ConnectorInvocationResult
+  })
+}
+
 // --- namespace for ergonomic `import { Connectors } from "..."` ---
 
 export namespace Connectors {
   export type Connector = ResolvedConnector
   export type Resolution = ConnectorResolution
+  export type InvocationResult = ConnectorInvocationResult
   export const resolve = resolveConnectors
   export const filter = filterConnectorTools
   export const hint = renderConnectorHint
+  export const findTool = findConnectorTool
+  export const invoke = invokeConnector
+  export const NotResolvedError = ConnectorNotResolvedError
 }

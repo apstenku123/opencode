@@ -1335,14 +1335,47 @@ export namespace ACP {
     }
 
     /**
-     * Unstable ACP extension: stubbed session replay. Always throws
-     * `Replay.NOT_IMPLEMENTED_CODE` with the Stream-G dependency hint
-     * until the rollout module lands. Exposed publicly so the ACP router
-     * surfaces the structured error to clients that opted into the
-     * `_meta.replay` capability.
+     * Unstable ACP extension: session replay. Opens the rollout file
+     * recorded by Stream G for the requested session and streams every
+     * entry back to the ACP client via `session/update` notifications.
+     * Throws `Replay.NOT_IMPLEMENTED_CODE` only when the rollout module
+     * is missing (should never happen at runtime) or the session has no
+     * rollout file on disk (fresh session, pre-writer).
      */
     async unstable_replaySession(params: { sessionId: string; fromIndex?: number; toIndex?: number; rate?: number }) {
-      return Replay.handleOrReject(params)
+      return Replay.handleOrReject({
+        ...params,
+        emit: async (entry) => {
+          await this.connection
+            .sessionUpdate({
+              sessionId: params.sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                messageId: `replay_${entry.seq}`,
+                content: {
+                  type: "resource",
+                  resource: {
+                    uri: `rollout://${params.sessionId}/${entry.seq}`,
+                    mimeType: "application/json",
+                    text: JSON.stringify({
+                      seq: entry.seq,
+                      kind: entry.kind,
+                      time: entry.time,
+                      payload: entry.payload,
+                    }),
+                  },
+                },
+              },
+            })
+            .catch((err) => {
+              log.error("failed to send replay entry to ACP", {
+                sessionId: params.sessionId,
+                seq: entry.seq,
+                error: err,
+              })
+            })
+        },
+      })
     }
 
     /**
