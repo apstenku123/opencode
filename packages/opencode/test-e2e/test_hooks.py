@@ -43,18 +43,18 @@ import pytest
 
 from harness import OpencodeClient, OpencodeServer, resolve_opencode_binary
 
-# The ``opencode serve`` HTTP routes require a per-request ``Instance.provide``
-# wrapper which is supplied by ``WorkspaceRouterMiddleware``. When that
-# middleware is not wired into ``InstanceRoutes`` the server returns
+# Instance-context smoke check: ``POST /session`` depends on the
+# ``WorkspaceRouterMiddleware`` being wired into ``InstanceRoutes``. If the
+# middleware is missing (or the build is stale) the server returns
 # ``500: No context found for instance`` for every POST that touches a
-# project (session/thread/turn). The e2e suite auto-skips in that case so
-# it's safe to run pre- and post-fix without spurious failures. Set
-# ``OPENCODE_E2E_FORCE=1`` to run anyway (useful for the fix-loop).
+# project — the suite then auto-skips rather than producing noisy
+# failures. Set ``OPENCODE_E2E_FORCE=1`` to run anyway (useful when
+# hunting the bug in the fix-loop).
 _FORCE_E2E = os.environ.get("OPENCODE_E2E_FORCE") == "1"
 
 
 def _server_supports_instance_routes(base_url: str, cwd: str) -> bool:
-    """Smoke-test ``POST /session`` to detect the Instance-context bug."""
+    """Smoke-test ``POST /session`` to detect a missing Instance context."""
     import httpx as _httpx
 
     try:

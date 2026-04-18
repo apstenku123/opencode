@@ -117,6 +117,18 @@ class OpencodeClient:
     def get_thread(self, thread_id: str) -> dict[str, Any]:
         return self._get(f"/thread/{thread_id}")
 
+    def fork_thread(
+        self,
+        thread_id: str,
+        *,
+        messageID: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """POST /thread/:id/fork — fork a thread at an optional message boundary."""
+        body: dict[str, Any] = {}
+        if messageID is not None:
+            body["messageID"] = messageID
+        return self._post(f"/thread/{thread_id}/fork", json=body)
+
     # --- turns ---------------------------------------------------------
 
     def start_turn(
@@ -280,6 +292,23 @@ class OpencodeClient:
         if ts is not None:
             body["ts"] = ts
         return self._post(f"/thread/{thread_id}/autobest/setActive", json=body)
+
+    def set_autobest_enabled(
+        self,
+        thread_id: str,
+        enabled: bool,
+        *,
+        ts: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """POST /thread/:id/autobest/enabled."""
+        body: dict[str, Any] = {"enabled": enabled}
+        if ts is not None:
+            body["ts"] = ts
+        return self._post(f"/thread/{thread_id}/autobest/enabled", json=body)
+
+    def get_autobest_by_thread(self, thread_id: str) -> dict[str, Any]:
+        """GET /thread/:id/autobest — thread-scoped alias for get_autobest."""
+        return self._get(f"/thread/{thread_id}/autobest")
 
     # --- events --------------------------------------------------------
 
