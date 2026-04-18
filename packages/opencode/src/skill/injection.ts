@@ -22,7 +22,12 @@
  */
 
 import path from "path"
+import { Effect } from "effect"
+import { Log } from "@/util"
+import { SkillEvolution } from "./evolution"
 import type { Info as SkillInfo } from "./index"
+
+const log = Log.create({ service: "skill.injection" })
 
 // ---------------------------------------------------------------------------
 // Types
@@ -293,5 +298,64 @@ function triggersFromContent(content: string): string[] {
     .map((line) => line.replace(/^\s*-\s*/, "").trim().replace(/^["']|["']$/g, ""))
     .filter(Boolean)
 }
+
+// ---------------------------------------------------------------------------
+// Invocation wiring
+// ---------------------------------------------------------------------------
+
+/**
+ * Funnel the parsed mentions/implicit invocations into the evolution engine.
+ *
+ * Each "invoked" skill is treated as a successful tool completion for
+ * evolution bookkeeping purposes so its utility rate trends upward on
+ * repeated voluntary use. Failures are reported through the normal
+ * tool-result path (registry wrapper), not here — an invocation is always
+ * recorded as a *signal of intent*, never a guaranteed outcome.
+ *
+ * Safe to call with an empty list; it is a no-op.
+ */
+export const recordInvocations = Effect.fn("SkillInjection.recordInvocations")(function* (input: {
+  skills: SkillInfo[]
+  source: "mention" | "implicit"
+  taskQuery?: string
+  executionTrace?: string[]
+}) {
+  if (input.skills.length === 0) return
+  const evolution = yield* SkillEvolution.Service
+  for (const sk of input.skills) {
+    yield* evolution
+      .onToolComplete({
+        toolName: sk.name,
+        success: true,
+        taskQuery: input.taskQuery,
+        executionTrace: input.executionTrace ?? [],
+      })
+      .pipe(Effect.ignore)
+  }
+  log.debug("recorded skill invocations", {
+    source: input.source,
+    skills: input.skills.map((s) => s.name),
+  })
+})
+
+/**
+ * Convenience wrapper — scans user prompt text for `$skill-name` mentions
+ * and records each one as a voluntary invocation. Swallows errors (e.g.
+ * when the evolution service is absent from the active layer).
+ */
+export const handleUserPromptMentions = Effect.fn("SkillInjection.handleUserPromptMentions")(function* (input: {
+  text: string
+  skills: SkillInfo[]
+  taskQuery?: string
+}) {
+  const mentions = parseSkillMentions(input.text, input.skills)
+  if (mentions.length === 0) return mentions
+  yield* recordInvocations({
+    skills: mentions.map((m) => m.skill),
+    source: "mention",
+    taskQuery: input.taskQuery,
+  }).pipe(Effect.ignore)
+  return mentions
+})
 
 export * as SkillInjection from "./injection"

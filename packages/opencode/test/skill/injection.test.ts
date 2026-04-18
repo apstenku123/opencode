@@ -1,6 +1,17 @@
 import { describe, expect, test } from "bun:test"
-import { parseSkillMentions, detectImplicitInvocation } from "../../src/skill/injection"
+import { Effect, Layer } from "effect"
+import {
+  parseSkillMentions,
+  detectImplicitInvocation,
+  handleUserPromptMentions,
+  recordInvocations,
+} from "../../src/skill/injection"
+import { SkillEvolution } from "../../src/skill/evolution"
+import { Bus } from "../../src/bus"
 import type { Skill } from "../../src/skill"
+import { Instance } from "../../src/project/instance"
+import { provideTmpdirInstance } from "../fixture/fixture"
+import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
 
 const skill = (name: string, description = "", content = ""): Skill.Info => ({
   name,
@@ -95,5 +106,77 @@ describe("skill/injection - detectImplicitInvocation", () => {
       skillsList,
     )
     expect(inv.length).toBe(1)
+  })
+})
+
+describe("skill/injection - invocation recording", () => {
+  const layer = Layer.mergeAll(
+    SkillEvolution.layer.pipe(Layer.provide(Bus.layer)),
+    CrossSpawnSpawner.defaultLayer,
+  )
+
+  // Unique per-test skill names to dodge disk persistence at
+  // ~/.local/share/opencode/skill-evolution.json — the evolution service
+  // loads state from disk, so re-using names across runs inflates counters.
+  const unique = () => `inj-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+  test("handleUserPromptMentions routes mentions into the evolution engine", async () => {
+    try {
+      const rustName = unique()
+      const dockerName = unique()
+      const skills = [skill(rustName), skill(dockerName)]
+      const out = await Effect.runPromise(
+        provideTmpdirInstance((_dir) =>
+          Effect.gen(function* () {
+            const mentions = yield* handleUserPromptMentions({
+              text: `please run $${rustName} now`,
+              skills,
+            })
+            const evo = yield* SkillEvolution.Service
+            const snap = yield* evo.snapshot()
+            return { mentions, snap }
+          }),
+        ).pipe(Effect.provide(layer), Effect.scoped),
+      )
+      expect(out.mentions.length).toBe(1)
+      expect(out.mentions[0].skill.name).toBe(rustName)
+      expect(out.snap.utility_table[rustName]?.successes).toBe(1)
+    } finally {
+      await Instance.disposeAll()
+    }
+  })
+
+  test("recordInvocations bumps utility for every implicit hit", async () => {
+    try {
+      const dockerName = unique()
+      const rustName = unique()
+      const skills = [skill(dockerName), skill(rustName)]
+      const snap = await Effect.runPromise(
+        provideTmpdirInstance((_dir) =>
+          Effect.gen(function* () {
+            yield* recordInvocations({ skills, source: "implicit" })
+            const evo = yield* SkillEvolution.Service
+            return yield* evo.snapshot()
+          }),
+        ).pipe(Effect.provide(layer), Effect.scoped),
+      )
+      expect(snap.utility_table[dockerName]?.successes).toBe(1)
+      expect(snap.utility_table[rustName]?.successes).toBe(1)
+    } finally {
+      await Instance.disposeAll()
+    }
+  })
+
+  test("empty skill list is a no-op", async () => {
+    try {
+      await Effect.runPromise(
+        provideTmpdirInstance((_dir) => recordInvocations({ skills: [], source: "mention" })).pipe(
+          Effect.provide(layer),
+          Effect.scoped,
+        ),
+      )
+    } finally {
+      await Instance.disposeAll()
+    }
   })
 })

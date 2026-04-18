@@ -16,6 +16,8 @@ import type { Provider } from "@/provider"
 import type { Agent } from "@/agent/agent"
 import { Permission } from "@/permission"
 import { Skill } from "@/skill"
+import { SkillEnvDeps } from "@/skill/env-deps"
+import type { SessionID } from "./schema"
 
 export namespace SystemPrompt {
   export function provider(model: Provider.Model) {
@@ -57,7 +59,11 @@ export namespace SystemPrompt {
 
   export interface Interface {
     readonly environment: (model: Provider.Model) => string[]
-    readonly skills: (agent: Agent.Info, input?: string) => Effect.Effect<string | undefined>
+    readonly skills: (
+      agent: Agent.Info,
+      input?: string,
+      sessionID?: SessionID,
+    ) => Effect.Effect<string | undefined>
   }
 
   export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -67,6 +73,7 @@ export namespace SystemPrompt {
     Effect.gen(function* () {
       const skill = yield* Skill.Service
       const cfg = yield* Config.Service
+      const envDeps = yield* SkillEnvDeps.Service
 
       const api: Interface = {
         environment(model) {
@@ -85,7 +92,7 @@ export namespace SystemPrompt {
             ].join("\n"),
           ]
         },
-        skills(agent: Agent.Info, input?: string) {
+        skills(agent: Agent.Info, input?: string, sessionID?: SessionID) {
           return Effect.gen(function* () {
             if (Permission.disabled(["skill"], agent.permission).has("skill")) return
             const conf = yield* cfg.get()
@@ -103,6 +110,26 @@ export namespace SystemPrompt {
                 picks = recommend({ text: input, list }).slice(0, 3)
               }
             }
+
+            // Env-var dependency resolution. Before any picked skill is
+            // mentioned in the system prompt, walk each one's frontmatter
+            // `dependencies.tools: [{type: "env_var", value}]` block and
+            // prompt the user via the Question service for any missing
+            // values. Answers are cached per-session (never on disk) so
+            // secrets stay out of the rollout. When the call-site doesn't
+            // hand us a `sessionID` (e.g. title-generation, unit tests) we
+            // silently skip — there's no shell to prompt through anyway.
+            if (sessionID && picks.length > 0) {
+              yield* Effect.forEach(
+                picks,
+                (pick) =>
+                  envDeps
+                    .resolveSkillDependenciesForTurn({ sessionID, skill: pick })
+                    .pipe(Effect.ignore),
+                { concurrency: "unbounded", discard: true },
+              )
+            }
+
             return [
               "Skills provide specialized instructions and workflows for specific tasks.",
               "Use the skill tool to load a skill when a task matches its description.",
@@ -122,5 +149,9 @@ export namespace SystemPrompt {
     }),
   )
 
-  export const defaultLayer = layer.pipe(Layer.provide(Skill.defaultLayer), Layer.provide(Config.defaultLayer))
+  export const defaultLayer = layer.pipe(
+    Layer.provide(Skill.defaultLayer),
+    Layer.provide(Config.defaultLayer),
+    Layer.provide(SkillEnvDeps.defaultLayer),
+  )
 }

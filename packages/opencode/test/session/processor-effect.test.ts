@@ -18,6 +18,7 @@ import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
 import { Skill } from "../../src/skill"
+import { SkillEvolution } from "../../src/skill/evolution"
 import { Snapshot } from "../../src/snapshot"
 import { Log } from "../../src/util"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
@@ -163,6 +164,7 @@ const deps = Layer.mergeAll(
   Permission.defaultLayer,
   Plugin.defaultLayer,
   Skill.defaultLayer,
+  SkillEvolution.defaultLayer,
   Config.defaultLayer,
   LLM.defaultLayer,
   Provider.defaultLayer,

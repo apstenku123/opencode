@@ -252,6 +252,48 @@ export function Session() {
     })
   })
 
+  // Skill evolution banner. The `SkillEvolutionEngine` emits one of four
+  // actions after each tool outcome; only `optimize_skill` and
+  // `discover_new_skill` are interesting enough to flag mid-session.
+  // `record_success` never hits the bus and `record_tip` is deliberately
+  // silent to avoid noise on early failures before min_samples is met.
+  event.subscribe((evt: { type: string; properties?: Record<string, unknown> }) => {
+    if (evt.type !== "skill.evolution-suggested") return
+    const action = (evt.properties ?? {}).action as { kind?: string; skillName?: string; oldSkillName?: string } | undefined
+    if (!action) return
+    if (action.kind === "optimize_skill") {
+      toast.show({
+        message: `Skill suggestion: '${action.skillName}' could be refined — opencode is noting optimization opportunities.`,
+        variant: "info",
+        duration: 5000,
+      })
+      return
+    }
+    if (action.kind === "discover_new_skill") {
+      toast.show({
+        message: `Skill suggestion: '${action.oldSkillName}' may warrant a rewrite — opencode drafted a replacement.`,
+        variant: "info",
+        duration: 5000,
+      })
+    }
+  })
+
+  // Autoskill hot-insert banner: the extractor just persisted a new
+  // auto-skill under `~/.local/share/opencode/skills/auto/`. Surface the
+  // insert so the user knows new workflows are now available for the
+  // next turn without having to dig through the log.
+  event.subscribe((evt: { type: string; properties?: Record<string, unknown> }) => {
+    if (evt.type !== "skill.hot-inserted") return
+    const props = evt.properties ?? {}
+    const skill = props.skill as { name?: string } | undefined
+    const name = skill?.name ?? "(unnamed)"
+    toast.show({
+      message: `New skill available: ${name}. Invoke via the skill tool or a $${name} mention.`,
+      variant: "success",
+      duration: 4000,
+    })
+  })
+
   event.on("session.status", (evt) => {
     if (evt.properties.sessionID !== route.sessionID) return
     if (evt.properties.status.type !== "retry") return
