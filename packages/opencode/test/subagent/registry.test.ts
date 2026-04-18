@@ -217,4 +217,119 @@ describe("SubagentRegistry", () => {
   test("summarize on empty input returns empty string", () => {
     expect(SubagentRegistry.summarize([])).toBe("")
   })
+
+  test("waitForIds resolves immediately for already-finished children", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const parent = sid("session_wi_p")
+        const a = sid("session_wi_a")
+        yield* reg.spawn(parent, a)
+        yield* reg.close(a, { status: "completed", result: "done" })
+        const results = yield* reg.waitForIds(parent, [a])
+        expect(results.length).toBe(1)
+        expect(results[0]?.status).toBe("completed")
+        expect(results[0]?.result).toBe("done")
+      }),
+    )
+  })
+
+  test("waitForIds rejects unknown ids", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const exit = yield* Effect.exit(
+          reg.waitForIds(sid("session_wi_p2"), [sid("session_missing")]),
+        )
+        expect(exit._tag).toBe("Failure")
+      }),
+    )
+  })
+
+  test("waitForIds rejects children owned by a different parent", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const p1 = sid("session_wi_p3")
+        const p2 = sid("session_wi_p4")
+        const c = sid("session_wi_foreign")
+        yield* reg.spawn(p1, c)
+        const exit = yield* Effect.exit(reg.waitForIds(p2, [c]))
+        expect(exit._tag).toBe("Failure")
+      }),
+    )
+  })
+
+  test("cancelChild cancels exactly one child and returns true", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const parent = sid("session_cc_p")
+        const c1 = sid("session_cc_c1")
+        const c2 = sid("session_cc_c2")
+        let cancelled1 = false
+        let cancelled2 = false
+        yield* reg.spawn(parent, c1, { cancel: () => (cancelled1 = true) })
+        yield* reg.spawn(parent, c2, { cancel: () => (cancelled2 = true) })
+        const ok = yield* reg.cancelChild(parent, c1)
+        expect(ok).toBe(true)
+        expect(cancelled1).toBe(true)
+        expect(cancelled2).toBe(false)
+        const active = yield* reg.active(parent)
+        expect(active.has(c1)).toBe(false)
+        expect(active.has(c2)).toBe(true)
+      }),
+    )
+  })
+
+  test("cancelChild returns false for unknown or foreign-parent ids", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const p1 = sid("session_cc2_p1")
+        const p2 = sid("session_cc2_p2")
+        const c = sid("session_cc2_foreign")
+        yield* reg.spawn(p1, c)
+        expect(yield* reg.cancelChild(p2, c)).toBe(false)
+        expect(yield* reg.cancelChild(p1, sid("session_cc2_missing"))).toBe(false)
+        const active = yield* reg.active(p1)
+        expect(active.has(c)).toBe(true)
+      }),
+    )
+  })
+
+  test("listChildren returns active + finished rows sorted by startedAt", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const parent = sid("session_lc_p")
+        const running = sid("session_lc_running")
+        const done = sid("session_lc_done")
+        const errored = sid("session_lc_err")
+        yield* reg.spawn(parent, done)
+        yield* reg.close(done, { status: "completed", result: "R" })
+        yield* reg.spawn(parent, errored)
+        yield* reg.close(errored, { status: "error", error: "boom" })
+        yield* reg.spawn(parent, running)
+        const rows = yield* reg.listChildren(parent)
+        expect(rows.length).toBe(3)
+        const byID = new Map(rows.map((r) => [r.sessionID, r]))
+        expect(byID.get(done)?.status).toBe("completed")
+        expect(byID.get(done)?.result).toBe("R")
+        expect(byID.get(errored)?.status).toBe("error")
+        expect(byID.get(errored)?.error).toBe("boom")
+        expect(byID.get(running)?.status).toBe("running")
+      }),
+    )
+  })
+
+  test("listChildren returns empty array for unknown parent", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const rows = yield* reg.listChildren(sid("session_lc_nobody"))
+        expect(rows).toEqual([])
+      }),
+    )
+  })
 })
