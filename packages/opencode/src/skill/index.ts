@@ -46,11 +46,28 @@ export const Dependencies = z.object({
 })
 export type Dependencies = z.infer<typeof Dependencies>
 
+/**
+ * Provenance label for a registered skill. Lets callers (HTTP consumers, the
+ * TUI sidebar) distinguish the bundled built-in pack from hand-authored and
+ * auto-extracted skills without path-sniffing the `location` field.
+ *
+ *   - `builtin`  — shipped with the binary via `src/skill/builtin/*`.
+ *   - `auto`     — written by the autoskill hot-insert pipeline into
+ *                   `{data}/skills/auto/*.md`.
+ *   - `project`  — discovered under the active project's `.claude/skills` or
+ *                   `.agents/skills`, or through user-configured
+ *                   `skills.paths` / `skills.urls`.
+ */
+export const Scope = z.enum(["builtin", "auto", "project"])
+export type Scope = z.infer<typeof Scope>
+
 export const Info = z.object({
   name: z.string(),
   description: z.string(),
   location: z.string(),
   content: z.string(),
+  /** Provenance — see {@link Scope}. Defaults to `"project"` for discovered skills. */
+  scope: Scope.optional(),
   /** Optional env-var dependencies declared in frontmatter. */
   dependencies: Dependencies.optional(),
 })
@@ -139,9 +156,24 @@ export interface Interface {
   }) => Effect.Effect<RoutedSkill[]>
 }
 
-const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.Interface) {
+const add = Effect.fnUntraced(function* (
+  state: State,
+  match: string,
+  bus: Bus.Interface,
+  scope: Scope = "project",
+  /**
+   * Pre-loaded markdown source. When provided the frontmatter parser runs
+   * against this string directly instead of re-reading the file at `match`.
+   * Required for the built-in pack (whose `location` is a synthetic
+   * `/$bunfs/root/...` path embedded at bundle time).
+   */
+  preloaded?: string,
+) {
   const md = yield* Effect.tryPromise({
-    try: () => ConfigMarkdown.parse(match),
+    try: () =>
+      preloaded !== undefined
+        ? Promise.resolve(ConfigMarkdown.parseString(preloaded, match))
+        : ConfigMarkdown.parse(match),
     catch: (err) => err,
   }).pipe(
     Effect.catch(
@@ -159,8 +191,16 @@ const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.I
 
   if (!md) return
 
-  const parsed = Info.pick({ name: true, description: true, dependencies: true }).safeParse(md.data)
+  // `name` + `description` are required; `dependencies` follows the strict
+  // `{tools:[{type:"env_var",...}]}` shape. Legacy builtin markdown uses a
+  // flat `dependencies: [docker]` array — we accept that by parsing
+  // dependencies separately and silently dropping the field if it doesn't
+  // conform. This keeps the builtin pack loadable without forcing a
+  // frontmatter migration.
+  const parsed = Info.pick({ name: true, description: true }).safeParse(md.data)
   if (!parsed.success) return
+  const depsParsed = Dependencies.optional().safeParse((md.data as any)?.dependencies)
+  const dependencies = depsParsed.success ? depsParsed.data : undefined
 
   if (state.skills[parsed.data.name]) {
     log.warn("duplicate skill name", {
@@ -176,7 +216,8 @@ const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.I
     description: parsed.data.description,
     location: match,
     content: md.content,
-    dependencies: parsed.data.dependencies,
+    scope,
+    dependencies,
   }
 })
 
@@ -231,9 +272,11 @@ const registerBuiltinSkills = Effect.fnUntraced(function* (state: State, bus: Bu
   )
   for (const entry of bundle) {
     // The `add()` helper parses the markdown frontmatter and writes into
-    // `state.skills`. We pass the real bundle location so the display
-    // path points at the built-in SKILL.md rather than a synthetic URI.
-    yield* add(state, entry.location, bus)
+    // `state.skills`. We hand it both the bundle path (for display/logging)
+    // and the pre-loaded markdown body so the filesystem parser is
+    // bypassed — the synthetic `/$bunfs/root/...` location is never
+    // openable at runtime.
+    yield* add(state, entry.location, bus, "builtin", entry.content)
   }
   log.info("registered builtin skills", { count: bundle.length, names: bundle.map((s) => s.name) })
 })

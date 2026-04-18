@@ -4,10 +4,11 @@
  * Port of `codex-rs/core/src/skills/builtin.rs` (36 LOC) which uses the Rust
  * `include_str!` macro to compile SKILL.md files directly into the binary.
  *
- * In TypeScript we can't `include_str!`, so each SKILL.md lives under
- * `src/skill/builtin/<name>/SKILL.md` and we load it at module init via
- * `Bun.file()` relative to `import.meta.dir`. The content is read once per
- * process — subsequent calls return the cached string.
+ * In TypeScript + Bun's single-exec bundle we use import attributes with
+ * the `text` type so Bun inlines each SKILL.md's UTF-8 content as a string
+ * at compile time. This matches Rust's `include_str!` — no runtime `fs`
+ * access, no reliance on `import.meta.dir`, works identically in dev (`bun
+ * run`) and in the single-exec binary (`/$bunfs/root/...`).
  *
  * # Skills in this bundle (8 total, parity with Rust)
  *
@@ -34,6 +35,18 @@
 import path from "path"
 import { Flag } from "@/flag/flag"
 
+// Inline each SKILL.md at bundle time. Bun's `text` import attribute reads
+// the file during the build and embeds the UTF-8 bytes as a string — the
+// same mechanism used by `codex-rs` via `include_str!`. No runtime fs access.
+import bm25KbSearch from "./builtin/bm25-kb-search/SKILL.md" with { type: "text" }
+import copilotAccountFailover from "./builtin/copilot-account-failover/SKILL.md" with { type: "text" }
+import copilotRateLimitTuning from "./builtin/copilot-rate-limit-tuning/SKILL.md" with { type: "text" }
+import dockerCrossBuild from "./builtin/docker-cross-build/SKILL.md" with { type: "text" }
+import fixRustCompilation from "./builtin/fix-rust-compilation/SKILL.md" with { type: "text" }
+import guardianApprovalRouting from "./builtin/guardian-approval-routing/SKILL.md" with { type: "text" }
+import multiAgentLifecycle from "./builtin/multi-agent-lifecycle/SKILL.md" with { type: "text" }
+import upstreamMergeThinHooks from "./builtin/upstream-merge-thin-hooks/SKILL.md" with { type: "text" }
+
 /** Canonical list of bundled skill names (order = registration order). */
 export const BUILTIN_SKILL_NAMES = [
   "bm25-kb-search",
@@ -47,6 +60,18 @@ export const BUILTIN_SKILL_NAMES = [
 ] as const
 
 export type BuiltinSkillName = (typeof BUILTIN_SKILL_NAMES)[number]
+
+/** Bundle-embedded raw markdown keyed by canonical skill name. */
+const BUILTIN_SKILL_CONTENT: Record<BuiltinSkillName, string> = {
+  "bm25-kb-search": bm25KbSearch,
+  "copilot-account-failover": copilotAccountFailover,
+  "copilot-rate-limit-tuning": copilotRateLimitTuning,
+  "docker-cross-build": dockerCrossBuild,
+  "fix-rust-compilation": fixRustCompilation,
+  "guardian-approval-routing": guardianApprovalRouting,
+  "multi-agent-lifecycle": multiAgentLifecycle,
+  "upstream-merge-thin-hooks": upstreamMergeThinHooks,
+}
 
 /**
  * A lazily-resolved builtin skill descriptor. `content` is the raw
@@ -63,23 +88,27 @@ export interface BuiltinSkill {
 const cache = new Map<BuiltinSkillName, BuiltinSkill>()
 
 /**
- * Resolve the on-disk path of a bundled skill's `SKILL.md`. Stays a pure
- * file-path computation so tests can assert exact locations.
+ * Resolve the on-disk path of a bundled skill's `SKILL.md`. In the bundled
+ * binary this path is synthetic (under `/$bunfs/root`) and exists only for
+ * display/logging. Never open it with `fs` — use {@link loadBuiltinSkill}
+ * instead, which returns the inlined text.
  */
 export function builtinSkillPath(name: BuiltinSkillName): string {
   return path.join(import.meta.dir, "builtin", name, "SKILL.md")
 }
 
 /**
- * Read and cache a single bundled skill. Throws (via the Bun.file error
- * pipeline) when the underlying file is missing — treat that as a
- * compile-time invariant violation, not a runtime condition.
+ * Resolve a single bundled skill from the inlined content table. Cached
+ * after first lookup so repeated calls are free.
  */
 export async function loadBuiltinSkill(name: BuiltinSkillName): Promise<BuiltinSkill> {
   const existing = cache.get(name)
   if (existing) return existing
   const location = builtinSkillPath(name)
-  const content = await Bun.file(location).text()
+  const content = BUILTIN_SKILL_CONTENT[name]
+  if (typeof content !== "string" || content.length === 0) {
+    throw new Error(`builtin skill "${name}" has no inlined content`)
+  }
   const entry: BuiltinSkill = { name, location, content }
   cache.set(name, entry)
   return entry

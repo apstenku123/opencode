@@ -69,7 +69,18 @@ export function fallbackSanitization(content: string): string {
 
 export async function parse(filePath: string) {
   const template = await Filesystem.readText(filePath)
+  return parseString(template, filePath)
+}
 
+/**
+ * Parse markdown content already loaded into memory. Used by the built-in
+ * skill pack where the `SKILL.md` files are inlined at bundle time and the
+ * `filePath` is a synthetic bunfs path that cannot be `open`ed at runtime.
+ *
+ * Keeps the `FrontmatterError` path identical so callers can branch on
+ * `FrontmatterError.isInstance(err)` regardless of load source.
+ */
+export function parseString(template: string, displayPath: string) {
   try {
     const md = matter(template)
     return md
@@ -79,8 +90,8 @@ export async function parse(filePath: string) {
     } catch (err) {
       throw new FrontmatterError(
         {
-          path: filePath,
-          message: `${filePath}: Failed to parse YAML frontmatter: ${err instanceof Error ? err.message : String(err)}`,
+          path: displayPath,
+          message: `${displayPath}: Failed to parse YAML frontmatter: ${err instanceof Error ? err.message : String(err)}`,
         },
         { cause: err },
       )

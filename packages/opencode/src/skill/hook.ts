@@ -144,6 +144,7 @@ export const maybeAutoExtractSkill = Effect.fn("Skill.maybeAutoExtractSkill")(fu
       description: candidate.suggestedDescription,
       location: filePath,
       content: candidate.content,
+      scope: "auto",
     }
 
     yield* skill.notifyHotInserted(info)
