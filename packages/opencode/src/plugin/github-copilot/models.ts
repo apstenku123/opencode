@@ -318,21 +318,53 @@ export namespace CopilotModels {
     existing: Record<string, Model> = {},
     proxyUrl?: string,
     plan?: string,
+    proxy?: { token?: string; envelope?: boolean },
   ): Promise<Record<string, Model>> {
-    const target = proxyUrl ? new URL("/models", proxyUrl).href : `${baseURL}/models`
-    // Shared HTTP client: picks up NODE_EXTRA_CA_CERTS automatically and
-    // applies the unified timeout; we intentionally disable retry here
-    // since the caller (`aliasModels`) already has a fallback catalog.
-    const res = await HttpClient.request(target, {
-      headers,
-      retry: false,
-      throwOnError: false,
-      timeoutMs: 5_000,
-    })
-    if (!res.ok) {
-      throw new Error(`Failed to fetch models: ${res.status}`)
+    // When the account is configured for the Rust-compatible envelope proxy,
+    // `/models` also needs to be wrapped as `POST {proxy}/fetch` — URL
+    // rewrite (`{proxy}/models`) returns 404 because GCP fetch-proxy only
+    // exposes `/fetch`.
+    const useEnvelope =
+      proxyUrl && (proxy?.envelope === true || process.env.OPENCODE_COPILOT_PROXY_ENVELOPE === "1")
+    let data: z.infer<typeof schema>
+    if (useEnvelope) {
+      const upstream = `${baseURL}/models`
+      const hdr: Record<string, string> = {}
+      if (typeof headers === "object" && !Array.isArray(headers)) {
+        for (const [k, v] of Object.entries(headers as Record<string, string>)) hdr[k] = v
+      }
+      const envBody = JSON.stringify({ url: upstream, method: "GET", headers: hdr, timeout_ms: 10_000 })
+      const res = await HttpClient.request(`${proxyUrl}/fetch`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          ...(proxy?.token ? { Authorization: `Bearer ${proxy.token}` } : {}),
+        },
+        body: envBody,
+        retry: false,
+        throwOnError: false,
+        timeoutMs: 15_000,
+      })
+      if (!res.ok) throw new Error(`Failed to fetch models: ${res.status}`)
+      const env = (await res.json()) as { status_code?: number; body?: string }
+      if (!env.status_code || env.status_code >= 400) {
+        throw new Error(`Failed to fetch models: ${env.status_code ?? "no-status"}`)
+      }
+      data = schema.parse(JSON.parse(env.body ?? "{}"))
+    } else {
+      const target = proxyUrl ? new URL("/models", proxyUrl).href : `${baseURL}/models`
+      const res = await HttpClient.request(target, {
+        headers,
+        retry: false,
+        throwOnError: false,
+        timeoutMs: 5_000,
+      })
+      if (!res.ok) {
+        throw new Error(`Failed to fetch models: ${res.status}`)
+      }
+      data = schema.parse(await res.json())
     }
-    const data = schema.parse(await res.json())
 
     const result = { ...existing }
     const gated = retainForPlan(data.data, plan)

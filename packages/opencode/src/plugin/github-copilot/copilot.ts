@@ -1273,6 +1273,24 @@ function parseRetryAfterHeader(value: string | null): number | undefined {
 export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   const sdk = input.client
   await Effect.runPromise(migrate().pipe(Effect.provide(Auth.defaultLayer), Effect.provide(AppFileSystem.defaultLayer))).catch(() => [])
+  // Drain proxy metadata collected by `migrate()` from legacy credential
+  // files into the connection store. Forces `envelope=true` because those
+  // creds come from the Rust CLI GCP fetch-proxy, which only exposes the
+  // envelope protocol (`POST {proxy}/fetch`).
+  {
+    const { proxyImports } = await import("./auth")
+    if (proxyImports.size > 0) {
+      let state = await readState()
+      let changed = false
+      for (const [key, item] of proxyImports) {
+        const conn = state.connections[key]
+        if (conn?.proxyUrl === item.url && conn?.proxyToken === item.token && conn?.envelope === true) continue
+        state = upsert(state, key, { proxyUrl: item.url, proxyToken: item.token, envelope: true })
+        changed = true
+      }
+      if (changed) await writeState(state)
+    }
+  }
   const premium = new Map<string, Set<string>>()
   const { AppRuntime } = await import("@/effect/app-runtime")
   const resolvedCfg = await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.get())).catch(() => undefined)

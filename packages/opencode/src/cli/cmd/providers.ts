@@ -4,8 +4,11 @@ import * as prompts from "@clack/prompts"
 import { UI } from "../ui"
 import { ModelsDev } from "../../provider"
 import { classifyPlan, fetchQuota, formatQuotaBar, type Quota } from "../../plugin/github-copilot/quota"
-import { summarizeMigration } from "../../plugin/github-copilot/auth"
+import { migrate, proxyImports, summarizeMigration } from "../../plugin/github-copilot/auth"
 import { connectionFile } from "../../plugin/github-copilot/paths"
+import { AppFileSystem } from "@opencode-ai/shared/filesystem"
+import { Effect } from "effect"
+import { Store, upsert } from "../../plugin/github-copilot/connections"
 import {
   CopilotRuntimeState,
   getPoolRoutingConfig,
@@ -39,7 +42,30 @@ import { AppRuntime } from "@/effect/app-runtime"
 
 type PluginAuth = NonNullable<Hooks["auth"]>
 
+let migrated = false
+
 export async function allAuth() {
+  if (!migrated) {
+    migrated = true
+    await AppRuntime.runPromise(migrate()).catch(() => undefined)
+    if (proxyImports.size > 0) {
+      await AppRuntime.runPromise(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          const store = new Store(fs)
+          let state = yield* store.read()
+          let changed = false
+          for (const [key, item] of proxyImports) {
+            const conn = state.connections[key]
+            if (conn?.proxyUrl === item.url && conn?.proxyToken === item.token && conn?.envelope === true) continue
+            state = upsert(state, key, { proxyUrl: item.url, proxyToken: item.token, envelope: true })
+            changed = true
+          }
+          if (changed) yield* store.write(state)
+        }),
+      ).catch(() => undefined)
+    }
+  }
   return AppRuntime.runPromise(Auth.Service.use((svc) => svc.all()))
 }
 
@@ -615,7 +641,11 @@ export async function loadAccountStatuses() {
   const items = await Promise.all(
     accounts.map(async ([key, info]) => {
       const proxy = state.connections[key]?.proxyUrl
-        ? { url: state.connections[key]?.proxyUrl, token: state.connections[key]?.proxyToken }
+        ? {
+            url: state.connections[key]?.proxyUrl,
+            token: state.connections[key]?.proxyToken,
+            envelope: state.connections[key]?.envelope,
+          }
         : undefined
       try {
         log(`fetchQuota ${key} start`)
@@ -658,7 +688,7 @@ export async function loadAccountStatuses() {
       items.map(async (item) => {
         const key = item.status.key
         const conn = state.connections[key]
-        if (conn?.discovery?.at) {
+        if (conn?.discovery?.at && conn.discovery.ok !== false) {
           log(`probe: ${key} already discovered, skip`)
           return
         }
@@ -684,6 +714,7 @@ export async function loadAccountStatuses() {
             {},
             item.proxy?.url,
             item.quota.plan,
+            { token: item.proxy?.token, envelope: item.proxy?.envelope },
           )
           const ids = Object.values(models).map((m) => m.api.id)
           log(`probe: ${key} ok, ${ids.length} models`)
