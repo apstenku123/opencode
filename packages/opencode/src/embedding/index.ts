@@ -154,4 +154,70 @@ export {
   openAICompatLayer,
   type OpenAICompatConfig,
 } from "./openai"
-export { DEFAULT_TFIDF_VOCAB_SIZE, localTfIdfLayer, tfidfEmbed } from "./tfidf"
+export {
+  DEFAULT_TFIDF_VOCAB_SIZE,
+  localTfIdfLayer,
+  tfidfEmbed,
+  LocalTfIdfCorpus,
+  type LocalTfIdfCorpusFile,
+  type LocalTfIdfQueryResult,
+} from "./tfidf"
+
+// --------------------------------------------------------------------------
+// Provider selection
+// --------------------------------------------------------------------------
+
+import { openAICompatLayer as _openAICompatLayer, type OpenAICompatConfig } from "./openai"
+import { localTfIdfLayer as _localTfIdfLayer } from "./tfidf"
+
+/**
+ * Resolve the user-requested embedding provider. Honoured values:
+ *
+ *   - `"local"` / `"tfidf"` → always use the local TF-IDF fallback.
+ *   - `"api"` / `"openai"`  → use the HTTP provider; no fallback on auth
+ *                              failure (callers who *want* fallback should
+ *                              call {@link autoEmbeddingLayer}).
+ *   - anything else         → `"auto"` (HTTP if config present, else local).
+ *
+ * Reads `OPENCODE_EMBEDDING_PROVIDER` at call time so tests that mutate
+ * `process.env` between runs see the updated value.
+ */
+export function resolveEmbeddingProvider(): "local" | "api" | "auto" {
+  const raw = (process.env["OPENCODE_EMBEDDING_PROVIDER"] ?? "").trim().toLowerCase()
+  if (raw === "local" || raw === "tfidf") return "local"
+  if (raw === "api" || raw === "openai") return "api"
+  return "auto"
+}
+
+/**
+ * Build an {@link EmbeddingService} layer with an auto-fallback to the local
+ * TF-IDF provider. Selection rules:
+ *
+ *   - `OPENCODE_EMBEDDING_PROVIDER=local` forces the TF-IDF fallback.
+ *   - `OPENCODE_EMBEDDING_PROVIDER=api`   forces the HTTP provider (requires
+ *     `apiConfig`).
+ *   - Otherwise: use `apiConfig` when provided, else fall back to local.
+ *
+ * The returned layer never errors at construction time; any HTTP failure
+ * surfaces on the `embed`/`embedBatch` call sites. Callers that want a
+ * *runtime* fallback (e.g. silently swap to local on the first `401`) can
+ * wrap this layer with their own Effect-level retry strategy.
+ */
+export function autoEmbeddingLayer(options?: {
+  apiConfig?: OpenAICompatConfig
+  localVocabSize?: number
+}): Layer.Layer<EmbeddingService> {
+  const provider = resolveEmbeddingProvider()
+  const local = () => _localTfIdfLayer({ vocabSize: options?.localVocabSize })
+  if (provider === "local") return local()
+  if (provider === "api") {
+    if (!options?.apiConfig) {
+      throw new Error(
+        "OPENCODE_EMBEDDING_PROVIDER=api requires an apiConfig — pass one to autoEmbeddingLayer() or set provider=auto.",
+      )
+    }
+    return _openAICompatLayer(options.apiConfig)
+  }
+  // auto
+  return options?.apiConfig ? _openAICompatLayer(options.apiConfig) : local()
+}

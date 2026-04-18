@@ -17,6 +17,8 @@ import { Glob } from "@opencode-ai/shared/util/glob"
 import { Log } from "../util"
 import { Discovery } from "./discovery"
 import { Bm25Index } from "./bm25"
+import { hybridRank, type HybridHit, type HybridWeights } from "./retrieval"
+import { cosineSimilarity } from "@/embedding"
 
 const log = Log.create({ service: "skill" })
 const EXTERNAL_DIRS = [".claude", ".agents"]
@@ -89,6 +91,23 @@ export interface Interface {
    * matches (caller should fall back to substring `recommend()`).
    */
   readonly search: (query: string, topK?: number) => Effect.Effect<{ skill: Info; score: number }[]>
+  /**
+   * Hybrid BM25 ↔ embedding retrieval. When an `embedder` is supplied, the
+   * final ranking blends BM25 with cosine similarity against a per-skill
+   * TF-IDF / API embedding using configurable weights (default 0.4×BM25 +
+   * 0.6×cosine). When `embedder` is `undefined`, the call degrades to the
+   * same BM25-only path as {@link search} — the returned hits always carry
+   * their component scores so the caller can inspect which channel fired.
+   */
+  readonly searchHybrid: (input: {
+    query: string
+    topK?: number
+    weights?: HybridWeights
+    embedder?: {
+      embed: (text: string) => Float32Array
+      embedBatch?: (texts: ReadonlyArray<string>) => Float32Array[]
+    }
+  }) => Effect.Effect<HybridHit[]>
   /**
    * Inject a freshly-extracted skill into the live registry without a disk
    * re-scan. Used by the autoskill hot-insert pipeline after it writes the
@@ -295,7 +314,56 @@ export const layer = Layer.effect(
       return result
     })
 
-    return Service.of({ get, all, dirs, available, notifyHotInserted, search })
+    const searchHybrid = Effect.fn("Skill.searchHybrid")(function* (input: {
+      query: string
+      topK?: number
+      weights?: HybridWeights
+      embedder?: {
+        embed: (text: string) => Float32Array
+        embedBatch?: (texts: ReadonlyArray<string>) => Float32Array[]
+      }
+    }) {
+      const topK = input.topK ?? 5
+      const pool = Math.max(topK * 3, 10)
+      const s = yield* InstanceState.get(state)
+      const list = Object.values(s.skills)
+      if (list.length === 0) return [] as HybridHit[]
+      if (!s.bm25) s.bm25 = Bm25Index.build(list)
+      const bm25Hits = s.bm25.search(input.query, pool)
+
+      // Candidate pool: BM25 hits, or full corpus capped at `pool` when BM25
+      // returns nothing (cold-start semantic fallback).
+      const byName = new Map(list.map((sk) => [sk.name, sk]))
+      const candidates: Info[] = bm25Hits.length > 0
+        ? bm25Hits.map((h) => byName.get(h.skillName)).filter((v): v is Info => v !== undefined)
+        : list.slice(0, pool)
+
+      const cosineScores = new Map<string, number>()
+      if (input.embedder && candidates.length > 0) {
+        try {
+          const qVec = input.embedder.embed(input.query)
+          if (qVec.length > 0) {
+            const texts = candidates.map((c) => `${c.name}\n${c.description}\n${c.content}`)
+            const docVecs = input.embedder.embedBatch
+              ? input.embedder.embedBatch(texts)
+              : texts.map((t) => input.embedder!.embed(t))
+            if (docVecs.length === candidates.length) {
+              candidates.forEach((skill, i) => {
+                const vec = docVecs[i]
+                if (!vec) return
+                cosineScores.set(skill.name, cosineSimilarity(qVec, vec))
+              })
+            }
+          }
+        } catch (err) {
+          log.warn("hybrid embedder failed", { err })
+        }
+      }
+
+      return hybridRank(list, bm25Hits, cosineScores, topK, input.weights)
+    })
+
+    return Service.of({ get, all, dirs, available, notifyHotInserted, search, searchHybrid })
   }),
 )
 
