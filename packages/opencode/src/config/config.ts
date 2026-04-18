@@ -250,6 +250,59 @@ export const Info = z
         url: z.string().optional().describe("Enterprise URL"),
       })
       .optional(),
+    copilot: z
+      .object({
+        rateLimiter: z
+          .object({
+            enabled: z
+              .boolean()
+              .optional()
+              .describe(
+                "Enable the adaptive GitHub Copilot rate limiter. When true, dispatch passes through a per-account sliding-429-window semaphore that shrinks concurrency on burst and regrows after a clean window. Defaults to true.",
+              ),
+            slidingWindowMs: z
+              .number()
+              .int()
+              .min(1000)
+              .optional()
+              .describe("Sliding 429 window size in ms. Default 600000 (10 min)."),
+            cleanWindowMs: z
+              .number()
+              .int()
+              .min(1000)
+              .optional()
+              .describe("Required clean-window duration (ms) before capacity regrows. Default 300000 (5 min)."),
+            threshold: z
+              .number()
+              .min(0)
+              .optional()
+              .describe("429 density threshold (per-minute rate) that triggers shrink. Default 0.2."),
+            maxConcurrent: z
+              .number()
+              .int()
+              .min(1)
+              .optional()
+              .describe("Maximum per-account concurrency (upper bound). Default 7."),
+            minConcurrent: z
+              .number()
+              .int()
+              .min(1)
+              .optional()
+              .describe("Minimum per-account concurrency (floor when shrinking). Default 1."),
+            acquireTimeoutMs: z
+              .number()
+              .int()
+              .min(0)
+              .optional()
+              .describe("Max time (ms) acquire() will wait before rejecting. Default 30000."),
+          })
+          .optional()
+          .describe(
+            "Per-account adaptive semaphore that reacts to 429s over a sliding window. Mirrors Rust `copilot_rate_limiter.rs`.",
+          ),
+      })
+      .optional()
+      .describe("GitHub Copilot provider configuration"),
     compaction: z
       .object({
         auto: z.boolean().optional().describe("Enable automatic compaction when context is full (default: true)"),

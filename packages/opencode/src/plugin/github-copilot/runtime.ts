@@ -1,4 +1,5 @@
 import type { CopilotAuth } from "./auth"
+import type { CopilotRateLimiter } from "./rate-limiter"
 
 // ---------------------------------------------------------------------------
 // Constants mirroring `codex-rs/core/src/account_pool.rs`.
@@ -80,6 +81,13 @@ export type Runtime = {
   last: Record<string, number>
   feed: Event[]
   rate: Record<string, RateState>
+  /**
+   * Optional adaptive per-account rate limiter. Populated by the plugin
+   * bootstrap (`CopilotAuthPlugin`). `dispatch` routes through it when
+   * present to enforce an adaptive semaphore on top of the pool's per-
+   * account concurrency cap.
+   */
+  rateLimiter?: CopilotRateLimiter
 }
 
 export function emptyPool(): Pool {
@@ -88,6 +96,17 @@ export function emptyPool(): Pool {
 
 export function owner(limit = 1, minIntervalMs = 0): Runtime {
   return { pool: emptyPool(), limit, minIntervalMs, last: {}, feed: [], rate: {} }
+}
+
+/**
+ * Attach a {@link CopilotRateLimiter} to an existing runtime. Idempotent:
+ * replacing an attached limiter drains any pending waiters on the old one.
+ */
+export function attachRateLimiter(state: Runtime, limiter: CopilotRateLimiter) {
+  const previous = state.rateLimiter
+  state.rateLimiter = limiter
+  if (previous && previous !== limiter) previous.drain()
+  return state
 }
 
 export function event(state: Runtime, type: Event["type"], key: string, at = Date.now(), meta?: Partial<Omit<Event, "at" | "key" | "type" | "load">>) {

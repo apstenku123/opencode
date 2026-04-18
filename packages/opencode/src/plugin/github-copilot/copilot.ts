@@ -20,6 +20,7 @@ import {
 } from "./runtime"
 import { AccountPool, type Lease } from "./account-pool"
 import { openRateStore } from "./account-pool-sqlite"
+import { CopilotRateLimiter, copilotRateLimiterConfig, type Release as RateLimiterRelease } from "./rate-limiter"
 import path from "path"
 import { classifyPlan, fetchQuota } from "./quota"
 import { MessageV2 } from "@/session/message-v2"
@@ -86,6 +87,14 @@ export const CopilotRuntimeState = {
   },
   current: undefined as Runtime | undefined,
   pool: undefined as AccountPool | undefined,
+  /**
+   * Adaptive rate limiter keyed by account key. Populated during plugin
+   * boot and mirrors `runtime.rateLimiter`. Null-safe for non-copilot
+   * sessions.
+   */
+  rateLimiter(): CopilotRateLimiter | undefined {
+    return this.current?.rateLimiter
+  },
   info: {} as Record<string, { lane?: string; discovery: number; penalty: number; cooldown: boolean; selected?: boolean; selectedReason?: string[]; rejectedReason?: string[] }>,
   usage() {
     return usage(this.current)
@@ -906,12 +915,29 @@ export async function dispatch(input: {
   // `leaseRef` is updated in-place when an atomic `reassign` happens on 429;
   // the closure below reads from it so `release()` frees the *current* lease.
   const leaseRef = { lease: slot.lease }
+  // Acquire an adaptive-rate-limiter slot for the same account, if the
+  // runtime has a limiter attached. This sits on top of the pool lease and
+  // shrinks/grows capacity based on the 10-min 429 window. On reassign the
+  // slot is released for the old key and re-acquired for the new one.
+  const rateRef: { release?: RateLimiterRelease } = {}
+  if (input.runtime.rateLimiter) {
+    try {
+      rateRef.release = await input.runtime.rateLimiter.acquire(live.key)
+    } catch {
+      // Limiter timeout — fall through without the adaptive gate so we
+      // never permanently stall dispatch on a single slow account.
+    }
+  }
   const release = () => {
     if (leaseRef.lease) {
       leaseRef.lease.release()
       leaseRef.lease = undefined
     } else if (slot.fallbackRelease) {
       slot.fallbackRelease()
+    }
+    if (rateRef.release) {
+      rateRef.release.release()
+      rateRef.release = undefined
     }
   }
   const res = await dispatchOnce({
@@ -932,6 +958,19 @@ export async function dispatch(input: {
       try {
         const newLease = leaseRef.lease.reassign(failoverKey)
         leaseRef.lease = newLease
+        // Swap the rate-limiter slot to the failover account too — the
+        // adaptive gate must follow the actual dispatch target.
+        if (input.runtime.rateLimiter) {
+          if (rateRef.release) {
+            rateRef.release.release()
+            rateRef.release = undefined
+          }
+          try {
+            rateRef.release = await input.runtime.rateLimiter.acquire(failoverKey)
+          } catch {
+            // fall through — limiter disabled/unavailable for the failover
+          }
+        }
         // Re-read state (it was updated in the first attempt's body).
         const nextLoaded = await input.read()
         const nextState = syncAccount(nextLoaded, input.auths)
@@ -1000,6 +1039,9 @@ async function dispatchOnce(ctx: {
     // existing cooldown (Rust `set_exhaustion` semantics). Routed through
     // `pool.recordExhaustion` when a pool is attached so persistence picks
     // it up in the background flush.
+    // Also feed the adaptive rate-limiter's sliding window so it can
+    // shrink concurrency across subsequent dispatches.
+    input.runtime.rateLimiter?.record429(live.key)
     const retryAfter = res.headers.get("retry-after") ?? res.headers.get("Retry-After")
     const retryAfterMs = parseRetryAfterHeader(retryAfter)
     const result = input.pool
@@ -1190,10 +1232,14 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   await Effect.runPromise(migrate().pipe(Effect.provide(Auth.defaultLayer), Effect.provide(AppFileSystem.defaultLayer))).catch(() => [])
   const premium = new Map<string, Set<string>>()
   const { AppRuntime } = await import("@/effect/app-runtime")
-  const cfg = copilotRuntimeConfig(
-    await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.get())).catch(() => undefined),
-  )
+  const resolvedCfg = await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.get())).catch(() => undefined)
+  const cfg = copilotRuntimeConfig(resolvedCfg)
   const runtime = owner(cfg.limit, cfg.minIntervalMs)
+  // Attach the adaptive rate limiter. Driven by `copilot.rateLimiter.*`
+  // config (see `rate-limiter.ts::copilotRateLimiterConfig`). Env
+  // overrides (`OPENCODE_COPILOT_RATE_LIMITER_*`) are resolved there.
+  const rlOpts = copilotRateLimiterConfig(resolvedCfg as any)
+  runtime.rateLimiter = new CopilotRateLimiter(rlOpts)
   const discoveryBarrier = createDiscoveryBarrier()
   CopilotRuntimeState.current = runtime
   // Boot the AccountPool against the live runtime + SQLite cooldown store.
