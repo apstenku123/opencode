@@ -36,6 +36,9 @@ import { pathToFileURL } from "url"
 import { Filesystem } from "../util"
 import { Hash } from "@opencode-ai/shared/util/hash"
 import { ACPSessionManager } from "./session"
+import { Elicitation } from "./elicitation"
+import { PlanMode } from "./plan-mode"
+import { Replay } from "./replay"
 import type { ACPConfig } from "./types"
 import { Provider } from "../provider"
 import { ModelID, ProviderID } from "../provider/schema"
@@ -147,6 +150,8 @@ export namespace ACP {
     private bashSnapshots = new Map<string, string>()
     private toolStarts = new Set<string>()
     private permissionQueues = new Map<string, Promise<void>>()
+    private elicitationCounter = new Elicitation.Counter()
+    private planModeTracker = new PlanMode.Tracker()
     private permissionOptions: PermissionOption[] = [
       { optionId: "once", kind: "allow_once", name: "Allow once" },
       { optionId: "always", kind: "allow_always", name: "Always allow" },
@@ -567,6 +572,11 @@ export namespace ACP {
             fork: {},
             list: {},
             resume: {},
+          },
+          _meta: {
+            ...PlanMode.initializeMeta(),
+            ...Replay.initializeMeta(Replay.isAvailable()),
+            elicitation: { supported: true },
           },
         },
         authMethods: [authMethod],
@@ -1312,7 +1322,40 @@ export namespace ACP {
       if (!availableModes.some((mode) => mode.id === params.modeId)) {
         throw new Error(`Agent not found: ${params.modeId}`)
       }
+      const { changed, previous } = this.planModeTracker.observe(params.sessionId, params.modeId)
       this.sessionManager.setMode(params.sessionId, params.modeId)
+      if (changed && (PlanMode.isPlanMode(params.modeId) || PlanMode.isPlanMode(previous))) {
+        await PlanMode.announceTransition(this.connection, {
+          sessionId: params.sessionId,
+          from: previous,
+          to: params.modeId,
+          automatic: false,
+        })
+      }
+    }
+
+    /**
+     * Unstable ACP extension: stubbed session replay. Always throws
+     * `Replay.NOT_IMPLEMENTED_CODE` with the Stream-G dependency hint
+     * until the rollout module lands. Exposed publicly so the ACP router
+     * surfaces the structured error to clients that opted into the
+     * `_meta.replay` capability.
+     */
+    async unstable_replaySession(params: { sessionId: string; fromIndex?: number; toIndex?: number; rate?: number }) {
+      return Replay.handleOrReject(params)
+    }
+
+    /**
+     * Issue an out-of-band elicitation to the ACP client for the given
+     * session. Bumps the per-session counter and drives the request via
+     * the permission channel; clients with the elicitation extension
+     * enabled render a text-entry UI, others see a binary
+     * submit/cancel dialog.
+     */
+    async elicit(request: Omit<Elicitation.Request, "id"> & { id?: string }): Promise<Elicitation.Response> {
+      const count = this.elicitationCounter.next(request.sessionId)
+      const id = request.id ?? `oob_${count}`
+      return Elicitation.ask(this.connection, { ...request, id })
     }
 
     async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
