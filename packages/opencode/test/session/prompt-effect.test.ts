@@ -200,12 +200,16 @@ function makeHttp() {
   const trunc = Truncate.layer.pipe(Layer.provideMerge(deps))
   const proc = SessionProcessor.layer.pipe(Layer.provide(summary), Layer.provideMerge(deps))
   const compact = SessionCompaction.layer.pipe(Layer.provideMerge(proc), Layer.provideMerge(deps))
+  // Round-2: the autobest observer registers itself lazily inside the
+  // runLoop via `SessionAutobestObserver.ensureRegistered`, so no extra
+  // layer wiring is needed beyond round-1 composition.
   return Layer.mergeAll(
     TestLLMServer.layer,
     SessionPrompt.layer.pipe(
       Layer.provide(SessionRevert.defaultLayer),
       Layer.provide(summary),
       Layer.provide(AdaptiveHooks.defaultLayer),
+      Layer.provide(SubagentRegistry.defaultLayer),
       Layer.provideMerge(run),
       Layer.provideMerge(compact),
       Layer.provideMerge(proc),
@@ -704,6 +708,11 @@ it.live(
         const prompt = yield* SessionPrompt.Service
         const sessions = yield* Session.Service
 
+        // Round-2: the autobest observer fires inside the runLoop's
+        // postIteration hook. For Step A it persists the candidate via
+        // `applyAutobest` and returns `Continue` (no Inject), so the loop
+        // ends after the single LLM reply. Step B/C/D inject paths are
+        // exercised by `test/autobest/steps.test.ts`.
         yield* llm.text(`- tighten failing repro
 - rerun focused lane`)
 
@@ -712,20 +721,12 @@ it.live(
         yield* user(chat.id, "hi")
 
         yield* prompt.loop({ sessionID: chat.id })
-        // SessionAutobestObserver runs on the SessionStatus.Event.Idle bus
-        // subscription with void Effect.runPromise(...), so its writes land
-        // after prompt.loop resolves. Wait for the observer's autobest.result
-        // history write before reading the derived autobest state.
+        // The autobest observer writes `autobest.result` synchronously
+        // inside `Session.applyAutobest` while still inside the loop, so
+        // by the time `prompt.loop` resolves the history event is present.
+        // Read it directly without polling.
         const history = yield* Effect.promise(() => import("../../src/history"))
-        const result = yield* Effect.promise(async () => {
-          const deadline = Date.now() + 5_000
-          while (Date.now() < deadline) {
-            const item = await history.last(chat.id, "autobest.result")
-            if (item) return item
-            await Bun.sleep(10)
-          }
-          throw new Error("timed out waiting for autobest.result history event")
-        })
+        const result = yield* Effect.promise(() => history.last(chat.id, "autobest.result"))
         const state = yield* sessions.getAutobest(chat.id)
         expect(state.active?.key).toBe("tighten failing repro")
         expect(result).toMatchObject({

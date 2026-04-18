@@ -215,27 +215,32 @@ export namespace AdaptiveHooks {
   export const layer = Layer.effect(
     Service,
     Effect.gen(function* () {
+      // Observers are process-wide — they describe code that hooks into
+      // every session loop. We deliberately keep them in a layer-local
+      // closure (NOT in InstanceState) so registration happens at layer
+      // build time without requiring an active `Instance` context. The
+      // per-session AdaptiveState bags DO live in InstanceState — those
+      // are accessed only at hook invocation time when Instance is active.
+      const observers: Observer[] = []
       const data = yield* InstanceState.make(
         Effect.fn("AdaptiveHooks.state")(function* () {
-          const observers: Observer[] = []
           const sessions = new Map<SessionID, AdaptiveState.Value>()
-          return { observers, sessions }
+          return { sessions }
         }),
       )
 
       const getState = InstanceState.get(data)
 
       const register: Interface["register"] = (observer) =>
-        Effect.gen(function* () {
-          const state = yield* getState
-          state.observers.push(observer)
+        Effect.sync(() => {
+          observers.push(observer)
           return () => {
-            const idx = state.observers.indexOf(observer)
-            if (idx >= 0) state.observers.splice(idx, 1)
+            const idx = observers.indexOf(observer)
+            if (idx >= 0) observers.splice(idx, 1)
           }
         })
 
-      const registered: Interface["registered"] = Effect.map(getState, (state) => state.observers.map((o) => o.name))
+      const registered: Interface["registered"] = Effect.sync(() => observers.map((o) => o.name))
 
       const stateFor: Interface["stateFor"] = (sessionID) =>
         Effect.map(getState, (state) => {
@@ -254,10 +259,9 @@ export namespace AdaptiveHooks {
 
       const runPreIteration: Interface["runPreIteration"] = (args) =>
         Effect.gen(function* () {
-          const state = yield* getState
           const bag = yield* stateFor(args.sessionID)
           bag.iteration = args.step
-          for (const obs of state.observers) {
+          for (const obs of observers) {
             if (!obs.preIteration) continue
             yield* obs.preIteration(bag, args)
           }
@@ -265,11 +269,10 @@ export namespace AdaptiveHooks {
 
       const runPostIteration: Interface["runPostIteration"] = (args) =>
         Effect.gen(function* () {
-          const state = yield* getState
           const bag = yield* stateFor(args.sessionID)
           if (args.assistantText !== undefined) bag.lastAssistantText = args.assistantText
           const directives: Directive[] = []
-          for (const obs of state.observers) {
+          for (const obs of observers) {
             if (!obs.postIteration) continue
             directives.push(yield* obs.postIteration(bag, args))
           }
@@ -278,10 +281,9 @@ export namespace AdaptiveHooks {
 
       const runPreBreak: Interface["runPreBreak"] = (args) =>
         Effect.gen(function* () {
-          const state = yield* getState
           const bag = yield* stateFor(args.sessionID)
           const directives: Directive[] = []
-          for (const obs of state.observers) {
+          for (const obs of observers) {
             if (!obs.preBreak) continue
             directives.push(yield* obs.preBreak(bag, args))
           }

@@ -60,20 +60,36 @@ export namespace SessionAutosteer {
 
   export const initialState: State = { stagnationCount: 0 }
 
+  /**
+   * Optional overrides for the heuristic. Any field left undefined falls
+   * back to the corresponding `SessionAutosteer.*` constant. Plumbed through
+   * config (`autosteering.{stagnationTrigger,similarityThreshold,...}`) so
+   * users can tune detection without recompiling.
+   */
+  export interface Thresholds {
+    stagnationTrigger?: number
+    similarityThreshold?: number
+    minResponseLength?: number
+    planningPhrases?: ReadonlyArray<string>
+    actionMarkers?: ReadonlyArray<string>
+  }
+
   /** True iff `text` contains a planning phrase AND no action marker. */
-  export function isPlanningOnly(text: string): boolean {
+  export function isPlanningOnly(text: string, thresholds?: Thresholds): boolean {
     if (!text) return false
+    const phrases = thresholds?.planningPhrases ?? PLANNING_PHRASES
+    if (phrases.length === 0) return false
     const lower = text.toLowerCase()
-    const hasPlanning = PLANNING_PHRASES.some((p) => lower.includes(p))
+    const hasPlanning = phrases.some((p) => lower.includes(p.toLowerCase()))
     if (!hasPlanning) return false
-    const hasAction = hasActionMarkers(text)
-    return !hasAction
+    return !hasActionMarkers(text, thresholds)
   }
 
   /** True iff `text` shows any concrete action marker (code fence, Edited/Created/Ran). */
-  export function hasActionMarkers(text: string): boolean {
+  export function hasActionMarkers(text: string, thresholds?: Thresholds): boolean {
     if (!text) return false
-    for (const marker of ACTION_MARKERS) {
+    const markers = thresholds?.actionMarkers ?? ACTION_MARKERS
+    for (const marker of markers) {
       if (text.includes(marker)) return true
     }
     return false
@@ -107,14 +123,25 @@ export namespace SessionAutosteer {
    * Pure-function detector. Given the previous response (via state) and the
    * new `response`, decide whether it is stagnant. Mirrors the Rust planning
    * + similarity logic but leaves counter/injection decisions to `evaluate`.
+   *
+   * Thresholds are optional — defaults reproduce the Rust behaviour.
+   * Plumbed through `evaluate(state, response, thresholds)` and ultimately
+   * fed by config (`autosteering.{similarityThreshold,...}`).
    */
-  export function detectStagnation(previous: string | undefined, response: string): boolean {
+  export function detectStagnation(
+    previous: string | undefined,
+    response: string,
+    thresholds?: Thresholds,
+  ): boolean {
     if (!response || !response.trim()) return false
-    if (isPlanningOnly(response)) return true
+    const minLen = thresholds?.minResponseLength ?? 0
+    if (minLen > 0 && response.length < minLen) return false
+    if (isPlanningOnly(response, thresholds)) return true
     if (previous && previous.trim()) {
       const a = response.slice(0, SIMILARITY_PREFIX_CHARS)
       const b = previous.slice(0, SIMILARITY_PREFIX_CHARS)
-      if (jaccardSimilarity(a, b) > SIMILARITY_THRESHOLD) return true
+      const threshold = thresholds?.similarityThreshold ?? SIMILARITY_THRESHOLD
+      if (jaccardSimilarity(a, b) > threshold) return true
     }
     return false
   }
@@ -138,16 +165,17 @@ export namespace SessionAutosteer {
    *   - if not stagnant, reset the counter to 0
    *   - always remember the last response for next time
    */
-  export function evaluate(state: State, response: string): Evaluation {
+  export function evaluate(state: State, response: string, thresholds?: Thresholds): Evaluation {
     if (!response || !response.trim()) {
       return { nudge: false, nextState: state, stagnant: false }
     }
     const prev = state.previousResponse
-    const stagnant = detectStagnation(prev, response)
+    const stagnant = detectStagnation(prev, response, thresholds)
     const nextPrev = response.slice(0, SIMILARITY_PREFIX_CHARS)
     if (stagnant) {
       const nextCount = state.stagnationCount + 1
-      const nudge = nextCount >= STAGNATION_TRIGGER
+      const trigger = thresholds?.stagnationTrigger ?? STAGNATION_TRIGGER
+      const nudge = nextCount >= trigger
       return {
         nudge,
         stagnant: true,

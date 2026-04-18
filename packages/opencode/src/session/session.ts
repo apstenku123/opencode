@@ -398,6 +398,7 @@ export interface Interface {
     sessionID: SessionID
     text: string
     time?: number
+    synthetic?: boolean
   }) => Effect.Effect<MessageID>
 }
 
@@ -882,6 +883,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
         messageID: id,
         type: "text",
         text: input.text,
+        ...(input.synthetic ? { synthetic: true as const } : {}),
       } satisfies MessageV2.TextPart)
       yield* touch(input.sessionID)
       return msg.id

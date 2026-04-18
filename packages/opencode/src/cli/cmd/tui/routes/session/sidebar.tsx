@@ -1,7 +1,8 @@
 import { useSync } from "@tui/context/sync"
-import { createMemo, Show } from "solid-js"
+import { createMemo, createSignal, onCleanup, onMount, Show } from "solid-js"
 import { useTheme } from "../../context/theme"
 import { useTuiConfig } from "../../context/tui-config"
+import { useEvent } from "@tui/context/event"
 import { InstallationVersion } from "@/installation/version"
 import { TuiPluginRuntime } from "../../plugin"
 
@@ -11,8 +12,25 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
   const sync = useSync()
   const { theme } = useTheme()
   const tuiConfig = useTuiConfig()
+  const event = useEvent()
   const session = createMemo(() => sync.session.get(props.sessionID))
   const scrollAcceleration = createMemo(() => getScrollAcceleration(tuiConfig))
+
+  // Per-session cumulative autosteer-nudge counter — opencode's analog of
+  // the Rust right_panel.rs:804-807 `autosteering_count` per-agent display.
+  // Increments off the bus event published by `SessionAutosteerObserver`.
+  const [autosteerCount, setAutosteerCount] = createSignal(0)
+  onMount(() => {
+    const off = event.subscribe(
+      (evt: { type: string; properties?: Record<string, unknown> }) => {
+        if (evt.type !== "session.autosteer.nudge") return
+        if (evt.properties?.sessionID !== props.sessionID) return
+        const count = typeof evt.properties?.count === "number" ? evt.properties.count : autosteerCount() + 1
+        setAutosteerCount(count)
+      },
+    )
+    onCleanup(off)
+  })
 
   return (
     <Show when={session()}>
@@ -56,6 +74,14 @@ export function Sidebar(props: { sessionID: string; overlay?: boolean }) {
             <TuiPluginRuntime.Slot name="sidebar_content" session_id={props.sessionID} />
           </box>
         </scrollbox>
+
+        <Show when={autosteerCount() > 0}>
+          <box flexShrink={0} paddingTop={1}>
+            <text fg={theme.textMuted}>
+              ⚠ Autosteer: <span style={{ fg: theme.text }}>{autosteerCount()}</span>
+            </text>
+          </box>
+        </Show>
 
         <box flexShrink={0} gap={1} paddingTop={1}>
           <TuiPluginRuntime.Slot name="sidebar_footer" mode="single_winner" session_id={props.sessionID}>

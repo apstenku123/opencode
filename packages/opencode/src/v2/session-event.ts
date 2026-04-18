@@ -480,6 +480,29 @@ export namespace SessionEvent {
     modelUsed: Schema.String.pipe(Schema.optional),
     /** Action scheduled as next user turn (auto-continue payload). */
     resultingAction: Schema.String.pipe(Schema.optional),
+    /**
+     * Whether the cycle's "And what's next?" follow-up has been dispatched.
+     * Mirror of `Session::what_next_asks_used_this_cycle` in Rust.
+     */
+    whatNextAsked: Schema.Boolean.pipe(Schema.optional),
+    /**
+     * Compact-window correlation id used for Step B plan check. Optional —
+     * absent when the compact pipeline has not produced a window yet.
+     */
+    compactWindowID: Schema.Number.pipe(Schema.optional),
+    /** Truncated compact-window snippet shown for diagnostics. */
+    compactSnippet: Schema.String.pipe(Schema.optional),
+    /**
+     * Grounding outcome side-band. Populated when Step A `complaint=true`
+     * triggered the grounding dispatch in `autobest/grounding.ts`.
+     */
+    grounding: Schema.Struct({
+      outcome: Schema.Union([Schema.Literal("skipped"), Schema.Literal("dispatched")]),
+      reason: Schema.String.pipe(Schema.optional),
+      agentsSpawned: Schema.Number.pipe(Schema.optional),
+      toolsUsed: Schema.Array(Schema.String).pipe(Schema.optional),
+      turn: Schema.Number,
+    }).pipe(Schema.optional),
   }) {
     static create(
       input: BaseInput & {
@@ -494,6 +517,16 @@ export namespace SessionEvent {
         elapsedMs?: number
         modelUsed?: string
         resultingAction?: string
+        whatNextAsked?: boolean
+        compactWindowID?: number
+        compactSnippet?: string
+        grounding?: {
+          outcome: "skipped" | "dispatched"
+          reason?: string
+          agentsSpawned?: number
+          toolsUsed?: readonly string[]
+          turn: number
+        }
       },
     ) {
       return new Autobest({
@@ -512,6 +545,10 @@ export namespace SessionEvent {
         elapsedMs: input.elapsedMs,
         modelUsed: input.modelUsed,
         resultingAction: input.resultingAction,
+        whatNextAsked: input.whatNextAsked,
+        compactWindowID: input.compactWindowID,
+        compactSnippet: input.compactSnippet,
+        grounding: input.grounding,
       })
     }
   }

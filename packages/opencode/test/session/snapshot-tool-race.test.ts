@@ -162,6 +162,7 @@ function makeHttp() {
       Layer.provide(SessionRevert.defaultLayer),
       Layer.provide(SessionSummary.defaultLayer),
       Layer.provide(AdaptiveHooks.defaultLayer),
+      Layer.provide(SubagentRegistry.defaultLayer),
       Layer.provideMerge(run),
       Layer.provideMerge(compact),
       Layer.provideMerge(proc),

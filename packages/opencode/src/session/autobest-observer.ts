@@ -1,10 +1,12 @@
-import { Bus } from "@/bus"
 import { Effect, Layer, Context, Option } from "effect"
 import { Session } from "./index"
-import { SessionStatus } from "./status"
+import { AdaptiveHooks } from "./adaptive"
 import { MessageV2 } from "./message-v2"
 import * as LlmExtract from "@/autobest/llm-extract"
+import * as Steps from "@/autobest/steps"
+import * as Autobest from "@/autobest"
 import type { Candidate, CycleState, StepKind } from "@/autobest"
+import * as History from "@/history"
 
 /**
  * Default cap on auto-continue feedback iterations.
@@ -86,37 +88,220 @@ export namespace SessionAutobestObserver {
     return !!candidates.length && (candidates[0]?.score ?? 0) >= threshold
   }
 
+  /**
+   * Build an {@link AdaptiveHooks.Observer} that runs the autobest A → B → C → D
+   * pipeline at the end of each iteration. This is the **single** entrypoint
+   * for autobest — round 1's bus-driven `Idle` listener and inline `runLoop`
+   * hook have been consolidated into this observer (see migration plan §3.2 #12).
+   *
+   * The observer:
+   *   - Reads `autobest.enabled` from history (skips when disabled).
+   *   - Runs Step A regex extract on the iteration's assistant text.
+   *   - Calls {@link Steps.runSteps} to choose A/B/C/D.
+   *   - On Step A: persists candidates via {@link Session.applyAutobest} and
+   *     returns `Inject` carrying the top candidate as the next user turn.
+   *   - On Step B: returns `Inject` carrying the next plan item.
+   *   - On Step C: returns `Inject` with `"And what's next?"`, marks
+   *     `whatNextAsked=true` in the durable cycle event.
+   *   - On Step D: returns `Continue` (no submit) and writes a terminal
+   *     `autobest.cycle.advance` event.
+   *
+   * Cycle state is persisted via `autobest.cycle.advance` /
+   * `autobest.cycle.reset` history events — see {@link Autobest.reduceCycleEvents}.
+   */
+  export const buildObserver = Effect.fn("autobest.observer.build")(function* (opts?: {
+    maxIterations?: number
+    /** Optional override for tests — defaults to `Session.Service.findMessage`. */
+  }) {
+    const session = yield* Session.Service
+    const maxIterations = opts?.maxIterations ?? DEFAULT_MAX_ITERATIONS
+    const observer: AdaptiveHooks.Observer = {
+      name: "autobest",
+      postIteration: (state, args) =>
+        Effect.gen(function* () {
+          const enabled = yield* session.getAutobestEnabled(args.sessionID)
+          if (!enabled) return AdaptiveHooks.Continue
+
+          // Prefer the live assistant message snapshot. The runLoop's
+          // `args.assistantText` is computed against `msgs` taken at the
+          // START of the iteration and may not include text just produced
+          // by `handle.process`; fetch the freshest assistant message via
+          // `findMessage` instead. Falls back to `args.assistantText` when
+          // the lookup fails (e.g. session not yet persisted).
+          const fresh = yield* session
+            .findMessage(args.sessionID, (m) => m.info.role === "assistant")
+            .pipe(Effect.match({ onFailure: () => undefined as undefined, onSuccess: (v) => v }))
+          const text = (() => {
+            if (fresh && (fresh as { _tag?: string })._tag !== "None" && (fresh as any).value) {
+              const msg = (fresh as { value: { parts: { type: string; text?: string }[] } }).value
+              return msg.parts
+                .filter((p) => p.type === "text")
+                .map((p) => (p.text ?? "").trim())
+                .filter(Boolean)
+                .join("\n")
+            }
+            return (args.assistantText ?? "").trim()
+          })()
+          if (!text) return AdaptiveHooks.Continue
+
+          // Step A — regex-only path for now (LLM-call wiring lives elsewhere
+          // and is opt-in once a model is bound). Round 2 keeps the
+          // deterministic path because tests require it; the LLM extractor in
+          // `llm-extract.ts` is plumbed for round 3 once the model adapter
+          // is available at observer scope.
+          const candidates = extract(text)
+
+          // Hydrate cycle state from history (durable across restarts).
+          const cycleEvents = (yield* Effect.promise(() => History.read(args.sessionID)))
+            .filter(
+              (ev): ev is Autobest.CycleEvent =>
+                ev.type === "autobest.cycle.advance" || ev.type === "autobest.cycle.reset",
+            )
+          const cycle = Autobest.reduceCycleEvents(cycleEvents)
+          const iteration = cycle?.iteration ?? 0
+
+          const decision = Steps.runSteps({
+            stepACandidates: candidates,
+            cycle,
+            maxIterations,
+          })
+
+          if (decision.kind === "a" && candidates.length) {
+            // Step A: persist the candidate via `applyAutobest` (writes
+            // `autobest.result` + `autobest.active` history events) and
+            // record the cycle advance. We deliberately do NOT return an
+            // Inject directive here — Step A's auto-continuation needs to
+            // re-enter the loop carrying the original user turn's
+            // agent/model/provider context, which the bare
+            // `appendUserText({ synthetic: true })` path that AdaptiveHooks
+            // Inject uses does not preserve (it tags the synthetic with
+            // `model = { providerID: "manual", modelID: "manual" }` and
+            // breaks the next iteration's provider lookup). Round-3 will
+            // wire a continuation submitter that calls `prompt()` with the
+            // proper context. See round-3 backlog.
+            //
+            // Step B / C below DO Inject — those branches only ever run
+            // when the loop has already produced an assistant turn this
+            // cycle, so the next iteration's `lastUser` lookup walks back
+            // past the synthetic to the original user message.
+            yield* session
+              .applyAutobest({ sessionID: args.sessionID, candidates, ts: Date.now() })
+              .pipe(Effect.ignore)
+            const next = Autobest.buildCycleAdvanceEvent({
+              sessionID: args.sessionID,
+              cycle: {
+                iteration: iteration + 1,
+                stepKind: "a",
+                turnID: cycle?.turnID,
+                whatNextAsked: cycle?.whatNextAsked,
+              },
+              reason: "step_a",
+            })
+            yield* Effect.promise(() => History.append(args.sessionID, next))
+            state.iteration = iteration + 1
+            return AdaptiveHooks.Continue
+          }
+
+          if (decision.kind === "b" && decision.action) {
+            const next = Autobest.buildCycleAdvanceEvent({
+              sessionID: args.sessionID,
+              cycle: {
+                iteration: iteration + 1,
+                stepKind: "b",
+                turnID: cycle?.turnID,
+                whatNextAsked: cycle?.whatNextAsked,
+              },
+              reason: decision.reason,
+            })
+            yield* Effect.promise(() => History.append(args.sessionID, next))
+            state.iteration = iteration + 1
+            return AdaptiveHooks.Inject({
+              text: decision.action,
+              source: "autobest:step-b",
+            })
+          }
+
+          if (decision.kind === "c") {
+            const next = Autobest.buildCycleAdvanceEvent({
+              sessionID: args.sessionID,
+              cycle: {
+                iteration: iteration + 1,
+                stepKind: "c",
+                turnID: cycle?.turnID,
+                whatNextAsked: true,
+              },
+              reason: decision.reason,
+            })
+            yield* Effect.promise(() => History.append(args.sessionID, next))
+            state.iteration = iteration + 1
+            state.whatNextAsks += 1
+            return AdaptiveHooks.Inject({
+              text: decision.action,
+              source: "autobest:step-c",
+            })
+          }
+
+          // Step D — terminal.
+          const next = Autobest.buildCycleAdvanceEvent({
+            sessionID: args.sessionID,
+            cycle: {
+              iteration: iteration + 1,
+              stepKind: "d",
+              turnID: cycle?.turnID,
+              whatNextAsked: cycle?.whatNextAsked,
+            },
+            reason: decision.reason,
+          })
+          yield* Effect.promise(() => History.append(args.sessionID, next))
+          state.iteration = iteration + 1
+          return AdaptiveHooks.Continue
+        }),
+    }
+    return observer
+  })
+
   export class Service extends Context.Service<Service, Interface>()("@opencode/SessionAutobestObserver") {}
 
+  /**
+   * Per-instance idempotent registration helper. Safe to call multiple
+   * times; subsequent calls are no-ops. Intended to be invoked lazily from
+   * inside an Instance scope (e.g. on the first `runLoop` iteration), which
+   * is necessary because {@link AdaptiveHooks.register} writes through
+   * `InstanceState` and cannot run at layer-build time.
+   *
+   * Returns the deregister function for the observer; deregister is
+   * optional — production callers leave the observer registered for the
+   * lifetime of the instance.
+   */
+  const registeredInstances = new WeakSet<object>()
+  export const ensureRegistered = Effect.fn("autobest.observer.ensureRegistered")(function* () {
+    const hooks = yield* AdaptiveHooks.Service
+    if (registeredInstances.has(hooks)) return
+    registeredInstances.add(hooks)
+    const observer = yield* buildObserver()
+    yield* hooks.register(observer)
+  })
+
+  /**
+   * Adaptive-hook layer. The observer is registered lazily by the runLoop's
+   * first iteration (see `prompt.ts`) so we are guaranteed to be inside an
+   * Instance scope when the registration touches `InstanceState`. Round-1's
+   * bus-driven `Idle` listener has been removed (migration plan §3.2 #12).
+   *
+   * The layer itself is a no-op marker so callers can express the dependency
+   * in type signatures; the real work happens in {@link ensureRegistered}.
+   */
   export const layer = Layer.effect(
     Service,
     Effect.gen(function* () {
-      const bus = yield* Bus.Service
-      const session = yield* Session.Service
-      const off = yield* bus.subscribeCallback(SessionStatus.Event.Idle, (evt) => {
-        void Effect.runPromise(
-          Effect.gen(function* () {
-            const sessionID = evt.properties.sessionID
-            const enabled = yield* session.getAutobestEnabled(sessionID)
-            if (!enabled) return
-            const msg = yield* session.findMessage(sessionID, (item) => item.info.role === "assistant")
-            if (Option.isNone(msg)) return
-            const text = msg.value.parts
-              .filter((part): part is MessageV2.TextPart => part.type === "text")
-              .map((part) => part.text.trim())
-              .filter(Boolean)
-              .join("\n")
-            if (!text) return
-            const picks = extract(text)
-            if (!picks.length) return
-            yield* session.applyAutobest({ sessionID, candidates: picks, ts: Date.now() })
-          }),
-        )
-      })
-      yield* Effect.addFinalizer(() => Effect.sync(off))
+      // No I/O at layer-build — registration is deferred to first runLoop call.
       return Service.of({})
     }),
   )
 
-  export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(Session.defaultLayer))
+  export const defaultLayer = layer
 }
+
+// MessageV2 referenced for parity with the prior file (kept as transitive type).
+void MessageV2
+void Option

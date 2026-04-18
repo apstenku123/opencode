@@ -211,6 +211,32 @@ export type Event =
         reason?: string[]
       }[]
     }
+  | {
+      ts: number
+      type: "autobest.cycle.advance"
+      sessionID: string
+      stepKind: "a" | "b" | "c" | "d"
+      turnID?: string
+      whatNextAsked?: boolean
+      iteration: number
+      reason?: string
+    }
+  | {
+      ts: number
+      type: "autobest.cycle.reset"
+      sessionID: string
+      reason?: string
+    }
+  | {
+      ts: number
+      type: "autobest.grounding"
+      sessionID: string
+      outcome: "skipped" | "dispatched"
+      reason?: string
+      agentsSpawned?: number
+      toolsUsed?: string[]
+      turn: number
+    }
 
 export function file(sessionID: string) {
   return path.join(Global.Path.data, "history", `${sessionID}.jsonl`)

@@ -111,4 +111,110 @@ describe("SubagentRegistry", () => {
       }),
     )
   })
+
+  test("depth walks parent chain registered via spawn", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const top = sid("session_d_top")
+        const lvl1 = sid("session_d_lvl1")
+        const lvl2 = sid("session_d_lvl2")
+        const lvl3 = sid("session_d_lvl3")
+        yield* reg.spawn(top, lvl1)
+        yield* reg.spawn(lvl1, lvl2)
+        yield* reg.spawn(lvl2, lvl3)
+        expect(yield* reg.depth(top)).toBe(0)
+        expect(yield* reg.depth(lvl1)).toBe(1)
+        expect(yield* reg.depth(lvl2)).toBe(2)
+        expect(yield* reg.depth(lvl3)).toBe(3)
+        // depth survives close
+        yield* reg.close(lvl1, { status: "completed" })
+        expect(yield* reg.depth(lvl3)).toBe(3)
+      }),
+    )
+  })
+
+  test("cancelAll invokes per-child cancel callbacks and records cancelled summaries", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const parent = sid("session_cancel_p")
+        const c1 = sid("session_cancel_c1")
+        const c2 = sid("session_cancel_c2")
+        let cancelled1 = false
+        let cancelled2 = false
+        yield* reg.spawn(parent, c1, { cancel: () => (cancelled1 = true) })
+        yield* reg.spawn(parent, c2, { cancel: () => (cancelled2 = true) })
+        const n = yield* reg.cancelAll(parent)
+        expect(n).toBe(2)
+        expect(cancelled1).toBe(true)
+        expect(cancelled2).toBe(true)
+        const after = yield* reg.active(parent)
+        expect(after.size).toBe(0)
+        const s1 = yield* reg.summary(c1)
+        const s2 = yield* reg.summary(c2)
+        expect(s1?.status).toBe("cancelled")
+        expect(s2?.status).toBe("cancelled")
+      }),
+    )
+  })
+
+  test("waitForAll resolves when cancelAll fires after wait was already pending", async () => {
+    await run(
+      Effect.gen(function* () {
+        const reg = yield* SubagentRegistry.Service
+        const parent = sid("session_cancelw_p")
+        const c1 = sid("session_cancelw_c1")
+        yield* reg.spawn(parent, c1)
+        // Capture the entries before cancelAll so waitForAll has something to await.
+        const before = yield* reg.active(parent)
+        expect(before.size).toBe(1)
+        const waiting = yield* Effect.forkChild(reg.waitForAll(parent))
+        // Yield a tick so the forked waitForAll can read state.children before cancel.
+        yield* Effect.sleep("5 millis")
+        yield* reg.cancelAll(parent)
+        const results = yield* Fiber.join(waiting)
+        expect(results.length).toBe(1)
+        expect(results[0]?.status).toBe("cancelled")
+      }),
+    )
+  })
+
+  test("summarize formats children list with status tags", () => {
+    const out = SubagentRegistry.summarize([
+      {
+        sessionID: sid("session_x"),
+        parentID: sid("session_p"),
+        status: "completed",
+        startedAt: 0,
+        finishedAt: 1,
+        result: "ok-result",
+      },
+      {
+        sessionID: sid("session_y"),
+        parentID: sid("session_p"),
+        status: "error",
+        startedAt: 0,
+        finishedAt: 1,
+        error: "boom",
+      },
+      {
+        sessionID: sid("session_z"),
+        parentID: sid("session_p"),
+        status: "cancelled",
+        startedAt: 0,
+        finishedAt: 1,
+      },
+    ])
+    expect(out).toContain("[Sub-agent results] All 3 sub-agent(s) have finished:")
+    expect(out).toContain("[ok]")
+    expect(out).toContain("[error]")
+    expect(out).toContain("[cancelled]")
+    expect(out).toContain("ok-result")
+    expect(out).toContain("boom")
+  })
+
+  test("summarize on empty input returns empty string", () => {
+    expect(SubagentRegistry.summarize([])).toBe("")
+  })
 })

@@ -270,10 +270,93 @@ export const Info = z
           .describe(
             "Enable autosteering stagnation detection. When true, after two consecutive planning-only or near-duplicate assistant responses a canned user-role nudge is injected asking the model to execute. Defaults to true.",
           ),
+        stagnationTrigger: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "Number of consecutive stagnant turns before a nudge fires. Mirrors the Rust hardcoded `>= 2`. Default 2.",
+          ),
+        similarityThreshold: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe(
+            "Jaccard similarity (0-1) above which two consecutive replies are considered duplicates. Default 0.85.",
+          ),
+        minResponseLength: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Skip stagnation evaluation when the assistant reply is shorter than this many chars. Mirrors the TUI quick-answer filter. Default 0 (off).",
+          ),
+        planningPhrases: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Override the lowercase phrase list that marks a reply as planning-only. Empty array disables planning detection.",
+          ),
+        actionMarkers: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Override the substring list whose presence in a reply disables planning-only classification (e.g. ``` for code fences).",
+          ),
       })
       .optional()
       .describe(
         "Autosteering configuration. Detects when the model is only planning or repeating itself and nudges it back to action.",
+      ),
+    memories: z
+      .object({
+        enabled: z
+          .boolean()
+          .optional()
+          .describe(
+            "Master switch for the MemCoder-style memory subsystem. When false, all memory hooks (retrieval enrichment, post-turn extraction, rerank) are disabled regardless of the per-phase flags. Default: false.",
+          ),
+        retrievalEnabled: z
+          .boolean()
+          .optional()
+          .describe(
+            "Enable pre-turn `<similar_past_problems>` enrichment. When true, the turn loop synthesizes a retrieval query, runs cosine + (optional) LLM rerank against stored sextuples, and prepends the top-K hits to the user prompt. Default: false.",
+          ),
+        extractionEnabled: z
+          .boolean()
+          .optional()
+          .describe(
+            "Enable post-turn Phase-1 sextuple extraction. When true, after each completed turn the loop forks a background extractor that distills any defect-resolution moments into stored memories. Default: true (only effective when `enabled` is also true).",
+          ),
+        rerankEnabled: z
+          .boolean()
+          .optional()
+          .describe(
+            "Enable stage-2 LLM cross-encoder rerank during retrieval. Falls back to pure cosine ranking when disabled. Default: true.",
+          ),
+        retrievalTopK: z
+          .number()
+          .int()
+          .min(1)
+          .optional()
+          .describe(
+            "Number of memories to surface in the `<similar_past_problems>` block. Default: 5.",
+          ),
+        retrievalMinScore: z
+          .number()
+          .min(0)
+          .max(1)
+          .optional()
+          .describe(
+            "Cosine-merged minScore floor — drops candidates below this after the stage-1+stage-2 weighted merge. Default: 0.4.",
+          ),
+      })
+      .optional()
+      .describe(
+        "MemCoder-style long-term memory subsystem. Disabled by default; opt in via `memories.enabled = true` plus the per-phase flags. See `docs/codex-rs-migration-plan.md` §3.4.",
       ),
     autobest: z
       .object({
@@ -310,6 +393,43 @@ export const Info = z
           .positive()
           .optional()
           .describe("Timeout in milliseconds for model context protocol (MCP) requests"),
+        subagent: z
+          .object({
+            depthLimit: z
+              .number()
+              .int()
+              .min(0)
+              .optional()
+              .describe(
+                "Maximum nesting depth for async sub-agent spawns (`task` tool with `async: true`). Default 3.",
+              ),
+            autoWaitTimeoutMs: z
+              .number()
+              .int()
+              .min(0)
+              .optional()
+              .describe(
+                "Hard timeout for the parent loop's pre-break auto-wait on active children. Default 300_000.",
+              ),
+          })
+          .optional()
+          .describe(
+            "Async sub-agent tuning (ports `agent::exceeds_thread_spawn_depth_limit` + `auto_wait_for_active_children`).",
+          ),
+        stop_hooks: z
+          .array(
+            z.object({
+              name: z.string(),
+              command: z
+                .union([z.string(), z.array(z.string())])
+                .describe("Shell command (string or argv) to run at the parent loop's pre-break point."),
+              timeoutMs: z.number().int().positive().optional().describe("Per-hook timeout. Default 5000ms."),
+            }),
+          )
+          .optional()
+          .describe(
+            "User-defined stop hooks (port of `codex.rs:7227-7261`). When a hook exits non-zero or prints `Continue: <reason>`, the parent loop holds the turn open by injecting a synthetic user message.",
+          ),
       })
       .optional(),
   })

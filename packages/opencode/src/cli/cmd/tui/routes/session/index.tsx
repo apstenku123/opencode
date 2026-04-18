@@ -232,6 +232,26 @@ export function Session() {
   const dialog = useDialog()
   const renderer = useRenderer()
 
+  // ⚠️ Autosteering nudge banner.
+  //
+  // The server-side observer (`SessionAutosteerObserver`) publishes
+  // `session.autosteer.nudge` on the bus whenever a stagnation streak hits
+  // the trigger and a canned user-role nudge is appended to the session.
+  // The event isn't on the typed SDK enum (added this round, SDK regen
+  // happens out-of-band), so we subscribe via `event.subscribe` and string-
+  // match the type.
+  event.subscribe((evt: { type: string; properties?: Record<string, unknown> }) => {
+    if (evt.type !== "session.autosteer.nudge") return
+    const props = evt.properties ?? {}
+    if (props.sessionID !== route.sessionID) return
+    const count = typeof props.count === "number" ? props.count : 0
+    toast.show({
+      message: `⚠️ Autosteering: nudge #${count} injected — model was repeating itself or only planning.`,
+      variant: "warning",
+      duration: 4000,
+    })
+  })
+
   event.on("session.status", (evt) => {
     if (evt.properties.sessionID !== route.sessionID) return
     if (evt.properties.status.type !== "retry") return
@@ -929,6 +949,92 @@ export function Session() {
           }
         } catch {
           toast.show({ message: "Failed to export session", variant: "error" })
+        }
+        dialog.clear()
+      },
+    },
+    // Autosteering slash commands.
+    //
+    // The TUI's slash dispatch path (`dialog-command.tsx::trigger`) does not
+    // forward post-command arguments, so the Rust `/autosteering on|off|status`
+    // verb-arg surface is split into three discrete entries here. The shared
+    // backend route (`POST /config/autosteering`) is the single source of
+    // truth — the SDK regeneration that exposes it as `sdk.client.config`
+    // will happen out of band, so we fall back to direct `fetch` on the
+    // server URL provided by `useSDK()`.
+    {
+      title: "Autosteering — turn ON",
+      value: "session.autosteering.on",
+      category: "Session",
+      slash: { name: "autosteering-on", aliases: ["autosteer-on"] },
+      onSelect: async (dialog) => {
+        try {
+          const r = await fetch(`${sdk.url.replace(/\/+$/, "")}/config/autosteering`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ enabled: true }),
+          })
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          const data = (await r.json()) as { enabled: boolean; cumulativeNudgeCount: number }
+          toast.show({
+            message: `Autosteering: ON (nudges so far: ${data.cumulativeNudgeCount})`,
+            variant: "success",
+          })
+        } catch (e) {
+          toast.show({
+            message: e instanceof Error ? e.message : "Failed to enable autosteering",
+            variant: "error",
+          })
+        }
+        dialog.clear()
+      },
+    },
+    {
+      title: "Autosteering — turn OFF",
+      value: "session.autosteering.off",
+      category: "Session",
+      slash: { name: "autosteering-off", aliases: ["autosteer-off"] },
+      onSelect: async (dialog) => {
+        try {
+          const r = await fetch(`${sdk.url.replace(/\/+$/, "")}/config/autosteering`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ enabled: false }),
+          })
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          const data = (await r.json()) as { enabled: boolean; cumulativeNudgeCount: number }
+          toast.show({
+            message: `Autosteering: OFF (nudges so far: ${data.cumulativeNudgeCount})`,
+            variant: "info",
+          })
+        } catch (e) {
+          toast.show({
+            message: e instanceof Error ? e.message : "Failed to disable autosteering",
+            variant: "error",
+          })
+        }
+        dialog.clear()
+      },
+    },
+    {
+      title: "Autosteering — show status",
+      value: "session.autosteering.status",
+      category: "Session",
+      slash: { name: "autosteering", aliases: ["autosteer", "autosteering-status"] },
+      onSelect: async (dialog) => {
+        try {
+          const r = await fetch(`${sdk.url.replace(/\/+$/, "")}/config/autosteering`)
+          if (!r.ok) throw new Error(`HTTP ${r.status}`)
+          const data = (await r.json()) as { enabled: boolean; cumulativeNudgeCount: number }
+          toast.show({
+            message: `Autosteering: ${data.enabled ? "ON" : "OFF"} (nudges so far: ${data.cumulativeNudgeCount})`,
+            variant: "info",
+          })
+        } catch (e) {
+          toast.show({
+            message: e instanceof Error ? e.message : "Failed to read autosteering status",
+            variant: "error",
+          })
         }
         dialog.clear()
       },

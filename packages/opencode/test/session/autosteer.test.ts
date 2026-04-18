@@ -164,4 +164,58 @@ describe("SessionAutosteer heuristics", () => {
       expect(SessionAutosteer.STAGNATION_TRIGGER).toBe(2)
     })
   })
+
+  describe("thresholds overrides", () => {
+    test("custom planningPhrases replace the defaults", () => {
+      // The default phrase list does not include "будем" — without override
+      // the response should not classify as planning-only.
+      expect(SessionAutosteer.isPlanningOnly("будем рефакторить позже")).toBe(false)
+      // Supplying a custom list flips the verdict.
+      expect(
+        SessionAutosteer.isPlanningOnly("будем рефакторить позже", { planningPhrases: ["будем"] }),
+      ).toBe(true)
+    })
+
+    test("empty planningPhrases override disables planning detection", () => {
+      expect(SessionAutosteer.isPlanningOnly("My plan is to think.", { planningPhrases: [] })).toBe(false)
+    })
+
+    test("custom actionMarkers prevent planning classification", () => {
+      // Default action markers don't include "STATUS:" — without override
+      // the planning phrase still wins.
+      expect(SessionAutosteer.isPlanningOnly("My plan is x. STATUS: done")).toBe(true)
+      expect(
+        SessionAutosteer.isPlanningOnly("My plan is x. STATUS: done", { actionMarkers: ["STATUS:"] }),
+      ).toBe(false)
+    })
+
+    test("similarityThreshold is honored", () => {
+      const a = "alpha bravo charlie delta"
+      const b = "alpha bravo charlie echo" // jaccard ~ 0.6
+      // Default threshold (0.85) → not stagnant.
+      expect(SessionAutosteer.detectStagnation(a, b)).toBe(false)
+      // Lower threshold → flagged.
+      expect(SessionAutosteer.detectStagnation(a, b, { similarityThreshold: 0.5 })).toBe(true)
+    })
+
+    test("minResponseLength short-circuits short replies", () => {
+      // Short planning reply normally counts as stagnant.
+      expect(SessionAutosteer.detectStagnation(undefined, "My plan is x.")).toBe(true)
+      // With minResponseLength gate above the message length, skipped.
+      expect(
+        SessionAutosteer.detectStagnation(undefined, "My plan is x.", { minResponseLength: 100 }),
+      ).toBe(false)
+    })
+
+    test("custom stagnationTrigger fires on the configured count", () => {
+      // trigger=1 → first stagnant reply already nudges.
+      const out = SessionAutosteer.evaluate(
+        { stagnationCount: 0 },
+        "My plan is to start.",
+        { stagnationTrigger: 1 },
+      )
+      expect(out.stagnant).toBe(true)
+      expect(out.nudge).toBe(true)
+    })
+  })
 })

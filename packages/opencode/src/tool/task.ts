@@ -157,14 +157,31 @@ export const TaskTool = Tool.define(
         ...Object.fromEntries((cfg.experimental?.primary_tools ?? []).map((item) => [item, false])),
       }
 
-      // Async variant (round 1 scaffold):
+      // Async variant (round 2):
       // Register the child with SubagentRegistry, fork the child prompt under
       // the ambient scope, and return immediately with the child session id.
-      // The parent loop's preBreak hook (round 2) will call
-      // `subagents.waitForAll(parent)` before exiting if any children are
-      // still active. Cancel propagation still flows via `ops.cancel`.
+      // The parent loop's preBreak hook calls `subagents.waitForAll(parent)`
+      // before exiting if any children are still active. Cancel propagation
+      // flows via the registered `cancel` callback (also wired to ctx.abort).
       if (params.async === true) {
-        yield* subagents.spawn(SessionID.make(ctx.sessionID), nextSession.id)
+        // Depth-limit guard — port of `agent::exceeds_thread_spawn_depth_limit`.
+        // Walks the registered parent chain; the new child is one deeper than
+        // its parent. Reject when adding a child would exceed `depthLimit`
+        // (default 3). Synchronous variant is unaffected.
+        const depthLimit = cfg.experimental?.subagent?.depthLimit ?? 3
+        const parentDepth = yield* subagents.depth(SessionID.make(ctx.sessionID))
+        if (parentDepth + 1 > depthLimit) {
+          return yield* Effect.fail(
+            new Error(
+              `Sub-agent depth limit exceeded: parent at depth ${parentDepth}, attempting depth ${parentDepth + 1} > limit ${depthLimit}`,
+            ),
+          )
+        }
+
+        let cancelFiber: (() => void) | undefined
+        yield* subagents.spawn(SessionID.make(ctx.sessionID), nextSession.id, {
+          cancel: () => cancelFiber?.(),
+        })
         const runChild = Effect.gen(function* () {
           const parts = yield* ops.resolvePromptParts(params.prompt)
           return yield* ops.prompt({
@@ -195,9 +212,15 @@ export const TaskTool = Tool.define(
             }),
           ),
         )
-        ctx.abort.addEventListener("abort", () => {
+        cancelFiber = () => {
+          // Best-effort: signal the child runner to stop and interrupt the
+          // forked fiber. Either alone is sufficient; both is defensive.
+          try {
+            ops.cancel(nextSession.id)
+          } catch {}
           void Effect.runPromise(Fiber.interrupt(fiber))
-        })
+        }
+        ctx.abort.addEventListener("abort", () => cancelFiber?.())
         return {
           title: params.description,
           metadata: {

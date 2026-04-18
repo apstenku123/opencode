@@ -131,6 +131,85 @@ describe("SessionAutosteerObserver", () => {
     })
   })
 
+  test("runtime override forces autosteering off regardless of config default", async () => {
+    await Instance.provide({
+      directory: projectRoot,
+      fn: async () => {
+        const session = await createSession({})
+        // Disable via override.
+        await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.setEnabledOverride(false)),
+        )
+        await appendAssistantText(session.id, "My plan is to refactor.")
+        await appendAssistantText(session.id, "Here's my plan: refactor.")
+        const out = await evaluateSession(session.id)
+        expect(out.nudge).toBe(false)
+        expect(out.stagnant).toBe(false)
+        // Restore so the next test sees the default ON state.
+        await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.setEnabledOverride(undefined)),
+        )
+      },
+    })
+  })
+
+  test("cumulative nudge counter accumulates across nudges", async () => {
+    await Instance.provide({
+      directory: projectRoot,
+      fn: async () => {
+        const session = await createSession({})
+        await appendAssistantText(session.id, "My plan is to refactor.")
+        await evaluateSession(session.id)
+        await appendAssistantText(session.id, "Here's my plan: refactor again.")
+        const second = await evaluateSession(session.id)
+        expect(second.nudge).toBe(true)
+
+        const total = await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.cumulativeNudgeCount()),
+        )
+        expect(total).toBeGreaterThanOrEqual(1)
+
+        const perSession = await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.perSessionNudgeCounts()),
+        )
+        expect(perSession.get(session.id as any)).toBeGreaterThanOrEqual(1)
+      },
+    })
+  })
+
+  test("isEnabled returns the effective value", async () => {
+    await Instance.provide({
+      directory: projectRoot,
+      fn: async () => {
+        // Default config has autosteering enabled (or unset → defaults true).
+        const before = await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.isEnabled()),
+        )
+        expect(typeof before).toBe("boolean")
+
+        await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.setEnabledOverride(false)),
+        )
+        const off = await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.isEnabled()),
+        )
+        expect(off).toBe(false)
+
+        await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.setEnabledOverride(true)),
+        )
+        const on = await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.isEnabled()),
+        )
+        expect(on).toBe(true)
+
+        await AppRuntime.runPromise(
+          SessionAutosteerObserver.Service.use((svc) => svc.setEnabledOverride(undefined)),
+        )
+      },
+    })
+  })
+
   test("healthy reply between two stagnant replies prevents nudge", async () => {
     await Instance.provide({
       directory: projectRoot,

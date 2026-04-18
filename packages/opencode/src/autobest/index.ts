@@ -137,3 +137,92 @@ export function apply(state: State, input: { candidates: Candidate[]; ts?: numbe
   })
   return { state: next, decision: { ...out, active: next.active } }
 }
+
+// ---------------------------------------------------------------------------
+// Cycle history-event shapes (round 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Durable cycle event types written to the per-session history JSONL.
+ * Replaces the in-memory `Map<sessionID, CycleState>` left by round 1.
+ *
+ * Mirrors `Session::what_next_asks_used_this_cycle` etc. — survives process
+ * restart and thread resume.
+ */
+export type CycleEvent =
+  | {
+      readonly ts: number
+      readonly type: "autobest.cycle.advance"
+      readonly sessionID: string
+      readonly stepKind: StepKind
+      readonly turnID?: string
+      readonly whatNextAsked?: boolean
+      readonly iteration: number
+      readonly reason?: string
+    }
+  | {
+      readonly ts: number
+      readonly type: "autobest.cycle.reset"
+      readonly sessionID: string
+      readonly reason?: string
+    }
+
+/**
+ * Reduce a stream of {@link CycleEvent}s into the latest {@link CycleState}.
+ * `reset` zeroes iteration / whatNextAsked. `advance` takes the explicit
+ * iteration value (caller-supplied, monotonic per cycle).
+ *
+ * Used by `Session.getAutobest` to hydrate the cycle bag on read.
+ */
+export function reduceCycleEvents(events: readonly CycleEvent[]): CycleState | undefined {
+  let state: CycleState | undefined = undefined
+  for (const ev of events) {
+    if (ev.type === "autobest.cycle.reset") {
+      state = { iteration: 0, stepKind: "a" }
+      continue
+    }
+    if (ev.type === "autobest.cycle.advance") {
+      state = {
+        iteration: ev.iteration,
+        stepKind: ev.stepKind,
+        turnID: ev.turnID ?? state?.turnID,
+        whatNextAsked: ev.whatNextAsked ?? state?.whatNextAsked,
+      }
+      continue
+    }
+  }
+  return state
+}
+
+/** Build a `cycle.advance` event from a state delta. Pure helper — caller persists. */
+export function buildCycleAdvanceEvent(input: {
+  sessionID: string
+  cycle: CycleState
+  ts?: number
+  reason?: string
+}): Extract<CycleEvent, { type: "autobest.cycle.advance" }> {
+  return {
+    ts: input.ts ?? Date.now(),
+    type: "autobest.cycle.advance",
+    sessionID: input.sessionID,
+    stepKind: input.cycle.stepKind,
+    turnID: input.cycle.turnID,
+    whatNextAsked: input.cycle.whatNextAsked,
+    iteration: input.cycle.iteration,
+    reason: input.reason,
+  }
+}
+
+/** Build a `cycle.reset` event. Pure helper — caller persists. */
+export function buildCycleResetEvent(input: {
+  sessionID: string
+  ts?: number
+  reason?: string
+}): Extract<CycleEvent, { type: "autobest.cycle.reset" }> {
+  return {
+    ts: input.ts ?? Date.now(),
+    type: "autobest.cycle.reset",
+    sessionID: input.sessionID,
+    reason: input.reason,
+  }
+}
