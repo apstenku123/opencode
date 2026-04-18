@@ -39,9 +39,18 @@ import {
   Cursor,
   Kiro,
   OpenCodeAdapter,
+  fullText as sessionFullText,
 } from "./adapters"
 import { ForeignIngestCheckpoint } from "./checkpoint"
 import { withWriterLock } from "./writer-lock"
+import {
+  buildPhase1Prompt,
+  parsePhase1Response,
+  buildSextupleInputs,
+  PHASE1_TIMEOUT_MS,
+  type Phase1Model,
+} from "../phase1"
+import { Option } from "effect"
 
 // --------------------------------------------------------------------------
 // Source resolution
@@ -249,6 +258,48 @@ export const ingest = (input: IngestInput) => {
   })
 
   return withWriterLock(input.dataDir, input.gitRoot, task)
+}
+
+// --------------------------------------------------------------------------
+// Real LLM-backed SessionExtractor
+// --------------------------------------------------------------------------
+
+/**
+ * Build a {@link SessionExtractor} that runs the Phase-1 extractor prompt
+ * against a caller-supplied model bridge. Mirrors the behavior of the
+ * no-op extractor semantics (returns `[]` on any failure — the session is
+ * still checkpointed) while plugging a real LLM into the pipeline.
+ *
+ * Intended callers: the `/memory/ingest` RPC (see
+ * `src/server/instance/memory.ts`) and batch CLI flows. Both resolve a
+ * Phase-1 bridge from the user's configured extraction model and pass it
+ * in here — the extractor itself is storage-agnostic.
+ */
+export const makeLlmSessionExtractor = (opts: {
+  readonly model: Phase1Model
+  readonly timeoutMs?: number
+}): SessionExtractor => {
+  return (session, source) =>
+    Effect.gen(function* () {
+      const text = sessionFullText(session)
+      if (!text.trim()) return [] as ReadonlyArray<DefectSextupleInput>
+      const prompt = buildPhase1Prompt(text)
+      const raw = yield* opts
+        .model(prompt)
+        .pipe(
+          Effect.timeoutOption(opts.timeoutMs ?? PHASE1_TIMEOUT_MS),
+          Effect.catchCause(() => Effect.succeed(Option.none<string | null>())),
+          Effect.map((o) => Option.match(o, { onNone: () => null, onSome: (v) => v ?? null })),
+        )
+      if (!raw) return [] as ReadonlyArray<DefectSextupleInput>
+      const parsed = parsePhase1Response(raw)
+      if (!parsed) return [] as ReadonlyArray<DefectSextupleInput>
+      return buildSextupleInputs(
+        parsed,
+        source,
+        source.projectID,
+      ) as ReadonlyArray<DefectSextupleInput>
+    })
 }
 
 // --------------------------------------------------------------------------

@@ -27,6 +27,7 @@ import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
 import { AdaptiveHooks } from "../../src/session/adaptive"
+import { SessionMemoryObserver } from "../../src/session/memory-observer"
 import { SubagentRegistry } from "../../src/subagent/registry"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
@@ -210,6 +211,7 @@ function makeHttp() {
       Layer.provide(SessionRevert.defaultLayer),
       Layer.provide(summary),
       Layer.provide(AdaptiveHooks.defaultLayer),
+      Layer.provide(SessionMemoryObserver.defaultLayer),
       Layer.provide(SubagentRegistry.defaultLayer),
       Layer.provideMerge(run),
       Layer.provideMerge(compact),

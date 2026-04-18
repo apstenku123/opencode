@@ -110,6 +110,54 @@ const it = testEffect(facadeLayer)
 
 const seedSource: SextupleSource = { _tag: "rollout", threadID: "seed", timestamp: 0 }
 
+it.live("memory.enrichPromptForSession → delegates to enrichUserPromptWithMemories", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    yield* memory.add({
+      keywords: ["session", "retrieve"],
+      problem: "session-level retrieve integration",
+      rootCause: "facade plumbed",
+      solution: "call enrichPromptForSession",
+      source: seedSource,
+    })
+    const out = yield* memory.enrichPromptForSession("ses-1" as never, "session retrieve sample", {
+      minScore: -1,
+      topK: 1,
+    })
+    expect(out.block).not.toBeNull()
+    expect(out.block!).toContain("session-level retrieve integration")
+  }),
+)
+
+it.live("memory.extractFromTurn splits user/assistant events + runs refining gate", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    const llmResponse = JSON.stringify({
+      rollout_summary: "fixed a bug",
+      rollout_slug: "bug-fix",
+      raw_memory: "",
+      sextuples: [
+        {
+          keywords: ["mutex", "race"],
+          problem: "mutex race on shutdown",
+          root_cause: "two consumers pull without coordination",
+          solution: "add shutdown barrier and coordinate drain",
+        },
+      ],
+    })
+    const out = yield* memory.extractFromTurn({
+      turnEvents: [
+        { role: "user", text: "thanks, it works now" },
+        { role: "assistant", text: "fixed the deadlock — All tests passed." },
+      ],
+      source: { _tag: "rollout", threadID: "live", timestamp: 0 },
+      extractionModel: () => Effect.succeed(llmResponse),
+    })
+    expect(out.reason).toBe("ok")
+    expect(out.persisted).toHaveLength(1)
+  }),
+)
+
 it.live("enrichUserPromptWithMemories returns block when stored sextuples match", () =>
   Effect.gen(function* () {
     const memory = yield* Memory
@@ -287,5 +335,7 @@ function stubMemory(): Memory.Interface {
     retrieveByEmbedding: () => Effect.die("stub.retrieveByEmbedding"),
     enrichPrompt: () => Effect.die("stub.enrichPrompt"),
     runPhase1: () => Effect.die("stub.runPhase1"),
+    enrichPromptForSession: () => Effect.die("stub.enrichPromptForSession"),
+    extractFromTurn: () => Effect.die("stub.extractFromTurn"),
   }
 }
