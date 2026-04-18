@@ -353,6 +353,30 @@ export const Info = z
           .describe(
             "Cosine-merged minScore floor — drops candidates below this after the stage-1+stage-2 weighted merge. Default: 0.4.",
           ),
+        extractionModel: z
+          .string()
+          .optional()
+          .describe(
+            "Provider/model identifier (e.g. `openai/gpt-4.1`) used for post-turn Phase-1 sextuple extraction and for foreign-ingest LLM extraction. When omitted the extractor falls back to the session's default model.",
+          ),
+        rerankModel: z
+          .string()
+          .optional()
+          .describe(
+            "Provider/model identifier used for stage-2 cross-encoder rerank during retrieval. Falls back to pure cosine ranking when unset.",
+          ),
+        polishModel: z
+          .string()
+          .optional()
+          .describe(
+            "Provider/model identifier used for the post-extraction refining pass. Falls back to the deterministic verbatim-signals path when unset.",
+          ),
+        querySynthModel: z
+          .string()
+          .optional()
+          .describe(
+            "Provider/model identifier used for query synthesis during retrieval. Falls back to regex keyword extraction when unset.",
+          ),
       })
       .optional()
       .describe(

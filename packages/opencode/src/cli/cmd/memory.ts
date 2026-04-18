@@ -28,6 +28,7 @@ import {
 } from "../../server/instance/memory"
 import {
   ingest,
+  makeLlmSessionExtractor,
   type ForeignIngestSources,
   type SessionExtractor,
 } from "../../memory/foreign-ingest"
@@ -38,10 +39,30 @@ import {
   memoryRetrievalLayer,
   memoryStorageLayer,
   mockEmbeddingLayer,
+  makeMemoryBridge,
 } from "../../memory"
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
+import { Config } from "../../config"
+import { Provider } from "../../provider"
 
 const NO_OP_EXTRACTOR: SessionExtractor = () => Effect.succeed([])
+
+/**
+ * Resolve the configured extraction model (or the session default when
+ * unset) into a `SessionExtractor` backed by a real LLM bridge. Returns
+ * the no-op extractor when no model is available — mirrors the observer's
+ * graceful fallback.
+ */
+const resolveLlmExtractor = Effect.gen(function* () {
+  const cfg = yield* Config.Service.use((svc) => svc.get())
+  const spec = cfg.memories?.extractionModel?.trim() || cfg.model?.trim()
+  if (!spec) return NO_OP_EXTRACTOR
+  const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+    Effect.catchCause(() => Effect.succeed(undefined as undefined)),
+  )
+  if (!bridge) return NO_OP_EXTRACTOR
+  return makeLlmSessionExtractor({ model: bridge })
+})
 
 const memoryStack = Layer.provideMerge(
   memoryFacadeLayer,
@@ -183,6 +204,12 @@ const IngestCommand = cmd({
         describe: "per-session concurrency",
         type: "number",
       })
+      .option("extract", {
+        describe:
+          "run the Phase-1 LLM extractor on each ingested session — requires `memories.extractionModel` (or `model`) to be configured",
+        type: "boolean",
+        default: false,
+      })
       .option("json", {
         describe: "output as JSON",
         type: "boolean",
@@ -200,12 +227,21 @@ const IngestCommand = cmd({
       const dataDir = Global.Path.data
       const sources = sourcesForTool(tool, args.path ?? "")
 
+      const extractor = args.extract
+        ? await Effect.runPromise(
+            resolveLlmExtractor.pipe(
+              Effect.provide(Config.defaultLayer),
+              Effect.provide(Provider.defaultLayer),
+            ) as Effect.Effect<SessionExtractor, unknown, never>,
+          ).catch(() => NO_OP_EXTRACTOR)
+        : NO_OP_EXTRACTOR
+
       const program = ingest({
         gitRoot,
         dataDir,
         projectID: projectID ?? undefined,
         sources,
-        extract: NO_OP_EXTRACTOR,
+        extract: extractor,
         concurrency: args.concurrency,
       }).pipe(Effect.provide(ingestStack))
 

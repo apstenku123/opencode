@@ -45,6 +45,33 @@ describe("SessionMemoryObserver.buildHooksConfig", () => {
   })
 })
 
+describe("SessionMemoryObserver.resolveModelSpec", () => {
+  test("prefers the phase-specific slot when set", () => {
+    const cfg = { model: "anthropic/claude-sonnet", memories: { extractionModel: "openai/gpt-4.1" } }
+    expect(SessionMemoryObserver.resolveModelSpec(cfg, "extraction")).toBe("openai/gpt-4.1")
+  })
+
+  test("falls back to session default model for extraction + rerank", () => {
+    const cfg = { model: "anthropic/claude-sonnet", memories: {} }
+    expect(SessionMemoryObserver.resolveModelSpec(cfg, "extraction")).toBe("anthropic/claude-sonnet")
+    expect(SessionMemoryObserver.resolveModelSpec(cfg, "rerank")).toBe("anthropic/claude-sonnet")
+  })
+
+  test("does NOT fall back to default for polish / querySynth", () => {
+    const cfg = { model: "anthropic/claude-sonnet", memories: {} }
+    expect(SessionMemoryObserver.resolveModelSpec(cfg, "polish")).toBeUndefined()
+    expect(SessionMemoryObserver.resolveModelSpec(cfg, "querySynth")).toBeUndefined()
+  })
+
+  test("returns undefined when both slots are empty", () => {
+    expect(SessionMemoryObserver.resolveModelSpec(undefined, "extraction")).toBeUndefined()
+    expect(SessionMemoryObserver.resolveModelSpec({}, "extraction")).toBeUndefined()
+    expect(
+      SessionMemoryObserver.resolveModelSpec({ memories: { extractionModel: "  " } }, "extraction"),
+    ).toBeUndefined()
+  })
+})
+
 describe("SessionMemoryObserver.makeObserverOptions", () => {
   const stubMemory = {} as Memory.Interface
 
@@ -140,4 +167,38 @@ describe("SessionMemoryObserver.makeObserverOptions", () => {
       expect(cfg.enabled).toBe(true)
       expect(cfg.retrievalEnabled).toBe(DEFAULT_HOOKS_CONFIG.retrievalEnabled)
     }).pipe(Effect.runPromise))
+
+  test("wires provided bridges onto extractionModel / rerankModel / polishModel / querySynthModel", () => {
+    const extract = () => Effect.succeed("raw")
+    const rerank = () => Effect.succeed("{}")
+    const polish = () => Effect.succeed("{}")
+    const querySynth = () => Effect.succeed("query")
+    const opts = SessionMemoryObserver.makeObserverOptions({
+      memory: stubMemory,
+      session: stubSession([]),
+      config: stubConfig({}),
+      bridges: {
+        extraction: extract as any,
+        rerank: rerank as any,
+        polish: polish as any,
+        querySynth: querySynth as any,
+      },
+    })
+    expect(opts.extractionModel).toBe(extract as any)
+    expect(opts.rerankModel).toBe(rerank as any)
+    expect(opts.polishModel).toBe(polish as any)
+    expect(opts.querySynthModel).toBe(querySynth as any)
+  })
+
+  test("omitting bridges leaves all model slots undefined (no-LLM short-circuit)", () => {
+    const opts = SessionMemoryObserver.makeObserverOptions({
+      memory: stubMemory,
+      session: stubSession([]),
+      config: stubConfig({}),
+    })
+    expect(opts.extractionModel).toBeUndefined()
+    expect(opts.rerankModel).toBeUndefined()
+    expect(opts.polishModel).toBeUndefined()
+    expect(opts.querySynthModel).toBeUndefined()
+  })
 })

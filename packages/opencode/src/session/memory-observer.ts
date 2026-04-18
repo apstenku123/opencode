@@ -1,23 +1,30 @@
 /**
  * SessionMemoryObserver — wiring layer for the codemem turn-hooks.
  *
- * Round-3 integration. Mirrors the structural shape of
+ * Round-3 scaffold, round-4 wiring. Mirrors the structural shape of
  * `SessionAutobestObserver` / `SessionAutosteerObserver`: the layer is a
- * marker service whose *build* effect does nothing; actual registration of
- * the `AdaptiveHooks.Observer` happens lazily via `ensureRegistered()` so
- * the `register` call (which touches `InstanceState`) runs inside an
+ * marker service whose *build* effect does nothing; actual registration
+ * of the `AdaptiveHooks.Observer` happens lazily via `ensureRegistered()`
+ * so the `register` call (which touches `InstanceState`) runs inside an
  * active `Instance` scope from the session-prompt runloop.
  *
- * What it wires:
+ * What it wires (round-4):
  *   - Reads `config.memories.*` toggles and forwards them to
  *     `DEFAULT_HOOKS_CONFIG`, so users can opt-in via `opencode.json`.
  *   - Resolves the last user-message text + the recent assistant turn
  *     summary from the live `Session.Service` API (no speculation about
  *     message ids; we walk `messages({ sessionID })` newest-first).
- *   - Leaves `extractionModel` / `rerankModel` / `polishModel` unset by
- *     default — when the user doesn't ship a Phase-1 LLM bridge the
- *     observer silently short-circuits to "no-extraction-model" /
- *     "stage-1-only" modes. A future round wires an LLM adapter.
+ *   - Resolves a real `Phase1Model` / `RerankModel` / `RefiningModel` /
+ *     `SynthesizeModel` from `config.memories.{extractionModel,
+ *     rerankModel, polishModel, querySynthModel}` — falling back to the
+ *     session's configured default model when the dedicated slot is
+ *     empty. Bridges are built through the `Provider.Service` +
+ *     `ai.generateText` path (see `memory/llm-bridge.ts`) so the memory
+ *     subsystem stays decoupled from the streaming/permission-aware
+ *     `LLM.Service` used by the main runLoop.
+ *   - Extraction fires fire-and-forget via `Effect.forkDaemon` inside
+ *     `turn-hooks.registerMemoryTurnObserver` so a user turn is never
+ *     blocked by the Phase-1 extractor round-trip.
  *
  * Safety net: any exception inside the observer collapses to `Continue`
  * (see `registerMemoryTurnObserver` itself). Config-driven toggles make
@@ -29,14 +36,20 @@ import { Context, Effect, Layer } from "effect"
 import { AdaptiveHooks } from "./adaptive"
 import { Config } from "@/config"
 import { Memory, defaultLayer as memoryDefaultLayer } from "@/memory"
+import { makeMemoryBridge } from "@/memory/llm-bridge"
 import {
   DEFAULT_HOOKS_CONFIG,
   registerMemoryTurnObserver,
   type MemoryHooksConfig,
   type MemoryTurnObserverOptions,
 } from "@/memory/turn-hooks"
+import { Provider } from "@/provider"
 import { Session } from "./index"
 import type { SessionID } from "./schema"
+import type { Phase1Model } from "@/memory/phase1"
+import type { SynthesizeModel } from "@/memory/query-synth"
+import type { RerankModel } from "@/memory/rerank"
+import type { RefiningModel } from "@/memory/refining"
 import type { SextupleSource } from "@/memory/schema"
 
 export namespace SessionMemoryObserver {
@@ -89,13 +102,52 @@ export namespace SessionMemoryObserver {
   }
 
   /**
+   * Resolve the effective model spec string for a given memory phase.
+   * Falls back to the session's configured default model (`cfg.model`)
+   * when the phase-specific slot is empty. Returns `undefined` when
+   * neither is set.
+   */
+  export function resolveModelSpec(
+    cfg: { model?: string; memories?: { extractionModel?: string; rerankModel?: string; polishModel?: string; querySynthModel?: string } } | undefined,
+    phase: "extraction" | "rerank" | "polish" | "querySynth",
+  ): string | undefined {
+    const slot =
+      phase === "extraction"
+        ? cfg?.memories?.extractionModel
+        : phase === "rerank"
+          ? cfg?.memories?.rerankModel
+          : phase === "polish"
+            ? cfg?.memories?.polishModel
+            : cfg?.memories?.querySynthModel
+    if (slot && slot.trim()) return slot.trim()
+    // Fallback to the session's default model for extraction / rerank —
+    // query synthesis + polish are smaller hops, so leave them unset so
+    // the deterministic fallback kicks in rather than burning a heavy
+    // model round-trip. Users can opt in per-phase via the config slots.
+    if (phase === "extraction" || phase === "rerank") {
+      if (cfg?.model && cfg.model.trim()) return cfg.model.trim()
+    }
+    return undefined
+  }
+
+  /**
    * Build the observer options. Factored out so tests can drive the
    * resolver functions directly without standing up a Session service.
+   *
+   * `deps.bridges` is optional — callers that don't want LLM-backed
+   * extraction (tests, minimal embeds) omit it and the observer
+   * short-circuits to the no-model fallback inside the memory subsystem.
    */
   export const makeObserverOptions = (deps: {
     readonly memory: Memory.Interface
     readonly session: Session.Interface
     readonly config: Config.Interface
+    readonly bridges?: {
+      readonly extraction?: Phase1Model
+      readonly rerank?: RerankModel
+      readonly polish?: RefiningModel
+      readonly querySynth?: SynthesizeModel
+    }
   }): MemoryTurnObserverOptions => ({
     memory: deps.memory,
     config: () =>
@@ -154,12 +206,17 @@ export namespace SessionMemoryObserver {
         threadID: _sessionID,
         timestamp: Date.now(),
       } as SextupleSource),
-    // No LLM bridges supplied by default. When unset:
+    // LLM bridges come from `deps.bridges`. When a phase's bridge is
+    // unset the memory subsystem short-circuits gracefully:
     //   - querySynthModel: regex-based fallback (`regexKeywordQuery`) is used.
     //   - rerankModel: stage-2 rerank is skipped (pure cosine).
     //   - extractionModel: `runPhase1` short-circuits to `no-model`, so
     //     extraction produces no sextuples.
     //   - polishModel: refining gate runs verbatim signals only.
+    extractionModel: deps.bridges?.extraction,
+    rerankModel: deps.bridges?.rerank,
+    polishModel: deps.bridges?.polish,
+    querySynthModel: deps.bridges?.querySynth,
   })
 
   export const layer = Layer.effect(
@@ -169,8 +226,42 @@ export namespace SessionMemoryObserver {
       const session = yield* Session.Service
       const config = yield* Config.Service
       const hooks = yield* AdaptiveHooks.Service
+      const provider = yield* Effect.serviceOption(Provider.Service)
 
-      const opts = makeObserverOptions({ memory, session, config })
+      // Resolve the LLM bridges eagerly at layer-build time. We read the
+      // config once and bind the bridges to the currently configured
+      // models; subsequent config edits require a process restart to
+      // pick up (matches the semantics of `autobest.model` et al).
+      //
+      // When `Provider.Service` is unavailable (e.g. minimal test
+      // stacks) we skip bridge resolution entirely and the observer
+      // degrades to deterministic fallbacks per `makeObserverOptions`.
+      const cfg = yield* config.get()
+      const bridges: {
+        extraction?: Phase1Model
+        rerank?: RerankModel
+        polish?: RefiningModel
+        querySynth?: SynthesizeModel
+      } = {}
+      if (provider._tag === "Some") {
+        const providerSvc = provider.value
+        const tryResolve = (phase: "extraction" | "rerank" | "polish" | "querySynth") =>
+          Effect.gen(function* () {
+            const spec = resolveModelSpec(cfg, phase)
+            if (!spec) return undefined
+            const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+              Effect.provideService(Provider.Service, providerSvc),
+              Effect.catchCause(() => Effect.succeed(undefined as Phase1Model | undefined)),
+            )
+            return bridge
+          })
+        bridges.extraction = yield* tryResolve("extraction")
+        bridges.rerank = yield* tryResolve("rerank")
+        bridges.polish = yield* tryResolve("polish")
+        bridges.querySynth = yield* tryResolve("querySynth")
+      }
+
+      const opts = makeObserverOptions({ memory, session, config, bridges })
 
       const resolveConfig = opts.config
 
@@ -199,5 +290,10 @@ export namespace SessionMemoryObserver {
     Layer.provide(Session.defaultLayer),
     Layer.provide(Config.defaultLayer),
     Layer.provide(AdaptiveHooks.defaultLayer),
+    // Provider is a SOFT dependency — we read it via `Effect.serviceOption`
+    // inside `layer` so tests / minimal stacks that don't wire a provider
+    // still get a working (LLM-less) observer. When the ambient AppLayer
+    // provides `Provider.defaultLayer` elsewhere (production) bridges
+    // resolve as expected; when it doesn't, we degrade silently.
   )
 }

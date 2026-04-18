@@ -337,5 +337,6 @@ function stubMemory(): Memory.Interface {
     runPhase1: () => Effect.die("stub.runPhase1"),
     enrichPromptForSession: () => Effect.die("stub.enrichPromptForSession"),
     extractFromTurn: () => Effect.die("stub.extractFromTurn"),
+    runPhase1OnTurn: () => Effect.die("stub.runPhase1OnTurn"),
   }
 }

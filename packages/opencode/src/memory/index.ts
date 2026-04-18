@@ -153,6 +153,26 @@ export namespace Memory {
       readonly extractionModel?: Phase1Model
       readonly polishModel?: import("./refining").RefiningModel
     }) => Effect.Effect<import("./turn-hooks").ExtractAndRefineResult>
+
+    /**
+     * Round-4 convenience entry point: accepts `(sessionID, turnID, { model })`
+     * + pre-resolved assistant/user text and runs the Phase-1 extractor +
+     * refining gate. Unlike `extractFromTurn`, callers pass the already-
+     * concatenated `turnSummary` + `recentUserMessages` directly — useful
+     * for call-sites that have already walked the session history (e.g. the
+     * `SessionMemoryObserver` `resolveTurn` resolver). Returns the
+     * extract/refine result so callers can surface telemetry.
+     */
+    readonly runPhase1OnTurn: (input: {
+      readonly sessionID: string
+      readonly turnID?: string
+      readonly turnSummary: string
+      readonly recentUserMessages: ReadonlyArray<string>
+      readonly source: SextupleSource
+      readonly projectID?: string
+      readonly model?: Phase1Model
+      readonly polishModel?: import("./refining").RefiningModel
+    }) => Effect.Effect<import("./turn-hooks").ExtractAndRefineResult>
   }
 }
 
@@ -206,6 +226,7 @@ export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval |
       enrichPromptForSession: () =>
         Effect.die(`${tag}: enrichPromptForSession recursion not allowed`),
       extractFromTurn: () => Effect.die(`${tag}: extractFromTurn recursion not allowed`),
+      runPhase1OnTurn: () => Effect.die(`${tag}: runPhase1OnTurn recursion not allowed`),
     })
 
     return {
@@ -270,6 +291,17 @@ export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval |
           polishModel: input.polishModel,
         })
       },
+
+      runPhase1OnTurn: (input) =>
+        extractAndRefineTurnSextuples({
+          memory: subFacade("Memory.runPhase1OnTurn"),
+          turnSummary: input.turnSummary,
+          recentUserMessages: input.recentUserMessages,
+          source: input.source,
+          projectID: input.projectID,
+          extractionModel: input.model,
+          polishModel: input.polishModel,
+        }),
     }
   }),
 )
@@ -389,3 +421,14 @@ export {
   AUTO_TRIGGER_COMMIT_LIMIT,
 } from "./auto-trigger"
 export type { AutoTriggerInput, AutoTriggerResult } from "./auto-trigger"
+
+// Round-4 surfaces.
+export {
+  makeMemoryBridge,
+  makePhase1Bridge,
+  makeSynthesizeBridge,
+  makeRerankBridge,
+  makeRefiningBridge,
+  MEMORY_LLM_TIMEOUT_MS,
+} from "./llm-bridge"
+export type { MemoryBridgeOptions } from "./llm-bridge"

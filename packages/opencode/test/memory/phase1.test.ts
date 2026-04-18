@@ -313,3 +313,46 @@ it.live("Memory.runPhase1 facade entry-point persists records", () =>
     expect(out.stored).toHaveLength(1)
   }),
 )
+
+it.live("Memory.runPhase1OnTurn persists refined records via the mock model", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    const llmResponse = JSON.stringify({
+      rollout_summary: "race on shared timer",
+      rollout_slug: "race-timer",
+      raw_memory: "",
+      sextuples: [
+        {
+          keywords: ["timer", "race", "cleanup"],
+          problem: "shared timer fired after cleanup",
+          root_cause: "cancel token dropped on reassignment",
+          solution: "hold the token in an Option + cancel on drop",
+        },
+      ],
+    })
+    const out = yield* memory.runPhase1OnTurn({
+      sessionID: "ses-live-runphase1",
+      turnID: "turn-1",
+      turnSummary: "fixed the shutdown race by holding cancel tokens until drop",
+      recentUserMessages: ["shutdown race on timers"],
+      source,
+      model: () => Effect.succeed(llmResponse),
+    })
+    expect(out.reason).toBe("ok")
+    expect(out.persisted).toHaveLength(1)
+  }),
+)
+
+it.live("Memory.runPhase1OnTurn short-circuits to no-extraction-model when model is omitted", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    const out = yield* memory.runPhase1OnTurn({
+      sessionID: "ses-noop",
+      turnSummary: "some assistant text",
+      recentUserMessages: ["what happened?"],
+      source,
+    })
+    expect(out.reason).toBe("no-extraction-model")
+    expect(out.persisted).toEqual([])
+  }),
+)

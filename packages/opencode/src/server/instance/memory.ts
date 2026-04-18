@@ -30,9 +30,17 @@ import {
 } from "../../memory"
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
 import { ForeignIngestDoneTable, MemorySextupleTable } from "../../memory/memory.sql"
-import { ingest, type ForeignIngestSources, type SessionExtractor } from "../../memory/foreign-ingest"
+import {
+  ingest,
+  makeLlmSessionExtractor,
+  type ForeignIngestSources,
+  type SessionExtractor,
+} from "../../memory/foreign-ingest"
+import { makeMemoryBridge } from "../../memory/llm-bridge"
 import { crawl } from "../../memory/commit-crawler"
 import { NOOP_POLISHER } from "../../memory/auto-trigger"
+import { Config } from "../../config"
+import { Provider } from "../../provider"
 
 // --------------------------------------------------------------------------
 // Bus event
@@ -117,6 +125,12 @@ const IngestRequestBody = z
       })
       .optional(),
     concurrency: z.number().int().positive().max(32).optional(),
+    extract: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, run the Phase-1 LLM extractor on each ingested session. Requires `memories.extractionModel` (or `model`) to be configured. Default false.",
+      ),
   })
   .meta({ ref: "MemoryIngestRequest" })
 
@@ -172,6 +186,23 @@ const ingestStack = Layer.provideMerge(memoryStack, foreignIngestCheckpointLayer
 // --------------------------------------------------------------------------
 
 const NO_OP_EXTRACTOR: SessionExtractor = () => Effect.succeed([])
+
+/**
+ * Resolve an extractor backed by a real LLM bridge from the configured
+ * `memories.extractionModel` (or session default `cfg.model`). Falls
+ * back to the no-op extractor when no model is available — the session
+ * is still checkpointed so it isn't reprocessed.
+ */
+const resolveLlmExtractor = Effect.gen(function* () {
+  const cfg = yield* Config.Service.use((svc) => svc.get())
+  const spec = cfg.memories?.extractionModel?.trim() || cfg.model?.trim()
+  if (!spec) return NO_OP_EXTRACTOR
+  const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+    Effect.catchCause(() => Effect.succeed(undefined as undefined)),
+  )
+  if (!bridge) return NO_OP_EXTRACTOR
+  return makeLlmSessionExtractor({ model: bridge })
+})
 
 export const MemoryRoutes = () =>
   new Hono()
@@ -247,12 +278,21 @@ export const MemoryRoutes = () =>
 
         await Bus.publish(MemoryIngestStartedEvent, { gitRoot, projectID })
 
+        const extractor = body.extract
+          ? await Effect.runPromise(
+              resolveLlmExtractor.pipe(
+                Effect.provide(Config.defaultLayer),
+                Effect.provide(Provider.defaultLayer),
+              ) as Effect.Effect<SessionExtractor, unknown, never>,
+            ).catch(() => NO_OP_EXTRACTOR)
+          : NO_OP_EXTRACTOR
+
         const program = ingest({
           gitRoot,
           dataDir,
           projectID: projectID ?? undefined,
           sources,
-          extract: NO_OP_EXTRACTOR,
+          extract: extractor,
           concurrency: body.concurrency,
         }).pipe(Effect.provide(ingestStack))
 
