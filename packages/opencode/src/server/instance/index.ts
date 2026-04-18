@@ -32,6 +32,7 @@ import { ErrorMiddleware } from "../middleware"
 import { MessageV2 } from "../../session/message-v2"
 import { SyncRoutes } from "./sync"
 import { MemoryRoutes } from "./memory"
+import { RolloutRoutes } from "./rollout"
 import { AppRuntime } from "@/effect/app-runtime"
 import { Effect } from "effect"
 import { TimerSvc } from "./timer"
@@ -57,6 +58,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
     .route("/config", ConfigRoutes())
     .route("/experimental", ExperimentalRoutes())
     .route("/session", SessionRoutes())
+    .route("/session", RolloutRoutes())
     .route("/thread", ThreadRoutes())
     .route("/turn", TurnRoutes())
     .route("/permission", PermissionRoutes())

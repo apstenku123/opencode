@@ -30,6 +30,7 @@ import { Permission } from "@/permission"
 import { Global } from "@/global"
 import * as History from "@/history"
 import * as Autobest from "@/autobest"
+import { RolloutPath } from "@/rollout/path"
 import { Effect, Layer, Option, Context } from "effect"
 
 const log = Log.create({ service: "session" })
@@ -74,6 +75,12 @@ export function fromRow(row: SessionRow): Info {
     share,
     revert,
     permission: row.permission ?? undefined,
+    // Rollout path is a pure derivative of session id — recomputable
+    // on demand. Expose it on `Info` so clients (TUI, ACP, server
+    // routes) don't need to know the path convention. The file may
+    // or may not actually exist on disk; callers that need to read
+    // it should go through RolloutReader.exists().
+    rolloutPath: RolloutPath.forSession(row.id),
     time: {
       created: row.time_created,
       updated: row.time_updated,
@@ -155,6 +162,14 @@ export const Info = z
         diff: z.string().optional(),
       })
       .optional(),
+    /**
+     * Absolute path to the session's rollout JSONL log on disk.
+     * Populated at session-start by the prompt loop (Stream G).
+     * Optional: sessions created before the rollout subsystem
+     * landed, or sessions running with rollouts disabled, carry
+     * `undefined`.
+     */
+    rolloutPath: z.string().optional(),
   })
   .meta({
     ref: "Session",
@@ -433,8 +448,9 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
       permission?: Permission.Ruleset
     }) {
       const ctx = yield* InstanceState.context
+      const sessionID = SessionID.descending(input.id)
       const result: Info = {
-        id: SessionID.descending(input.id),
+        id: sessionID,
         slug: Slug.create(),
         version: InstallationVersion,
         projectID: ctx.project.id,
@@ -443,6 +459,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
         parentID: input.parentID,
         title: input.title ?? createDefaultTitle(!!input.parentID),
         permission: input.permission,
+        rolloutPath: RolloutPath.forSession(sessionID),
         time: {
           created: Date.now(),
           updated: Date.now(),
