@@ -374,3 +374,135 @@ export function dispatcherFromAiTools(tools: Record<string, { execute?: (args: a
       catch: (err) => err,
     }).pipe(Effect.catch(() => Effect.void))
 }
+
+// ---------------------------------------------------------------------------
+// Real MCP wiring (round 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shape of the MCP service surface this module consumes. Limited to `tools()`
+ * because grounding is otherwise decoupled from the rest of the MCP lifecycle.
+ * Kept structural to simplify testing — callers can pass any object matching
+ * this shape, e.g. a mock or the real `MCP.Service`.
+ */
+export interface McpInterface {
+  readonly tools: () => Effect.Effect<Record<string, { execute?: (args: any, opts?: any) => unknown }>>
+}
+
+/**
+ * Build a {@link Dispatcher} from a live `MCP.Service`-shaped interface.
+ * Internally calls `mcp.tools()` on each dispatch (cheap — it just reads the
+ * cached AI-SDK tool map) and forwards to {@link dispatcherFromAiTools}.
+ *
+ * The returned dispatcher honours the same failure-swallowing contract as
+ * {@link dispatcherFromAiTools}; grounding is fire-and-forget.
+ *
+ * # Filtering
+ *
+ * This dispatcher does NOT re-filter by {@link isSearchLikeToolName} — that
+ * filter is applied at the {@link maybeDispatchGrounding} layer against the
+ * **candidate tool list** provided by the caller, so only search-like tools
+ * ever reach this dispatcher. Callers must pass the pre-filtered tool-name
+ * list to `maybeDispatchGrounding` (see `session/autobest-observer.ts`).
+ */
+export function dispatcherFromMcp(mcp: McpInterface): Dispatcher {
+  return (toolName, query) =>
+    Effect.gen(function* () {
+      const tools = yield* mcp.tools()
+      yield* dispatcherFromAiTools(tools)(toolName, query)
+    }).pipe(Effect.catch(() => Effect.void))
+}
+
+/**
+ * Surface the list of search-like tool names from an `MCP.Service`-shaped
+ * interface. Used by the observer to build the `tools` argument for
+ * {@link maybeDispatchGrounding}.
+ */
+export function listSearchToolsFromMcp(mcp: McpInterface): Effect.Effect<string[]> {
+  return Effect.gen(function* () {
+    const tools = yield* mcp.tools()
+    return Object.keys(tools).filter(isSearchLikeToolName)
+  }).pipe(Effect.catch(() => Effect.succeed([] as string[])))
+}
+
+// ---------------------------------------------------------------------------
+// History-event persistence
+// ---------------------------------------------------------------------------
+
+/**
+ * `autobest.grounding` history event shape. Mirrors the entry in
+ * `history/index.ts` Event union. Duplicated structurally here to keep the
+ * grounding module free of a hard dependency on history's type tree — the
+ * observer casts to the history `Event` union when persisting.
+ */
+export interface GroundingEvent {
+  readonly ts: number
+  readonly type: "autobest.grounding"
+  readonly sessionID: string
+  readonly outcome: "skipped" | "dispatched"
+  readonly reason?: string
+  readonly agentsSpawned?: number
+  readonly toolsUsed?: string[]
+  readonly turn: number
+}
+
+/**
+ * Build a `autobest.grounding` history event for a {@link GroundingOutcome}.
+ * Use alongside {@link maybeDispatchGrounding}:
+ *
+ * ```
+ * const outcome = yield* maybeDispatchGrounding({ ... })
+ * yield* Effect.promise(() => History.append(sessionID, buildGroundingEvent({
+ *   sessionID,
+ *   outcome,
+ *   currentTurn,
+ * })))
+ * ```
+ *
+ * For `skipped` outcomes the `turn` field carries the **current** turn rather
+ * than a dispatch turn — this lets cooldown accounting advance correctly
+ * (i.e. "last attempt was at turn N" regardless of outcome).
+ */
+export function buildGroundingEvent(input: {
+  sessionID: string
+  outcome: GroundingOutcome
+  currentTurn: number
+  ts?: number
+}): GroundingEvent {
+  const ts = input.ts ?? Date.now()
+  if (input.outcome.kind === "skipped") {
+    return {
+      ts,
+      type: "autobest.grounding",
+      sessionID: input.sessionID,
+      outcome: "skipped",
+      reason: input.outcome.reason,
+      turn: input.currentTurn,
+    }
+  }
+  return {
+    ts,
+    type: "autobest.grounding",
+    sessionID: input.sessionID,
+    outcome: "dispatched",
+    agentsSpawned: input.outcome.agentsSpawned,
+    toolsUsed: [...input.outcome.toolsUsed],
+    turn: input.outcome.turn,
+  }
+}
+
+/**
+ * Walk a sequence of `autobest.grounding` events newest-first and return
+ * the turn of the most recent **dispatched** event. `skipped` events do NOT
+ * count — cooldown only advances when we actually fired tools.
+ *
+ * Used by the observer to hydrate `lastGroundingTurn` from history at the
+ * start of each Step A iteration.
+ */
+export function lastDispatchedGroundingTurn(events: readonly GroundingEvent[]): number | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]!
+    if (ev.outcome === "dispatched") return ev.turn
+  }
+  return undefined
+}

@@ -226,3 +226,93 @@ export function shouldSubmit(decision: StepDecision): boolean {
 }
 
 export type { StepKind }
+
+// ---------------------------------------------------------------------------
+// Effect-based orchestration (round 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * Effect variant of {@link runSteps} that pulls the compact window via a
+ * {@link CompactWindowReader} and checks whether the assistant's tail ignored
+ * any plan step. When a plan step is skipped, the decision is emitted with
+ * `reason: "plan_step_skipped"` and `action` = the skipped item; otherwise
+ * delegates to the pure {@link runSteps} path.
+ *
+ * # Plan-skip detection
+ *
+ * - `runStepB` returns the next-unfinished plan item.
+ * - If `assistantTail` (last assistant text) mentions the item verbatim,
+ *   treat it as implicitly addressed and fall through to Step C.
+ * - Otherwise emit a Step B decision with `plan_step_skipped`.
+ *
+ * Callers pass the `assistantTail` directly rather than re-reading messages,
+ * so tests and production share one code path.
+ */
+export function runStepsEffect(input: {
+  readonly sessionID: string
+  readonly stepACandidates: readonly Candidate[]
+  readonly cycle?: CycleState
+  readonly maxIterations: number
+  readonly compactReader?: CompactWindowReader
+  readonly assistantTail?: string
+  readonly askWhereIsPlanOnEmpty?: boolean
+}): Effect.Effect<StepDecision> {
+  return Effect.gen(function* () {
+    // Step A — unchanged.
+    if (input.stepACandidates.length > 0) {
+      return {
+        kind: "a",
+        reason: "step_a_candidates",
+        action: input.stepACandidates[0]!.key,
+      } satisfies StepDecision
+    }
+
+    // Step B — read compact window via the supplied reader (may be absent).
+    const reader = input.compactReader ?? noCompactWindow
+    const window = yield* reader(input.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    const planCheck = runStepB(window)
+    if (planCheck && planCheck.hasPlan && planCheck.nextItem) {
+      // Plan-skip detection — if the assistant tail already mentions the
+      // next item, treat as addressed and fall through to C/D.
+      const skipped = assistantIgnoredPlan(planCheck.nextItem, input.assistantTail ?? "")
+      if (skipped) {
+        return {
+          kind: "b",
+          reason: "plan_step_skipped",
+          action: planCheck.nextItem,
+          planCheck,
+        } satisfies StepDecision
+      }
+    }
+
+    // Step C / D — empty follow-up.
+    const iteration = input.cycle?.iteration ?? 0
+    const followup = decideEmptyFollowup({
+      cycle: input.cycle,
+      iteration,
+      maxIterations: input.maxIterations,
+      askWhereIsPlanOnEmpty: input.askWhereIsPlanOnEmpty,
+    })
+    if (followup.kind === "c") {
+      return { kind: "c", reason: followup.reason, action: followup.action } satisfies StepDecision
+    }
+    return { kind: "d", reason: followup.reason, resultingAction: null } satisfies StepDecision
+  })
+}
+
+/**
+ * Returns `true` when the assistant's tail appears to have SKIPPED the
+ * supplied plan item — i.e. neither mentions it nor completes it.
+ *
+ * Heuristic:
+ *   - strip the bullet/number prefix from the item
+ *   - case-insensitive substring match against tail
+ *   - item text must be >= 6 chars to avoid spurious "go" / "do" matches
+ *
+ * Exported for tests.
+ */
+export function assistantIgnoredPlan(planItem: string, tail: string): boolean {
+  const trimmed = planItem.trim().replace(/^[-*\d.)\s]+/, "").toLowerCase()
+  if (trimmed.length < 6) return false
+  return !tail.toLowerCase().includes(trimmed)
+}

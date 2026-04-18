@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
 import {
+  assistantIgnoredPlan,
   decideEmptyFollowup,
   isStepA,
   isStepB,
@@ -7,8 +9,10 @@ import {
   isStepD,
   runStepB,
   runSteps,
+  runStepsEffect,
   shouldSubmit,
   type CompactWindow,
+  type CompactWindowReader,
 } from "@/autobest/steps"
 import type { Candidate, CycleState } from "@/autobest"
 
@@ -166,5 +170,108 @@ describe("autobest/steps - runSteps orchestration", () => {
 
     const second = runSteps({ stepACandidates: [], cycle, maxIterations: 3 })
     expect(second.kind).toBe("d")
+  })
+})
+
+describe("autobest/steps - assistantIgnoredPlan", () => {
+  test("returns true when tail does not mention the item", () => {
+    expect(assistantIgnoredPlan("- deploy the branch", "I wrote tests and stopped.")).toBe(true)
+  })
+
+  test("returns false when tail mentions the item verbatim", () => {
+    expect(assistantIgnoredPlan("- deploy the branch", "next I will deploy the branch now")).toBe(false)
+  })
+
+  test("returns false for short plan items to avoid false positives", () => {
+    expect(assistantIgnoredPlan("- go", "anything")).toBe(false)
+    expect(assistantIgnoredPlan("1. do x", "z")).toBe(false)
+  })
+
+  test("strips bullet/number prefixes before matching", () => {
+    expect(assistantIgnoredPlan("1. write docs", "I will write docs tomorrow")).toBe(false)
+    expect(assistantIgnoredPlan("* write docs", "unrelated")).toBe(true)
+  })
+})
+
+describe("autobest/steps - runStepsEffect", () => {
+  const readerFor = (window?: CompactWindow): CompactWindowReader =>
+    () => Effect.succeed(window)
+
+  test("Step A wins when candidates are present (effect variant)", async () => {
+    const dec = await Effect.runPromise(
+      runStepsEffect({
+        sessionID: "s",
+        stepACandidates: cands("rerun-test"),
+        maxIterations: 3,
+      }),
+    )
+    expect(dec.kind).toBe("a")
+    expect(dec.kind === "a" && dec.action).toBe("rerun-test")
+  })
+
+  test("Step B fires when plan item is unmentioned in tail", async () => {
+    const dec = await Effect.runPromise(
+      runStepsEffect({
+        sessionID: "s",
+        stepACandidates: [],
+        maxIterations: 3,
+        compactReader: readerFor({
+          id: 1,
+          actionItems: ["deploy the branch", "update changelog"],
+          completed: [],
+        }),
+        assistantTail: "I wrote tests and then stopped.",
+      }),
+    )
+    expect(dec.kind).toBe("b")
+    expect(dec.kind === "b" && dec.action).toBe("deploy the branch")
+    expect(dec.kind === "b" && dec.reason).toBe("plan_step_skipped")
+  })
+
+  test("Step B falls through to C when tail already mentions next plan item", async () => {
+    const dec = await Effect.runPromise(
+      runStepsEffect({
+        sessionID: "s",
+        stepACandidates: [],
+        maxIterations: 3,
+        compactReader: readerFor({
+          id: 1,
+          actionItems: ["deploy the branch"],
+          completed: [],
+        }),
+        assistantTail: "I will deploy the branch next.",
+      }),
+    )
+    expect(dec.kind).toBe("c")
+  })
+
+  test("Step C fires when no compact reader is supplied", async () => {
+    const dec = await Effect.runPromise(
+      runStepsEffect({ sessionID: "s", stepACandidates: [], maxIterations: 3 }),
+    )
+    expect(dec.kind).toBe("c")
+  })
+
+  test("Step D fires once cycle.whatNextAsked=true (effect variant)", async () => {
+    const cycle: CycleState = { iteration: 1, stepKind: "c", whatNextAsked: true }
+    const dec = await Effect.runPromise(
+      runStepsEffect({ sessionID: "s", stepACandidates: [], cycle, maxIterations: 3 }),
+    )
+    expect(dec.kind).toBe("d")
+  })
+
+  test("compactReader failure is swallowed and treated as undefined window", async () => {
+    const failing: CompactWindowReader = () => Effect.fail(new Error("boom") as never)
+    const dec = await Effect.runPromise(
+      runStepsEffect({
+        sessionID: "s",
+        stepACandidates: [],
+        maxIterations: 3,
+        compactReader: failing,
+        assistantTail: "x",
+      }),
+    )
+    // Falls through to Step C when no window available.
+    expect(dec.kind).toBe("c")
   })
 })

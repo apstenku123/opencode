@@ -248,6 +248,99 @@ describe("autobest/grounding - maybeDispatchGrounding", () => {
   })
 })
 
+describe("autobest/grounding - dispatcherFromMcp + history helpers", () => {
+  const buildMcp = (tools: Record<string, { execute?: (args: any) => unknown }>) => ({
+    tools: () => Effect.succeed(tools),
+  })
+
+  test("dispatcherFromMcp invokes tool.execute via MCP.tools()", async () => {
+    const seen: string[] = []
+    const mcp = buildMcp({
+      "exa:search": { execute: (args: { query: string }) => void seen.push(args.query) },
+    })
+    const dispatch = (await import("@/autobest/grounding")).dispatcherFromMcp(mcp)
+    await Effect.runPromise(dispatch("exa:search", "hello"))
+    expect(seen).toEqual(["hello"])
+  })
+
+  test("dispatcherFromMcp swallows errors from tools and from MCP.tools()", async () => {
+    const mod = await import("@/autobest/grounding")
+    const failingMcp = { tools: () => Effect.fail(new Error("mcp down")) } as any
+    await Effect.runPromise(mod.dispatcherFromMcp(failingMcp)("exa:search", "q"))
+    const throwingMcp = buildMcp({
+      "exa:search": {
+        execute: () => {
+          throw new Error("kaboom")
+        },
+      },
+    })
+    await Effect.runPromise(mod.dispatcherFromMcp(throwingMcp)("exa:search", "q"))
+    expect(true).toBe(true)
+  })
+
+  test("listSearchToolsFromMcp filters by isSearchLikeToolName", async () => {
+    const mod = await import("@/autobest/grounding")
+    const mcp = buildMcp({ "exa:search": {}, "filesystem:read": {}, "perplexity:ask": {} })
+    const names = await Effect.runPromise(mod.listSearchToolsFromMcp(mcp))
+    expect(names.sort()).toEqual(["exa:search", "perplexity:ask"])
+  })
+
+  test("listSearchToolsFromMcp returns [] when tools() fails", async () => {
+    const mod = await import("@/autobest/grounding")
+    const names = await Effect.runPromise(
+      mod.listSearchToolsFromMcp({ tools: () => Effect.fail(new Error("x")) } as any),
+    )
+    expect(names).toEqual([])
+  })
+
+  test("buildGroundingEvent encodes dispatched + skipped correctly", async () => {
+    const mod = await import("@/autobest/grounding")
+    const dispatched = mod.buildGroundingEvent({
+      sessionID: "s1",
+      currentTurn: 5,
+      outcome: {
+        kind: "dispatched",
+        agentsSpawned: 2,
+        toolsUsed: ["exa:search", "perplexity:ask"],
+        turn: 5,
+      },
+    })
+    expect(dispatched.outcome).toBe("dispatched")
+    expect(dispatched.turn).toBe(5)
+    expect(dispatched.toolsUsed).toEqual(["exa:search", "perplexity:ask"])
+    expect(dispatched.agentsSpawned).toBe(2)
+    expect(dispatched.type).toBe("autobest.grounding")
+
+    const skipped = mod.buildGroundingEvent({
+      sessionID: "s1",
+      currentTurn: 3,
+      outcome: { kind: "skipped", reason: "cooldown 2/8" },
+    })
+    expect(skipped.outcome).toBe("skipped")
+    expect(skipped.reason).toBe("cooldown 2/8")
+    expect(skipped.turn).toBe(3)
+  })
+
+  test("lastDispatchedGroundingTurn returns latest dispatched turn", async () => {
+    const mod = await import("@/autobest/grounding")
+    const events: import("@/autobest/grounding").GroundingEvent[] = [
+      { ts: 1, type: "autobest.grounding", sessionID: "s", outcome: "dispatched", turn: 2 },
+      { ts: 2, type: "autobest.grounding", sessionID: "s", outcome: "skipped", reason: "cooldown 0/8", turn: 3 },
+      { ts: 3, type: "autobest.grounding", sessionID: "s", outcome: "dispatched", turn: 7 },
+      { ts: 4, type: "autobest.grounding", sessionID: "s", outcome: "skipped", reason: "no_search_tools", turn: 8 },
+    ]
+    expect(mod.lastDispatchedGroundingTurn(events)).toBe(7)
+  })
+
+  test("lastDispatchedGroundingTurn returns undefined when only skipped events present", async () => {
+    const mod = await import("@/autobest/grounding")
+    const events = [
+      { ts: 1, type: "autobest.grounding" as const, sessionID: "s", outcome: "skipped" as const, reason: "x", turn: 1 },
+    ]
+    expect(mod.lastDispatchedGroundingTurn(events)).toBeUndefined()
+  })
+})
+
 describe("autobest/grounding - dispatcherFromAiTools", () => {
   test("invokes underlying execute and swallows errors", async () => {
     const calls = await Effect.runPromise(

@@ -5,8 +5,11 @@ import { MessageV2 } from "./message-v2"
 import * as LlmExtract from "@/autobest/llm-extract"
 import * as Steps from "@/autobest/steps"
 import * as Autobest from "@/autobest"
+import * as Grounding from "@/autobest/grounding"
+import { compactWindowReaderFromSession } from "@/autobest/compact-stub"
 import type { Candidate, CycleState, StepKind } from "@/autobest"
 import * as History from "@/history"
+import { MCP } from "@/mcp"
 
 /**
  * Default cap on auto-continue feedback iterations.
@@ -111,10 +114,15 @@ export namespace SessionAutobestObserver {
    */
   export const buildObserver = Effect.fn("autobest.observer.build")(function* (opts?: {
     maxIterations?: number
+    /** Optional grounding config override. Defaults to Rust parity values. */
+    grounding?: Partial<Grounding.GroundingConfig>
     /** Optional override for tests — defaults to `Session.Service.findMessage`. */
   }) {
     const session = yield* Session.Service
+    const mcp = yield* Effect.serviceOption(MCP.Service)
     const maxIterations = opts?.maxIterations ?? DEFAULT_MAX_ITERATIONS
+    const groundingCfg = opts?.grounding
+    const compactReader = compactWindowReaderFromSession(session)
     const observer: AdaptiveHooks.Observer = {
       name: "autobest",
       postIteration: (state, args) =>
@@ -152,18 +160,60 @@ export namespace SessionAutobestObserver {
           const candidates = extract(text)
 
           // Hydrate cycle state from history (durable across restarts).
-          const cycleEvents = (yield* Effect.promise(() => History.read(args.sessionID)))
-            .filter(
-              (ev): ev is Autobest.CycleEvent =>
-                ev.type === "autobest.cycle.advance" || ev.type === "autobest.cycle.reset",
-            )
+          const rawEvents = yield* Effect.promise(() => History.read(args.sessionID))
+          const cycleEvents = rawEvents.filter(
+            (ev): ev is Autobest.CycleEvent =>
+              ev.type === "autobest.cycle.advance" || ev.type === "autobest.cycle.reset",
+          )
+          const groundingEvents = rawEvents.filter(
+            (ev): ev is Grounding.GroundingEvent => ev.type === "autobest.grounding",
+          )
           const cycle = Autobest.reduceCycleEvents(cycleEvents)
           const iteration = cycle?.iteration ?? 0
+          const lastGroundingTurn = Grounding.lastDispatchedGroundingTurn(groundingEvents)
 
-          const decision = Steps.runSteps({
+          // Grounding — fire when Step A yielded no candidates AND an MCP
+          // service is available. Uses per-session cooldown from the
+          // `autobest.grounding` event history.
+          //
+          // Note: the Rust pipeline gates on `complaint=true`. Until the
+          // observer is wired to the LLM extractor, we approximate "complaint"
+          // with "empty Step A on a non-empty assistant text" — which is the
+          // same starvation signal that triggers Step B/C/D. Once
+          // `extractLlm()` is the observer's default we will switch to the
+          // explicit `complaint` flag (see round-4 backlog).
+          if (!candidates.length && Option.isSome(mcp)) {
+            // `MCP.Interface.tools()` is structurally compatible with
+            // `Grounding.McpInterface` — the latter is intentionally narrower
+            // so the grounding module does not pull the full MCP surface.
+            const mcpSvc: Grounding.McpInterface = mcp.value
+            const toolNames = yield* Grounding.listSearchToolsFromMcp(mcpSvc)
+            if (toolNames.length) {
+              const outcome = yield* Grounding.maybeDispatchGrounding({
+                currentTurn: iteration,
+                lastGroundingTurn,
+                complaintReason: "empty_extract",
+                tail: text.slice(-4_000),
+                tools: toolNames,
+                config: groundingCfg,
+                dispatcher: Grounding.dispatcherFromMcp(mcpSvc),
+              })
+              const groundingEv = Grounding.buildGroundingEvent({
+                sessionID: args.sessionID,
+                outcome,
+                currentTurn: iteration,
+              })
+              yield* Effect.promise(() => History.append(args.sessionID, groundingEv))
+            }
+          }
+
+          const decision = yield* Steps.runStepsEffect({
+            sessionID: args.sessionID,
             stepACandidates: candidates,
             cycle,
             maxIterations,
+            compactReader,
+            assistantTail: text,
           })
 
           if (decision.kind === "a" && candidates.length) {
