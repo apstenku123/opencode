@@ -9,6 +9,7 @@ import type {
   Command,
   PermissionRequest,
   QuestionRequest,
+  QuestionForwardedToParent,
   LspStatus,
   McpStatus,
   McpResource,
@@ -18,6 +19,7 @@ import type {
   ProviderAuthMethod,
   VcsInfo,
 } from "@opencode-ai/sdk/v2"
+import { ForwardedQueue, type ForwardedQueueState } from "../routes/session/forwarded-queue"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useProject } from "@tui/context/project"
 import { useEvent } from "@tui/context/event"
@@ -49,6 +51,14 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       question: {
         [sessionID: string]: QuestionRequest[]
       }
+      /**
+       * Forwarded child-session questions awaiting the parent user's
+       * decision. Keyed by `parentID` (the parent session whose UI must
+       * render the prompt). Populated from
+       * `Question.Event.ForwardedToParent` emitted by the sub-agent
+       * Guardian.
+       */
+      forwarded_question: ForwardedQueueState
       config: Config
       session: Session[]
       session_status: {
@@ -91,6 +101,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
       agent: [],
       permission: {},
       question: {},
+      forwarded_question: ForwardedQueue.empty(),
       command: [],
       provider: [],
       provider_default: {},
@@ -157,16 +168,37 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         case "question.replied":
         case "question.rejected": {
           const requests = store.question[event.properties.sessionID]
-          if (!requests) break
-          const match = Binary.search(requests, event.properties.requestID, (r) => r.id)
-          if (!match.found) break
-          setStore(
-            "question",
-            event.properties.sessionID,
-            produce((draft) => {
-              draft.splice(match.index, 1)
-            }),
+          if (requests) {
+            const match = Binary.search(requests, event.properties.requestID, (r) => r.id)
+            if (match.found) {
+              setStore(
+                "question",
+                event.properties.sessionID,
+                produce((draft) => {
+                  draft.splice(match.index, 1)
+                }),
+              )
+            }
+          }
+          // Also drop any forwarded entry for this requestID — the parent
+          // may have answered via the inline prompt, or the child may have
+          // been auto-resolved elsewhere.
+          const nextForwarded = ForwardedQueue.dismissByRequestID(
+            store.forwarded_question,
+            event.properties.requestID,
           )
+          if (nextForwarded !== store.forwarded_question) {
+            setStore("forwarded_question", nextForwarded)
+          }
+          break
+        }
+
+        case "question.forwarded_to_parent": {
+          const entry = event.properties as QuestionForwardedToParent
+          const next = ForwardedQueue.push(store.forwarded_question, entry)
+          if (next !== store.forwarded_question) {
+            setStore("forwarded_question", next)
+          }
           break
         }
 
