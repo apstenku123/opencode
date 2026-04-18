@@ -43,6 +43,24 @@ describe("SessionMemoryObserver.buildHooksConfig", () => {
     const out = SessionMemoryObserver.buildHooksConfig({ memories: { enabled: false } })
     expect(out.enabled).toBe(false)
   })
+
+  test("default retrieval mode is hybrid with 0.4 / 0.6 weights", () => {
+    const out = SessionMemoryObserver.buildHooksConfig(undefined)
+    expect(out.retrievalMode).toBe("hybrid")
+    expect(out.retrievalBm25Weight).toBe(0.4)
+    expect(out.retrievalEmbeddingWeight).toBe(0.6)
+  })
+
+  test("memories.retrieval.{mode, bm25Weight, embeddingWeight} override defaults", () => {
+    const out = SessionMemoryObserver.buildHooksConfig({
+      memories: {
+        retrieval: { mode: "bm25", bm25Weight: 0.8, embeddingWeight: 0.2 },
+      },
+    } as any)
+    expect(out.retrievalMode).toBe("bm25")
+    expect(out.retrievalBm25Weight).toBe(0.8)
+    expect(out.retrievalEmbeddingWeight).toBe(0.2)
+  })
 })
 
 describe("SessionMemoryObserver.resolveModelSpec", () => {

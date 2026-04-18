@@ -265,3 +265,97 @@ itFacade.live("Memory.add is idempotent on re-insert (hash dedup)", () =>
     expect(second.record.hashId).toBe(first.record.hashId)
   }),
 )
+
+// --------------------------------------------------------------------------
+// Mode dispatch: Memory.retrieve({ mode: "bm25" | "hybrid" })
+// --------------------------------------------------------------------------
+
+itFacade.live("Memory.retrieve mode=bm25 ranks by lexical overlap with no embedding", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    // Seed three sextuples with distinctive vocabulary so BM25 can separate.
+    yield* memory.add(sample("deadlock on shutdown", ["deadlock", "mutex"]))
+    yield* memory.add(sample("timeout in network call", ["timeout", "http"]))
+    yield* memory.add(sample("off-by-one in loop", ["loop", "boundary"]))
+    const hits = yield* memory.retrieve({
+      queryText: "deadlock mutex shutdown",
+      topK: 3,
+      mode: "bm25",
+    })
+    expect(hits.length).toBeGreaterThan(0)
+    expect(hits[0]!.record.problem).toBe("deadlock on shutdown")
+    // BM25 results carry a bm25Score annotation.
+    expect(hits[0]!.bm25Score).toBeDefined()
+    expect(hits[0]!.bm25Score!).toBeGreaterThan(0)
+  }),
+)
+
+itFacade.live("Memory.retrieve mode=hybrid blends BM25 + cosine channels", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    yield* memory.add(sample("deadlock on shutdown", ["deadlock", "mutex"]))
+    yield* memory.add(sample("timeout in network call", ["timeout", "http"]))
+    yield* memory.add(sample("off-by-one in loop", ["loop", "boundary"]))
+
+    const hits = yield* memory.retrieve({
+      queryText: "deadlock mutex shutdown",
+      topK: 3,
+      mode: "hybrid",
+    })
+    expect(hits.length).toBeGreaterThan(0)
+    // Expect the lexically + semantically matching "deadlock" record first.
+    expect(hits[0]!.record.problem).toBe("deadlock on shutdown")
+    // Hybrid hits expose both channel scores.
+    for (const h of hits) {
+      expect(h.bm25Score).toBeDefined()
+      expect(h.cosineScore).toBeDefined()
+    }
+  }),
+)
+
+itFacade.live("Memory.retrieve mode=hybrid falls back to BM25-only on empty corpus of embeddings", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    // Use addWithoutEmbedding so no cosine channel is available.
+    yield* memory.addWithoutEmbedding(sample("deadlock on shutdown", ["deadlock"]))
+    yield* memory.addWithoutEmbedding(sample("timeout network call", ["timeout"]))
+    const hits = yield* memory.retrieve({
+      queryText: "deadlock",
+      topK: 5,
+      mode: "hybrid",
+    })
+    expect(hits.length).toBeGreaterThan(0)
+    expect(hits[0]!.record.problem).toBe("deadlock on shutdown")
+  }),
+)
+
+itFacade.live("Memory.retrieve mode=cosine preserves round-1 semantics", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    yield* memory.add(sample("deadlock on shutdown", ["deadlock", "mutex"]))
+    yield* memory.add(sample("off-by-one in loop", ["loop", "boundary"]))
+    const hits = yield* memory.retrieve({
+      queryText: "deadlock mutex [PROBLEM] deadlock on shutdown",
+      topK: 2,
+      minScore: -1,
+      mode: "cosine",
+    })
+    expect(hits).toHaveLength(2)
+    expect(hits[0]!.record.problem).toBe("deadlock on shutdown")
+    expect(hits[0]!.cosineScore).toBeDefined()
+    // BM25 channel is not used in cosine mode.
+    expect(hits[0]!.bm25Score).toBeUndefined()
+  }),
+)
+
+itFacade.live("Memory.retrieve mode=hybrid returns [] on empty corpus", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    const hits = yield* memory.retrieve({
+      queryText: "anything",
+      topK: 5,
+      mode: "hybrid",
+    })
+    expect(hits).toEqual([])
+  }),
+)

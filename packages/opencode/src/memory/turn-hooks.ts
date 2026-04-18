@@ -45,7 +45,7 @@ import {
   type RefinedOutput,
   type RefiningModel,
 } from "./refining"
-import type { ScoredSextuple } from "./retrieval"
+import type { HybridWeights, RetrievalMode, ScoredSextuple } from "./retrieval"
 import type { DefectSextupleInput, SextupleSource } from "./schema"
 
 // --------------------------------------------------------------------------
@@ -130,6 +130,14 @@ export interface EnrichUserPromptInput {
   readonly querySynthModel?: SynthesizeModel
   /** Stage-2 rerank LLM bridge (omit ⇒ skip stage-2). */
   readonly rerankModel?: RerankModel
+  /**
+   * Stage-1 retrieval mode. Default `"hybrid"` — blends BM25 + cosine. Use
+   * `"cosine"` to preserve round-1 semantics; `"bm25"` for lex-only (no
+   * embedding provider needed).
+   */
+  readonly retrievalMode?: RetrievalMode
+  /** Hybrid blend weights (only meaningful when `retrievalMode === "hybrid"`). */
+  readonly retrievalWeights?: HybridWeights
 }
 
 export interface EnrichUserPromptResult {
@@ -183,14 +191,18 @@ export function enrichUserPromptWithMemories(
     const topK = input.topK ?? DEFAULT_RETRIEVAL_TOP_K
     // Stage-1: pull a pool of `topK * 4` candidates so the rerank stage has
     // room to re-order. Match Rust's STAGE1_POOL_MULTIPLIER behavior.
+    // `minScore = -1` for cosine so negative cosines still feed the rerank;
+    // hybrid + bm25 modes produce non-negative scores so the floor is a no-op
+    // for them but we pass it through uniformly for consistency.
+    const mode: RetrievalMode = input.retrievalMode ?? "hybrid"
     const stage1 = yield* input.memory
       .retrieve({
         queryText: synth.query,
         projectID: input.projectID,
         topK: topK * 4,
-        // Use `-1` so even negative-cosine candidates feed the rerank — the
-        // weighted merge + minScore filter will drop them later.
-        minScore: -1,
+        minScore: mode === "cosine" ? -1 : 0,
+        mode,
+        weights: input.retrievalWeights,
       })
       .pipe(Effect.catchCause(() => Effect.succeed([] as ScoredSextuple[])))
     if (stage1.length === 0) {
@@ -380,6 +392,14 @@ export interface MemoryHooksConfig {
   readonly rerankEnabled: boolean
   readonly retrievalTopK: number
   readonly retrievalMinScore: number
+  /**
+   * Stage-1 retrieval mode: `"cosine"` (round-1 default), `"bm25"`, or
+   * `"hybrid"` (default in S8 — blends BM25 + embedding).
+   */
+  readonly retrievalMode: RetrievalMode
+  /** Hybrid blend weights; applied when `retrievalMode === "hybrid"`. */
+  readonly retrievalBm25Weight: number
+  readonly retrievalEmbeddingWeight: number
 }
 
 export const DEFAULT_HOOKS_CONFIG: MemoryHooksConfig = {
@@ -389,6 +409,9 @@ export const DEFAULT_HOOKS_CONFIG: MemoryHooksConfig = {
   rerankEnabled: true,
   retrievalTopK: DEFAULT_RETRIEVAL_TOP_K,
   retrievalMinScore: 0.4,
+  retrievalMode: "hybrid",
+  retrievalBm25Weight: 0.4,
+  retrievalEmbeddingWeight: 0.6,
 }
 
 /**
@@ -422,6 +445,11 @@ export function registerMemoryTurnObserver(opts: MemoryTurnObserverOptions): Ada
           minScore: cfg.retrievalMinScore,
           querySynthModel: opts.querySynthModel,
           rerankModel: cfg.rerankEnabled ? opts.rerankModel : undefined,
+          retrievalMode: cfg.retrievalMode,
+          retrievalWeights: {
+            bm25Weight: cfg.retrievalBm25Weight,
+            embeddingWeight: cfg.retrievalEmbeddingWeight,
+          },
         })
         if (result.block) {
           state.scratch[ENRICHMENT_SCRATCH_KEY] = result.block

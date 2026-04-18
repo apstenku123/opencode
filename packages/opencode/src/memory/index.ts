@@ -32,7 +32,13 @@ import {
   type SextupleSource,
   embeddingKey,
 } from "./schema"
-import { MemoryRetrieval, type RetrieveInput, type ScoredSextuple } from "./retrieval"
+import {
+  MemoryRetrieval,
+  type HybridWeights,
+  type RetrievalMode,
+  type RetrieveInput,
+  type ScoredSextuple,
+} from "./retrieval"
 import { MemoryStorage } from "./storage"
 import {
   enrichUserPromptWithMemories,
@@ -54,6 +60,17 @@ export namespace Memory {
     readonly projectID?: string
     readonly topK?: number
     readonly minScore?: number
+    /**
+     * Retrieval ranking mode. Default `"cosine"` for backward-compat with
+     * round-1 callers. `"bm25"` skips the embedding channel entirely;
+     * `"hybrid"` blends BM25 + cosine with {@link HybridWeights}.
+     */
+    readonly mode?: RetrievalMode
+    /**
+     * Hybrid weights — ignored unless `mode === "hybrid"`. Defaults to
+     * `{ bm25Weight: 0.4, embeddingWeight: 0.6 }` (matches `src/skill`).
+     */
+    readonly weights?: HybridWeights
   }
 
   export interface Interface {
@@ -204,6 +221,40 @@ export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval |
         return { inserted, embedded: true, record }
       })
 
+    // Unified retrieve() — dispatches on `mode` and falls back gracefully
+    // when the embedding channel is unavailable (e.g. provider outage).
+    const retrieveImpl = ({
+      queryText,
+      projectID,
+      topK,
+      minScore,
+      mode = "cosine",
+      weights,
+    }: Memory.RetrieveByTextInput) =>
+      Effect.gen(function* () {
+        if (mode === "bm25") {
+          return yield* retrieval.retrieveBm25({ queryText, projectID, topK })
+        }
+        if (mode === "hybrid") {
+          // Best-effort embed: on failure we still run the BM25 channel
+          // (consistent with `src/skill/retrieval.ts` behaviour).
+          const queryEmbedding = yield* embedder
+            .embed(queryText)
+            .pipe(Effect.catchCause(() => Effect.succeed(new Float32Array(0))))
+          return yield* retrieval.retrieveHybrid({
+            queryText,
+            queryEmbedding: queryEmbedding.length > 0 ? queryEmbedding : undefined,
+            projectID,
+            topK,
+            minScore,
+            weights,
+          })
+        }
+        // Default: cosine (preserve round-1 semantics).
+        const queryEmbedding = yield* embedder.embed(queryText)
+        return yield* retrieval.retrieve({ queryEmbedding, projectID, topK, minScore })
+      })
+
     // Build a Memory.Interface-shaped sub-facade used by `enrichPrompt` /
     // `runPhase1` / `extractFromTurn` to avoid a self-referential capture
     // cycle. The sub-facade exposes only the calls the pipeline needs
@@ -215,11 +266,7 @@ export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval |
       embed: () => Effect.die(`${tag}: embed not allowed`),
       get: (hashId) => storage.getByHash(hashId),
       listByProject: (projectID, limit) => storage.listByProject(projectID, limit),
-      retrieve: ({ queryText, projectID, topK, minScore }) =>
-        Effect.gen(function* () {
-          const queryEmbedding = yield* embedder.embed(queryText)
-          return yield* retrieval.retrieve({ queryEmbedding, projectID, topK, minScore })
-        }),
+      retrieve: retrieveImpl,
       retrieveByEmbedding: (i) => retrieval.retrieve(i),
       enrichPrompt: () => Effect.die(`${tag}: enrichPrompt recursion not allowed`),
       runPhase1: () => Effect.die(`${tag}: runPhase1 recursion not allowed`),
@@ -248,11 +295,7 @@ export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval |
       get: (hashId) => storage.getByHash(hashId),
       listByProject: (projectID, limit) => storage.listByProject(projectID, limit),
 
-      retrieve: ({ queryText, projectID, topK, minScore }) =>
-        Effect.gen(function* () {
-          const queryEmbedding = yield* embedder.embed(queryText)
-          return yield* retrieval.retrieve({ queryEmbedding, projectID, topK, minScore })
-        }),
+      retrieve: retrieveImpl,
 
       retrieveByEmbedding: (input) => retrieval.retrieve(input),
 
@@ -333,9 +376,21 @@ export const defaultLayer: Layer.Layer<Memory | MemoryStorage | MemoryRetrieval 
 // Re-exports so callers can `import { Memory, EmbeddingService, … } from "@/memory"`.
 export { EmbeddingService, mockLayer as mockEmbeddingLayer, openAICompatLayer } from "./embedding"
 export { MemoryStorage, layer as memoryStorageLayer } from "./storage"
-export { MemoryRetrieval, cosineSimilarity, rankByCosine, layer as memoryRetrievalLayer } from "./retrieval"
+export {
+  MemoryRetrieval,
+  cosineSimilarity,
+  rankByCosine,
+  rankByBm25,
+  rankByHybrid,
+  blendHybridScores,
+  DEFAULT_BM25_WEIGHT,
+  DEFAULT_EMBEDDING_WEIGHT,
+  Bm25MemoryIndex,
+  sextupleDocText,
+  layer as memoryRetrievalLayer,
+} from "./retrieval"
 export type { DefectSextuple, DefectSextupleInput, SextupleSource } from "./schema"
-export type { ScoredSextuple, RetrieveInput } from "./retrieval"
+export type { ScoredSextuple, RetrieveInput, RetrievalMode, HybridWeights, Bm25Hit } from "./retrieval"
 export * as MemorySchema from "./schema"
 
 // Round-2 surfaces.

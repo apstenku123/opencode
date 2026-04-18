@@ -89,8 +89,21 @@ export namespace SessionMemoryObserver {
    * Pull the config into a typed `MemoryHooksConfig`. Falls back to
    * `DEFAULT_HOOKS_CONFIG` semantics (memories disabled by default).
    */
-  export function buildHooksConfig(cfg: { memories?: Partial<MemoryHooksConfig> } | undefined): MemoryHooksConfig {
+  export function buildHooksConfig(
+    cfg:
+      | {
+          memories?: Partial<MemoryHooksConfig> & {
+            retrieval?: {
+              mode?: MemoryHooksConfig["retrievalMode"]
+              bm25Weight?: number
+              embeddingWeight?: number
+            }
+          }
+        }
+      | undefined,
+  ): MemoryHooksConfig {
     const m = cfg?.memories
+    const r = m?.retrieval
     return {
       enabled: m?.enabled ?? DEFAULT_HOOKS_CONFIG.enabled,
       retrievalEnabled: m?.retrievalEnabled ?? DEFAULT_HOOKS_CONFIG.retrievalEnabled,
@@ -98,6 +111,12 @@ export namespace SessionMemoryObserver {
       rerankEnabled: m?.rerankEnabled ?? DEFAULT_HOOKS_CONFIG.rerankEnabled,
       retrievalTopK: m?.retrievalTopK ?? DEFAULT_HOOKS_CONFIG.retrievalTopK,
       retrievalMinScore: m?.retrievalMinScore ?? DEFAULT_HOOKS_CONFIG.retrievalMinScore,
+      retrievalMode:
+        r?.mode ?? m?.retrievalMode ?? DEFAULT_HOOKS_CONFIG.retrievalMode,
+      retrievalBm25Weight:
+        r?.bm25Weight ?? m?.retrievalBm25Weight ?? DEFAULT_HOOKS_CONFIG.retrievalBm25Weight,
+      retrievalEmbeddingWeight:
+        r?.embeddingWeight ?? m?.retrievalEmbeddingWeight ?? DEFAULT_HOOKS_CONFIG.retrievalEmbeddingWeight,
     }
   }
 

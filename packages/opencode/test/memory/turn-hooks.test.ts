@@ -182,6 +182,43 @@ it.live("enrichUserPromptWithMemories returns block when stored sextuples match"
   }),
 )
 
+it.live("enrichUserPromptWithMemories mode=hybrid returns BM25-biased block without embeddings", () =>
+  Effect.gen(function* () {
+    const memory = yield* Memory
+    // Seed with addWithoutEmbedding so only the BM25 channel fires.
+    yield* memory.addWithoutEmbedding({
+      keywords: ["deadlock", "mutex"],
+      problem: "deadlock on shutdown",
+      rootCause: "lock-ordering inversion",
+      solution: "unify lock acquisition order",
+      source: seedSource,
+    })
+    yield* memory.addWithoutEmbedding({
+      keywords: ["timeout"],
+      problem: "timeout in network call",
+      rootCause: "no retry",
+      solution: "backoff + retry",
+      source: seedSource,
+    })
+    const out = yield* enrichUserPromptWithMemories({
+      memory,
+      userPrompt: "deadlock mutex shutdown",
+      topK: 2,
+      // Use minScore=-1 since hybrid min-max normalises to [0,1] and stage-2
+      // rerank's default minScore=0.4 would drop the second candidate.
+      minScore: -1,
+      retrievalMode: "hybrid",
+    })
+    // Stage-1 must have at least surfaced BM25 candidates. Block content
+    // may or may not render depending on stage-2 merge; we only assert
+    // the BM25 channel fired.
+    expect(out.stage1.length).toBeGreaterThan(0)
+    expect(out.stage1.some((h) => (h as any).bm25Score !== undefined)).toBe(true)
+    // With minScore=-1 the deadlock record should be the top stage-1 hit.
+    expect(out.stage1[0]!.record.problem).toBe("deadlock on shutdown")
+  }),
+)
+
 it.live("enrichUserPromptWithMemories returns block null when stage-1 is empty", () =>
   Effect.gen(function* () {
     const memory = yield* Memory

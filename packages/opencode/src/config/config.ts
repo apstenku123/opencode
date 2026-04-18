@@ -430,6 +430,33 @@ export const Info = z
           .describe(
             "Provider/model identifier used for query synthesis during retrieval. Falls back to regex keyword extraction when unset.",
           ),
+        retrieval: z
+          .object({
+            mode: z
+              .enum(["cosine", "bm25", "hybrid"])
+              .optional()
+              .describe(
+                "Stage-1 retrieval ranker. `cosine` = embedding-only (round-1 default). `bm25` = pure lexical BM25. `hybrid` = min-max normalised weighted sum of both channels. Default: `hybrid`.",
+              ),
+            bm25Weight: z
+              .number()
+              .min(0)
+              .optional()
+              .describe(
+                "Weight for the BM25 channel in hybrid mode. Clamped to `>= 0`. Default: 0.4.",
+              ),
+            embeddingWeight: z
+              .number()
+              .min(0)
+              .optional()
+              .describe(
+                "Weight for the embedding/cosine channel in hybrid mode. Clamped to `>= 0`. Default: 0.6.",
+              ),
+          })
+          .optional()
+          .describe(
+            "Stage-1 retrieval ranker configuration. Controls how the `<similar_past_problems>` candidate pool is ordered before the optional stage-2 LLM rerank.",
+          ),
       })
       .optional()
       .describe(
