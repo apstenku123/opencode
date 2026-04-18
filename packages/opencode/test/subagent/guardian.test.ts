@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Fiber, Layer } from "effect"
+import { Effect, Exit, Fiber, Layer, Cause } from "effect"
 import { Bus } from "../../src/bus"
 import { Guardian } from "../../src/subagent/guardian"
 import { GuardianTestUtils } from "../../src/subagent/guardian-test-utils"
@@ -198,6 +198,53 @@ describe("Guardian live bus subscription", () => {
         expect(events.length).toBe(1)
 
         off()
+      }),
+    )
+  })
+
+  test("reject cascade: forwarded request rejected by parent propagates RejectedError to child", async () => {
+    await run(
+      Effect.gen(function* () {
+        const registry = yield* SubagentRegistry.Service
+        const sessions = yield* Session.Service
+        const q = yield* Question.Service
+        yield* Guardian.Service
+
+        const parent = yield* sessions.create({ title: "parent" })
+        const child = yield* sessions.create({ parentID: parent.id, title: "child" })
+        yield* registry.spawn(parent.id, child.id)
+
+        const asking = yield* Effect.forkChild(
+          Effect.exit(
+            q.ask({
+              sessionID: child.id,
+              questions: [
+                {
+                  question: "danger?",
+                  header: "danger",
+                  options: [{ label: "go", description: "" }],
+                },
+              ] as Question.Info[],
+            }),
+          ),
+        )
+
+        // Let guardian see the question and forward it.
+        yield* Effect.sleep("50 millis")
+
+        const list = yield* q.list()
+        expect(list.length).toBe(1)
+        yield* q.reject(list[0].id)
+
+        const exit = yield* Fiber.join(asking)
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          const squashed = Cause.squash(exit.cause) as Question.RejectedError
+          expect(squashed._tag).toBe("QuestionRejectedError")
+        }
+
+        const stats = yield* Guardian.Service.use((g) => g.stats())
+        expect(stats.forwarded).toBeGreaterThanOrEqual(1)
       }),
     )
   })
