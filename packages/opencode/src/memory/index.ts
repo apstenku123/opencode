@@ -314,3 +314,16 @@ export type {
   MemoryHooksConfig,
   MemoryTurnObserverOptions,
 } from "./turn-hooks"
+
+// Round-3 surfaces.
+export {
+  autoTrigger,
+  autoTriggerOnBootstrap,
+  autoTriggerMarkerPath,
+  readLastTriggerAt,
+  writeLastTriggerAt,
+  NOOP_POLISHER,
+  AUTO_TRIGGER_COOLDOWN_MS,
+  AUTO_TRIGGER_COMMIT_LIMIT,
+} from "./auto-trigger"
+export type { AutoTriggerInput, AutoTriggerResult } from "./auto-trigger"

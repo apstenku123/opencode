@@ -31,6 +31,8 @@ import {
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
 import { ForeignIngestDoneTable, MemorySextupleTable } from "../../memory/memory.sql"
 import { ingest, type ForeignIngestSources, type SessionExtractor } from "../../memory/foreign-ingest"
+import { crawl } from "../../memory/commit-crawler"
+import { NOOP_POLISHER } from "../../memory/auto-trigger"
 
 // --------------------------------------------------------------------------
 // Bus event
@@ -62,6 +64,16 @@ export const MemoryIngestCompletedEvent = BusEvent.define(
     projectID: z.string().nullable(),
     discovered: z.number().int(),
     inserted: z.number().int(),
+    durationMs: z.number().int(),
+  }),
+)
+
+export const MemoryCrawlCompletedEvent = BusEvent.define(
+  "memory.crawl.completed",
+  z.object({
+    repoRoot: z.string(),
+    commitsWalked: z.number().int(),
+    sextuplesEmitted: z.number().int(),
     durationMs: z.number().int(),
   }),
 )
@@ -119,6 +131,24 @@ const IngestResponse = z
     durationMs: z.number().int(),
   })
   .meta({ ref: "MemoryIngestResponse" })
+
+const CrawlRequestBody = z
+  .object({
+    repoRoot: z.string().optional(),
+    limit: z.number().int().positive().max(1000).optional(),
+  })
+  .meta({ ref: "MemoryCrawlRequest" })
+
+const CrawlResponse = z
+  .object({
+    repoRoot: z.string(),
+    commitsWalked: z.number().int(),
+    sextuplesEmitted: z.number().int(),
+    skippedTrivial: z.number().int(),
+    errors: z.number().int(),
+    durationMs: z.number().int(),
+  })
+  .meta({ ref: "MemoryCrawlResponse" })
 
 // --------------------------------------------------------------------------
 // Layer composition
@@ -257,6 +287,45 @@ export const MemoryRoutes = () =>
           skippedDone: stats.skippedDone,
           parseFailed: stats.parseFailed,
           produced: stats.produced,
+          durationMs: stats.durationMs,
+        })
+      },
+    )
+    .post(
+      "/crawl",
+      describeRoute({
+        summary: "Run the commit crawler for the current repo",
+        description:
+          "Walk up to `limit` recent commits in the given repo and extract sextuples into the per-repo JSONL cache. The round-3 default polisher is a no-op — SHAs remain pending until the real LLM polisher is wired.",
+        operationId: "memory.crawl",
+        responses: {
+          200: {
+            description: "Crawl stats",
+            content: { "application/json": { schema: resolver(CrawlResponse) } },
+          },
+        },
+      }),
+      validator("json", CrawlRequestBody.optional()),
+      async (c) => {
+        const body = (c.req.valid("json") ?? {}) as z.infer<typeof CrawlRequestBody>
+        const repoRoot = body.repoRoot ?? Instance.worktree
+        const dataDir = (await import("../../global")).Global.Path.data
+        const limit = body.limit ?? 50
+        const stats = await Effect.runPromise(
+          crawl({ repoRoot, dataDir, limit, polish: NOOP_POLISHER }),
+        )
+        await Bus.publish(MemoryCrawlCompletedEvent, {
+          repoRoot,
+          commitsWalked: stats.commitsWalked,
+          sextuplesEmitted: stats.sextuplesEmitted,
+          durationMs: stats.durationMs,
+        })
+        return c.json({
+          repoRoot,
+          commitsWalked: stats.commitsWalked,
+          sextuplesEmitted: stats.sextuplesEmitted,
+          skippedTrivial: stats.skippedTrivial,
+          errors: stats.errors,
           durationMs: stats.durationMs,
         })
       },

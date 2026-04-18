@@ -19,6 +19,7 @@ import { Filesystem } from "./util"
 import { DebugCommand } from "./cli/cmd/debug"
 import { StatsCommand } from "./cli/cmd/stats"
 import { McpCommand } from "./cli/cmd/mcp"
+import { MemoryCommand } from "./cli/cmd/memory"
 import { GithubCommand } from "./cli/cmd/github"
 import { ExportCommand } from "./cli/cmd/export"
 import { ImportCommand } from "./cli/cmd/import"
@@ -151,6 +152,7 @@ const cli = yargs(args)
   .completion("completion", "generate shell completion script")
   .command(AcpCommand)
   .command(McpCommand)
+  .command(MemoryCommand)
   .command(TuiThreadCommand)
   .command(AttachCommand)
   .command(RunCommand)

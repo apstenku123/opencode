@@ -13,6 +13,7 @@ import { FileWatcher } from "@/file/watcher"
 import { ShareNext } from "@/share"
 import * as Effect from "effect/Effect"
 import { Config } from "@/config"
+import { autoTriggerOnBootstrap } from "../memory/auto-trigger"
 
 export const InstanceBootstrap = Effect.gen(function* () {
   Log.Default.info("bootstrapping", { directory: Instance.directory })
@@ -39,4 +40,10 @@ export const InstanceBootstrap = Effect.gen(function* () {
       }
     }),
   )
+
+  // Round-3 memory auto-trigger: opportunistically crawl recent commits
+  // when `memories.enabled` is true and the per-repo cooldown has
+  // elapsed. Forked so bootstrap never blocks on git/LLM latency; any
+  // failure is swallowed by `autoTriggerOnBootstrap`.
+  yield* Effect.forkDetach(autoTriggerOnBootstrap)
 }).pipe(Effect.withSpan("InstanceBootstrap"))
