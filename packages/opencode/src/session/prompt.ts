@@ -23,6 +23,7 @@ import MAX_STEPS from "../session/prompt/max-steps.txt"
 import { ToolRegistry } from "../tool"
 import { Apps } from "../apps"
 import { MCP } from "../mcp"
+import { Connectors } from "../mcp/connectors"
 import { LSP } from "../lsp"
 import { FileTime } from "../file/time"
 import { Flag } from "../flag/flag"
@@ -589,8 +590,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
         const dir = Apps.bundled()
         const { known, unknown } = Apps.resolveFromText(dir, combined)
-        const note = Apps.renderSyntheticNote(known, unknown)
-        if (!note) return input.messages
+        const baseNote = Apps.renderSyntheticNote(known, unknown)
+        if (!baseNote) return input.messages
+
+        // R7: when the connector module has live MCP tools for any of the
+        // resolved apps, append a short hint enumerating the available tool
+        // names so the model can plan its turn without guessing. Failures
+        // here are non-fatal: if tool discovery errors out we keep the base
+        // note and move on.
+        let connectorNote = ""
+        if (known.length > 0) {
+          const tools = yield* mcp.tools().pipe(Effect.catch(() => Effect.succeed({})))
+          const resolution = Connectors.resolve(known, tools)
+          connectorNote = Connectors.hint(resolution)
+        }
+
+        const note = connectorNote ? `${baseNote}\n\n${connectorNote}` : baseNote
 
         userMessage.parts.push({
           id: PartID.ascending(),

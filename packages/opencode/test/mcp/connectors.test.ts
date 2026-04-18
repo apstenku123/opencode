@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test"
+import { Effect, Layer } from "effect"
 import type { Tool } from "ai"
 import { Apps } from "@/apps"
+import { MCP } from "@/mcp"
 import {
   Connectors,
+  ConnectorNotResolvedError,
   filterConnectorTools,
+  findConnectorTool,
+  invokeConnector,
   renderConnectorHint,
   resolveConnectors,
   resolveFromApps,
@@ -127,5 +132,150 @@ describe("mcp/connectors - Connectors namespace", () => {
     expect(typeof Connectors.resolve).toBe("function")
     expect(typeof Connectors.filter).toBe("function")
     expect(typeof Connectors.hint).toBe("function")
+    expect(typeof Connectors.findTool).toBe("function")
+    expect(typeof Connectors.invoke).toBe("function")
+  })
+})
+
+// --- findConnectorTool ---
+
+describe("mcp/connectors - findConnectorTool", () => {
+  test("locates the tool by sanitized `<server>_<name>` key", () => {
+    const dir = Apps.bundled()
+    const gh = dir.byId.get("github")!
+    const tools = toolsMap(["github_list_repos", "slack_post"])
+    const hit = findConnectorTool(gh, "list_repos", tools)
+    expect(hit?.key).toBe("github_list_repos")
+    expect(hit?.tool).toBe(tools["github_list_repos"])
+  })
+
+  test("returns undefined when the app has no mcpServer binding", () => {
+    const docOnly = { id: "docapp", name: "DocApp" }
+    expect(findConnectorTool(docOnly, "any", toolsMap(["docapp_any"]))).toBeUndefined()
+  })
+
+  test("returns undefined when no matching tool exists", () => {
+    const dir = Apps.bundled()
+    const gh = dir.byId.get("github")!
+    expect(findConnectorTool(gh, "unknown", toolsMap(["github_other"]))).toBeUndefined()
+  })
+})
+
+// --- invokeConnector ---
+
+/**
+ * Minimal in-memory MCP Service stub: only needs `tools()` for
+ * invokeConnector. All other methods throw on access so a regression
+ * that expands the invocation surface is caught immediately.
+ */
+function mockMcpLayer(tools: Record<string, Tool>) {
+  const stub = new Proxy(
+    {
+      tools: () => Effect.succeed(tools),
+    },
+    {
+      get(target, prop: string) {
+        const val = (target as Record<string, unknown>)[prop]
+        if (val !== undefined) return val
+        throw new Error(`mock MCP.Service: unexpected access to "${prop}"`)
+      },
+    },
+  ) as unknown as MCP.Interface
+  return Layer.succeed(MCP.Service, stub)
+}
+
+describe("mcp/connectors - invokeConnector", () => {
+  test("calls the resolved tool's execute with the supplied args", async () => {
+    const dir = Apps.bundled()
+    const gh = dir.byId.get("github")!
+    const calls: Array<{ args: unknown }> = []
+    const tool: Tool = {
+      description: "create issue",
+      inputSchema: { type: "object", properties: {} },
+      execute: async (args: unknown) => {
+        calls.push({ args })
+        return { content: [{ type: "text", text: "ok" }] }
+      },
+    } as unknown as Tool
+    const tools: Record<string, Tool> = { github_create_issue: tool }
+    const result = await Effect.runPromise(
+      invokeConnector(gh, "create_issue", { title: "bug", body: "repro" }).pipe(Effect.provide(mockMcpLayer(tools))),
+    )
+    expect(result.app.id).toBe("github")
+    expect(result.toolKey).toBe("github_create_issue")
+    expect(result.toolName).toBe("create_issue")
+    expect((result.result as { content: { text: string }[] }).content[0].text).toBe("ok")
+    expect(calls).toHaveLength(1)
+    expect((calls[0].args as { title: string }).title).toBe("bug")
+  })
+
+  test("fails with ConnectorNotResolvedError when the app has no mcpServer", async () => {
+    const docOnly = { id: "docapp", name: "DocApp" }
+    await Effect.runPromise(
+      invokeConnector(docOnly, "anything", {}).pipe(
+        Effect.catch((e) => {
+          expect(e).toBeInstanceOf(ConnectorNotResolvedError)
+          expect((e as ConnectorNotResolvedError).reason).toBe("no-mcp-server")
+          return Effect.void
+        }),
+        Effect.provide(mockMcpLayer({})),
+      ),
+    )
+  })
+
+  test("fails with ConnectorNotResolvedError when the tool is not live", async () => {
+    const dir = Apps.bundled()
+    const gh = dir.byId.get("github")!
+    await Effect.runPromise(
+      invokeConnector(gh, "missing", {}).pipe(
+        Effect.catch((e) => {
+          expect(e).toBeInstanceOf(ConnectorNotResolvedError)
+          expect((e as ConnectorNotResolvedError).reason).toBe("tool-not-found")
+          return Effect.void
+        }),
+        Effect.provide(mockMcpLayer({ slack_post: fakeTool("slack_post") })),
+      ),
+    )
+  })
+
+  test("fails with ConnectorNotResolvedError when the tool has no execute", async () => {
+    const dir = Apps.bundled()
+    const gh = dir.byId.get("github")!
+    const toolNoExec = {
+      description: "abstract",
+      inputSchema: { type: "object", properties: {} },
+    } as unknown as Tool
+    await Effect.runPromise(
+      invokeConnector(gh, "abstract", {}).pipe(
+        Effect.catch((e) => {
+          expect(e).toBeInstanceOf(ConnectorNotResolvedError)
+          expect((e as ConnectorNotResolvedError).reason).toBe("not-executable")
+          return Effect.void
+        }),
+        Effect.provide(mockMcpLayer({ github_abstract: toolNoExec })),
+      ),
+    )
+  })
+
+  test("rethrows errors from the underlying tool execute", async () => {
+    const dir = Apps.bundled()
+    const gh = dir.byId.get("github")!
+    const tool: Tool = {
+      description: "failing",
+      inputSchema: { type: "object", properties: {} },
+      execute: async () => {
+        throw new Error("upstream failure")
+      },
+    } as unknown as Tool
+    await Effect.runPromise(
+      invokeConnector(gh, "broken", {}).pipe(
+        Effect.catch((e) => {
+          expect(e).toBeInstanceOf(Error)
+          expect((e as Error).message).toContain("upstream failure")
+          return Effect.void
+        }),
+        Effect.provide(mockMcpLayer({ github_broken: tool })),
+      ),
+    )
   })
 })
