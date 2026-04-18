@@ -55,6 +55,22 @@ const CAPABILITY_RANK: Record<ModelCapability, number> = {
 /** Cooldowns longer than this are presumed stale (legacy 24h evictions). */
 export const STALE_COOLDOWN_THRESHOLD_MS = 60 * 60 * 1000
 
+/**
+ * Thrown by `acquire()` when the bounded wait (`ACQUIRE_TIMEOUT_MS` by
+ * default) elapses without a slot opening up. Mirrors Rust
+ * `AcquireError::Timeout` (`account_pool.rs:820-840`). Callers can
+ * distinguish this from an `AbortError` by `instanceof AcquireTimeoutError`.
+ */
+export class AcquireTimeoutError extends Error {
+  readonly kind = "AcquireTimeout" as const
+  readonly timeoutMs: number
+  constructor(timeoutMs: number) {
+    super(`AccountPool.acquire timed out after ${timeoutMs}ms`)
+    this.name = "AcquireTimeoutError"
+    this.timeoutMs = timeoutMs
+  }
+}
+
 export type AccountEntry = {
   key: string
   label?: string
@@ -82,8 +98,14 @@ export type Lease = {
    * old slot remains held (caller keeps dispatch rights).
    */
   reassign(newKey: string): Lease
-  /** Allow `await using lease = …` in callers that want RAII. */
-  [Symbol.dispose]?(): void
+  /**
+   * Allow `using lease = await pool.acquire(…)` (TS 5.2+). Automatically
+   * releases the slot when the binding goes out of scope, matching the
+   * Rust `Drop for AccountLease` RAII guarantee (`account_pool.rs:320-345`).
+   */
+  [Symbol.dispose](): void
+  /** Async-RAII variant for `await using lease = await pool.acquire(…)`. */
+  [Symbol.asyncDispose](): Promise<void>
 }
 
 export type AcquireOptions = {
@@ -192,6 +214,29 @@ export class AccountPool {
     return [...this.accounts]
   }
 
+  /**
+   * Key of the primary account, if any. Mirrors Rust
+   * `AccountPool::primary_key` (`account_pool.rs:429-470`). The first
+   * explicitly-flagged `primary: true` entry wins; with no explicit flag the
+   * account whose key is `"github-copilot"` is primary (matching the Rust
+   * default). Returns `undefined` when the roster is empty or contains no
+   * primary-eligible entry.
+   */
+  getPrimaryKey(): string | undefined {
+    const explicit = this.accounts.find((item) => item.primary)
+    return explicit?.key
+  }
+
+  /** Account keys tagged as non-primary (backup). */
+  getBackupKeys(): string[] {
+    return this.accounts.filter((item) => !item.primary).map((item) => item.key)
+  }
+
+  /** `true` when `key` resolves to the primary account in the roster. */
+  isPrimary(key: string): boolean {
+    return this.getPrimaryKey() === key
+  }
+
   /** Start the lease-GC timer. Safe to call multiple times. */
   start() {
     if (this.gc) return
@@ -231,16 +276,16 @@ export class AccountPool {
     return Math.max(0, limit - inUse)
   }
 
-  private candidates(preferSecondary: boolean): AccountEntry[] {
+  private candidates(preferSecondary: boolean, now: number): AccountEntry[] {
     if (!preferSecondary) return this.accounts
     const backups = this.accounts.filter((item) => !item.primary)
-    const now = Date.now()
+    if (backups.length === 0) return this.accounts
     const anyBackupAssignable = backups.some((item) => this.availableSlots(item.key, now) > 0)
     return anyBackupAssignable ? backups : this.accounts
   }
 
   private tryImmediate(key: string | undefined, preferSecondary: boolean, now: number): Lease | undefined {
-    const pool = this.candidates(preferSecondary)
+    const pool = this.candidates(preferSecondary, now)
     if (key) {
       const match = pool.find((item) => item.key === key)
       if (!match) return undefined
@@ -285,8 +330,13 @@ export class AccountPool {
         }
         return pool.reassignLease(lease, record, newKey)
       },
+      [Symbol.dispose](): void {
+        this.release()
+      },
+      async [Symbol.asyncDispose](): Promise<void> {
+        this.release()
+      },
     }
-    lease[Symbol.dispose] = () => lease.release()
     return lease
   }
 
@@ -334,6 +384,17 @@ export class AccountPool {
   }
 
   /**
+   * Convenience wrapper around {@link acquire} that sets `preferSecondary:
+   * true`. Mirrors Rust `AccountPool::acquire_prefer_secondary`
+   * (`account_pool.rs:804-840`) — sub-agents and other spawned fibers should
+   * use this entry point so the primary account stays free for interactive
+   * dispatches whenever a backup slot is available.
+   */
+  async acquirePreferSecondary(key?: string, options: AcquireOptions = {}): Promise<Lease> {
+    return this.acquire(key, { ...options, preferSecondary: true })
+  }
+
+  /**
    * Public API requested in the porting brief. Accepts either a specific
    * `key` or `undefined` to pick the best-headroom candidate. Throws on
    * timeout / abort / pool stopped.
@@ -369,7 +430,7 @@ export class AccountPool {
       }
       waiter.timer = setTimeout(() => {
         this.removeWaiter(waiter)
-        reject(new Error(`AccountPool.acquire timed out after ${timeoutMs}ms`))
+        reject(new AcquireTimeoutError(timeoutMs))
       }, timeoutMs)
       ;(waiter.timer as any)?.unref?.()
       this.waiters.push(waiter)
@@ -554,12 +615,23 @@ export class AccountPool {
     return this.accounts.filter((item) => this.availableSlots(item.key, now) > 0).length
   }
 
+  /**
+   * Timestamp (epoch ms) of the most recent cascade-breaker trigger — i.e.
+   * the last moment {@link shouldThrottleSpawns} returned `true`. `0` when
+   * the breaker has never fired. Mirrors the Rust `last_cascade_warning`
+   * field (`account_pool.rs:1260-1294`) and is exposed so UI / telemetry
+   * can surface the event without polling.
+   */
+  lastCascadeWarning = 0
+
   /** Rust `should_throttle_spawns` — >50% of accounts in cooldown. */
   shouldThrottleSpawns(now = Date.now()) {
     const total = this.accounts.length
     if (total <= 1) return false
     const avail = this.availableAccountCount(now)
-    return avail * 2 < total
+    const throttle = avail * 2 < total
+    if (throttle) this.lastCascadeWarning = now
+    return throttle
   }
 }
 

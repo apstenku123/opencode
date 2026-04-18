@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test"
-import { AccountPool, HEADERLESS_429_FALLBACK_DELAYS_MS } from "@/plugin/github-copilot/account-pool"
-import { FULL_RECOVERY_MS, PARTIAL_RECOVERY_MS } from "@/plugin/github-copilot/runtime"
+import {
+  AccountPool,
+  AcquireTimeoutError,
+  HEADERLESS_429_FALLBACK_DELAYS_MS,
+} from "@/plugin/github-copilot/account-pool"
+import {
+  ACQUIRE_TIMEOUT_MS,
+  FULL_RECOVERY_MS,
+  PARTIAL_RECOVERY_MS,
+  SECOND_RECOVERY_MS,
+} from "@/plugin/github-copilot/runtime"
 
 describe("AccountPool", () => {
   test("availableSlots starts at the per-account cap", () => {
@@ -400,6 +409,171 @@ describe("AccountPool", () => {
     const lease = await pool.acquire("a")
     lease.reassign("b")
     expect(() => lease.reassign("c")).toThrow(/already released/)
+  })
+
+  // ---------------------------------------------------------------------------
+  // Round 5 — full Rust parity additions
+  // ---------------------------------------------------------------------------
+
+  test("getPrimaryKey defaults to 'github-copilot' when no explicit flag", () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "github-copilot" }, { key: "github-copilot#work" }],
+      limit: 1,
+    })
+    expect(pool.getPrimaryKey()).toBe("github-copilot")
+    expect(pool.isPrimary("github-copilot")).toBe(true)
+    expect(pool.isPrimary("github-copilot#work")).toBe(false)
+    expect(pool.getBackupKeys()).toEqual(["github-copilot#work"])
+  })
+
+  test("getPrimaryKey honours explicit primary flag on another account", () => {
+    const pool = new AccountPool({
+      accounts: [
+        { key: "github-copilot" },
+        { key: "github-copilot#work", primary: true },
+      ],
+      limit: 1,
+    })
+    expect(pool.getPrimaryKey()).toBe("github-copilot#work")
+    expect(pool.getBackupKeys()).toEqual(["github-copilot"])
+  })
+
+  test("acquirePreferSecondary routes spawned sub-agents to backups", async () => {
+    const pool = new AccountPool({
+      accounts: [
+        { key: "github-copilot" },
+        { key: "github-copilot#work" },
+      ],
+      limit: 1,
+    })
+    const lease = await pool.acquirePreferSecondary()
+    expect(lease.key).toBe("github-copilot#work")
+    lease.release()
+  })
+
+  test("acquirePreferSecondary falls back to primary when every backup is saturated", async () => {
+    const pool = new AccountPool({
+      accounts: [
+        { key: "github-copilot" },
+        { key: "github-copilot#work" },
+      ],
+      limit: 1,
+    })
+    const backup = await pool.acquire("github-copilot#work")
+    const lease = await pool.acquirePreferSecondary(undefined, { timeoutMs: 100 })
+    expect(lease.key).toBe("github-copilot")
+    backup.release()
+    lease.release()
+  })
+
+  test("acquirePreferSecondary with only primary accounts uses primary", async () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "github-copilot" }],
+      limit: 1,
+    })
+    const lease = await pool.acquirePreferSecondary()
+    expect(lease.key).toBe("github-copilot")
+    lease.release()
+  })
+
+  test("acquire default timeout is ACQUIRE_TIMEOUT_MS (5 min)", () => {
+    // Sanity: the exported constant matches the Rust 5-minute bound so callers
+    // that omit timeoutMs inherit the Rust behaviour, not a shorter ad-hoc one.
+    expect(ACQUIRE_TIMEOUT_MS).toBe(5 * 60 * 1000)
+  })
+
+  test("acquire surfaces AcquireTimeoutError on timeout", async () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 1 })
+    const held = await pool.acquire("k")
+    let caught: unknown
+    try {
+      await pool.acquire("k", { timeoutMs: 10 })
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeInstanceOf(AcquireTimeoutError)
+    expect((caught as AcquireTimeoutError).kind).toBe("AcquireTimeout")
+    expect((caught as AcquireTimeoutError).timeoutMs).toBe(10)
+    held.release()
+  })
+
+  test("TS 5.2 `using` auto-releases the lease", async () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 1 })
+    {
+      using _lease = await pool.acquire("k")
+      expect(pool.availableSlots("k")).toBe(0)
+    }
+    // `using` dispose should have released.
+    expect(pool.availableSlots("k")).toBe(1)
+  })
+
+  test("TS 5.2 `await using` auto-releases the lease", async () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 1 })
+    const inner = async () => {
+      await using _lease = await pool.acquire("k")
+      expect(pool.availableSlots("k")).toBe(0)
+    }
+    await inner()
+    expect(pool.availableSlots("k")).toBe(1)
+  })
+
+  test("stepped recovery releases slots gradually (1 → 2 → 4 → cap)", () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 7 })
+    const base = 10_000_000
+    pool.recordExhaustion("k", { delayMs: 0, now: base })
+    // Immediately after cooldown cleared: 1 slot.
+    expect(pool.availableSlots("k", base)).toBe(1)
+    // At 5 min mark: 2 slots.
+    expect(pool.availableSlots("k", base + PARTIAL_RECOVERY_MS)).toBe(2)
+    // At 7 min mark: 4 slots.
+    expect(pool.availableSlots("k", base + SECOND_RECOVERY_MS)).toBe(4)
+    // At 9 min mark: full cap.
+    expect(pool.availableSlots("k", base + FULL_RECOVERY_MS)).toBe(7)
+  })
+
+  test("stepped recovery — consuming slots respects per-step ceiling", async () => {
+    const pool = new AccountPool({ accounts: [{ key: "k" }], limit: 7 })
+    // Plant a past 429 that has already crossed the 5-min mark but not 7-min.
+    // With effectiveLimit=2, only 2 acquires may succeed; the third blocks.
+    const base = 10_000_000
+    pool.recordExhaustion("k", { delayMs: 0, now: base - PARTIAL_RECOVERY_MS })
+    const a = await pool.acquire("k", { now: base, timeoutMs: 50 })
+    const b = await pool.acquire("k", { now: base, timeoutMs: 50 })
+    await expect(
+      pool.acquire("k", { now: base, timeoutMs: 20 }),
+    ).rejects.toBeInstanceOf(AcquireTimeoutError)
+    a.release()
+    b.release()
+  })
+
+  test("lastCascadeWarning timestamp updates when throttle fires", () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }, { key: "c" }],
+      limit: 7,
+    })
+    expect(pool.lastCascadeWarning).toBe(0)
+    expect(pool.shouldThrottleSpawns(1_000)).toBe(false)
+    // Breaker has not fired yet.
+    expect(pool.lastCascadeWarning).toBe(0)
+    pool.recordExhaustion("a", { delayMs: 60_000, now: 0 })
+    pool.recordExhaustion("b", { delayMs: 60_000, now: 0 })
+    expect(pool.shouldThrottleSpawns(5_000)).toBe(true)
+    expect(pool.lastCascadeWarning).toBe(5_000)
+  })
+
+  test("lastCascadeWarning does not regress when subsequent check is healthy", () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }, { key: "c" }],
+      limit: 7,
+    })
+    pool.recordExhaustion("a", { delayMs: 60_000, now: 0 })
+    pool.recordExhaustion("b", { delayMs: 60_000, now: 0 })
+    pool.shouldThrottleSpawns(5_000)
+    expect(pool.lastCascadeWarning).toBe(5_000)
+    // After cooldowns elapse, breaker releases — but the timestamp should
+    // remain (it's a high-water mark of the most recent cascade).
+    pool.shouldThrottleSpawns(10 * 60 * 1000)
+    expect(pool.lastCascadeWarning).toBe(5_000)
   })
 
   test("attachStore hydrates rows and writes through on recordExhaustion", () => {
