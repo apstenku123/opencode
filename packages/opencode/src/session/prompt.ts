@@ -59,6 +59,7 @@ import { EffectBridge } from "@/effect"
 import { Skill } from "@/skill"
 import { SkillInjection } from "@/skill/injection"
 import { SkillEvolution } from "@/skill/evolution"
+import { Rollout } from "@/rollout"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -1473,6 +1474,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const message = yield* createUserMessage(input)
           yield* sessions.touch(input.sessionID)
 
+          // [R6 Stream G] Open (or resume) the persistent rollout writer
+          // for this session and record the user turn. Failures here
+          // are non-fatal: rollout is best-effort and must never
+          // block the prompt loop.
+          const rollout = yield* Effect.promise(async () => {
+            try {
+              return await Rollout.open(input.sessionID)
+            } catch (err) {
+              log.error("rollout.open failed", { sessionID: input.sessionID, err: String(err) })
+              return undefined
+            }
+          })
+          if (rollout) {
+            yield* Effect.promise(async () => {
+              try {
+                await rollout.append("message.updated", {
+                  role: "user",
+                  messageID: message.info.id,
+                  partsCount: message.parts.length,
+                })
+                await rollout.flush()
+              } catch (err) {
+                log.error("rollout.append failed", { sessionID: input.sessionID, err: String(err) })
+              }
+            })
+          }
+
           const permissions: Permission.Ruleset = []
           for (const [t, enabled] of Object.entries(input.tools ?? {})) {
             permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
@@ -1482,8 +1510,32 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
           }
 
-          if (input.noReply === true) return message
-          return yield* loop({ sessionID: input.sessionID })
+          if (input.noReply === true) {
+            if (rollout)
+              yield* Effect.promise(async () => {
+                try {
+                  await rollout.close()
+                } catch {}
+              })
+            return message
+          }
+          const result = yield* loop({ sessionID: input.sessionID })
+          if (rollout) {
+            yield* Effect.promise(async () => {
+              try {
+                await rollout.append("message.updated", {
+                  role: "assistant",
+                  messageID: result.info.id,
+                  partsCount: result.parts.length,
+                })
+                await rollout.flush()
+                await rollout.close()
+              } catch (err) {
+                log.error("rollout.finalize failed", { sessionID: input.sessionID, err: String(err) })
+              }
+            })
+          }
+          return result
         },
       )
 
