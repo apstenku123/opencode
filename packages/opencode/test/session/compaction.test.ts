@@ -28,6 +28,7 @@ import { Snapshot } from "../../src/snapshot"
 import { ProviderTest } from "../fake/provider"
 import { testEffect } from "../lib/effect"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
+import * as Hook from "../../src/hook"
 
 void Log.init({ print: false })
 
@@ -169,7 +170,12 @@ function layer(result: "continue" | "compact") {
   )
 }
 
-function runtime(result: "continue" | "compact", plugin = Plugin.defaultLayer, provider = ProviderTest.fake()) {
+function runtime(
+  result: "continue" | "compact",
+  plugin = Plugin.defaultLayer,
+  provider = ProviderTest.fake(),
+  hookLayer: Layer.Layer<Hook.Service> = Hook.defaultLayer,
+) {
   const bus = Bus.layer
   return ManagedRuntime.make(
     Layer.mergeAll(SessionCompaction.layer, bus).pipe(
@@ -178,6 +184,7 @@ function runtime(result: "continue" | "compact", plugin = Plugin.defaultLayer, p
       Layer.provide(layer(result)),
       Layer.provide(Agent.defaultLayer),
       Layer.provide(plugin),
+      Layer.provideMerge(hookLayer),
       Layer.provide(bus),
       Layer.provide(Config.defaultLayer),
     ),
@@ -189,6 +196,7 @@ const deps = Layer.mergeAll(
   layer("continue"),
   Agent.defaultLayer,
   Plugin.defaultLayer,
+  Hook.defaultLayer,
   Bus.layer,
   Config.defaultLayer,
 )
@@ -236,6 +244,7 @@ function liveRuntime(layer: Layer.Layer<LLM.Service>, provider = ProviderTest.fa
       Layer.provide(Permission.defaultLayer),
       Layer.provide(Agent.defaultLayer),
       Layer.provide(Plugin.defaultLayer),
+      Layer.provide(Hook.defaultLayer),
       Layer.provide(Skill.defaultLayer),
       Layer.provide(SkillEvolution.defaultLayer),
       Layer.provide(status),
@@ -1193,6 +1202,209 @@ describe("session.compaction.process", () => {
 
           expect(summary?.info.role).toBe("assistant")
           expect(summary?.parts.some((part) => part.type === "tool")).toBe(false)
+        } finally {
+          await rt.dispose()
+        }
+      },
+    })
+  })
+
+  test("fires PreCompact hook with session metrics before compaction", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await svc.create({})
+        const msg = await user(session.id, "hello world")
+        const msgs = await svc.messages({ sessionID: session.id })
+
+        const observed: Array<{
+          event: string
+          sessionID: string
+          messageCount?: number
+          tokenCountBefore?: number
+          trigger?: string
+        }> = []
+
+        const rt = runtime("continue", Plugin.defaultLayer, wide())
+        try {
+          await rt.runPromise(
+            Hook.Service.use((svc) =>
+              svc.register({
+                name: "test-pre-compact",
+                event: "PreCompact",
+                run: (payload) =>
+                  Effect.sync(() => {
+                    const evt = payload.hook_event
+                    if (evt.hook_event_name !== "PreCompact") {
+                      return { kind: "success", decision_interrupt: false, suppress_output: false }
+                    }
+                    observed.push({
+                      event: evt.hook_event_name,
+                      sessionID: payload.session_id,
+                      messageCount: evt.message_count,
+                      tokenCountBefore: evt.token_count_before,
+                      trigger: evt.trigger,
+                    })
+                    return { kind: "success", decision_interrupt: false, suppress_output: false }
+                  }),
+              }),
+            ),
+          )
+
+          await rt.runPromise(
+            SessionCompaction.Service.use((svc) =>
+              svc.process({
+                parentID: msg.id,
+                messages: msgs,
+                sessionID: session.id,
+                auto: false,
+              }),
+            ),
+          )
+
+          expect(observed).toHaveLength(1)
+          expect(observed[0].event).toBe("PreCompact")
+          expect(observed[0].sessionID).toBe(session.id)
+          expect(observed[0].messageCount).toBe(msgs.length)
+          expect(observed[0].tokenCountBefore).toBeGreaterThanOrEqual(0)
+          expect(observed[0].trigger).toBe("manual")
+        } finally {
+          await rt.dispose()
+        }
+      },
+    })
+  })
+
+  test("fires PostCompact hook with summary and message counts after compaction", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await svc.create({})
+        const msg = await user(session.id, "hello world")
+        const msgs = await svc.messages({ sessionID: session.id })
+
+        type Captured = {
+          sessionID: string
+          kept?: number
+          dropped?: number
+          tokenAfter?: number
+          summary?: string
+          trigger?: string
+        }
+        const observed: Captured[] = []
+
+        const rt = runtime("continue", Plugin.defaultLayer, wide())
+        try {
+          await rt.runPromise(
+            Hook.Service.use((svc) =>
+              svc.register({
+                name: "test-post-compact",
+                event: "PostCompact",
+                run: (payload) =>
+                  Effect.sync(() => {
+                    const evt = payload.hook_event
+                    if (evt.hook_event_name !== "PostCompact") {
+                      return { kind: "success", decision_interrupt: false, suppress_output: false }
+                    }
+                    observed.push({
+                      sessionID: payload.session_id,
+                      kept: evt.kept_messages,
+                      dropped: evt.dropped_messages,
+                      tokenAfter: evt.token_count_after,
+                      summary: evt.summary,
+                      trigger: evt.trigger,
+                    })
+                    return { kind: "success", decision_interrupt: false, suppress_output: false }
+                  }),
+              }),
+            ),
+          )
+
+          const result = await rt.runPromise(
+            SessionCompaction.Service.use((svc) =>
+              svc.process({
+                parentID: msg.id,
+                messages: msgs,
+                sessionID: session.id,
+                auto: false,
+              }),
+            ),
+          )
+
+          expect(result).toBe("continue")
+          expect(observed).toHaveLength(1)
+          expect(observed[0].sessionID).toBe(session.id)
+          expect(observed[0].dropped).toBe(msgs.length)
+          expect(observed[0].kept).toBeGreaterThanOrEqual(1)
+          expect(typeof observed[0].summary).toBe("string")
+          expect(observed[0].trigger).toBe("manual")
+          expect(observed[0].tokenAfter).toBeGreaterThanOrEqual(0)
+        } finally {
+          await rt.dispose()
+        }
+      },
+    })
+  })
+
+  test("PreCompact deny decision cancels compaction", async () => {
+    await using tmp = await tmpdir()
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await svc.create({})
+        const msg = await user(session.id, "hello")
+        const msgs = await svc.messages({ sessionID: session.id })
+
+        let postFired = false
+        const rt = runtime("continue", Plugin.defaultLayer, wide())
+        try {
+          await rt.runPromise(
+            Hook.Service.use((svc) =>
+              Effect.gen(function* () {
+                yield* svc.register({
+                  name: "test-deny",
+                  event: "PreCompact",
+                  run: () =>
+                    Effect.succeed({
+                      kind: "success",
+                      decision_behavior: "deny",
+                      decision_message: "user denied compaction",
+                      decision_interrupt: false,
+                      suppress_output: false,
+                    }),
+                })
+                yield* svc.register({
+                  name: "test-post-guard",
+                  event: "PostCompact",
+                  run: () =>
+                    Effect.sync(() => {
+                      postFired = true
+                      return { kind: "success", decision_interrupt: false, suppress_output: false }
+                    }),
+                })
+              }),
+            ),
+          )
+
+          const result = await rt.runPromise(
+            SessionCompaction.Service.use((svc) =>
+              svc.process({
+                parentID: msg.id,
+                messages: msgs,
+                sessionID: session.id,
+                auto: false,
+              }),
+            ),
+          )
+
+          expect(result).toBe("stop")
+          expect(postFired).toBe(false)
+
+          // No assistant summary message should have been created.
+          const all = await svc.messages({ sessionID: session.id })
+          expect(all.some((m) => m.info.role === "assistant" && m.info.summary)).toBe(false)
         } finally {
           await rt.dispose()
         }

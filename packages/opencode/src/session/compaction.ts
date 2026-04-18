@@ -16,6 +16,7 @@ import { ModelID, ProviderID } from "@/provider/schema"
 import { Effect, Layer, Context } from "effect"
 import { InstanceState } from "@/effect"
 import { isOverflow as overflow } from "./overflow"
+import * as Hook from "@/hook"
 
 export namespace SessionCompaction {
   const log = Log.create({ service: "session.compaction" })
@@ -32,6 +33,37 @@ export namespace SessionCompaction {
   export const PRUNE_MINIMUM = 20_000
   export const PRUNE_PROTECT = 40_000
   const PRUNE_PROTECTED_TOOLS = ["skill"]
+
+  /**
+   * Rough token estimate across a message list — used for PreCompact /
+   * PostCompact hook payload metrics. Falls back to `Token.estimate` over
+   * the concatenated text-ish payload of each part.
+   */
+  function estimateMessagesTokens(messages: MessageV2.WithParts[]): number {
+    let total = 0
+    for (const msg of messages) {
+      for (const part of msg.parts) {
+        if (part.type === "text" || part.type === "reasoning") {
+          total += Token.estimate(part.text ?? "")
+        } else if (part.type === "tool") {
+          if (part.state.status === "completed") {
+            total += Token.estimate(part.state.output ?? "")
+          }
+        }
+      }
+    }
+    return total
+  }
+
+  function extractSummaryText(messages: MessageV2.WithParts[]): string {
+    const summary = messages.findLast((m) => m.info.role === "assistant" && m.info.summary)
+    if (!summary) return ""
+    return summary.parts
+      .filter((p): p is MessageV2.TextPart => p.type === "text")
+      .map((p) => p.text)
+      .join("\n")
+      .trim()
+  }
 
   export interface Interface {
     readonly isOverflow: (input: {
@@ -67,6 +99,7 @@ export namespace SessionCompaction {
     | Plugin.Service
     | SessionProcessor.Service
     | Provider.Service
+    | Hook.Service
   > = Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -77,6 +110,7 @@ export namespace SessionCompaction {
       const plugin = yield* Plugin.Service
       const processors = yield* SessionProcessor.Service
       const provider = yield* Provider.Service
+      const hooks = yield* Hook.Service
 
       const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
         tokens: MessageV2.Assistant["tokens"]
@@ -147,6 +181,29 @@ export namespace SessionCompaction {
           throw new Error(`Compaction parent must be a user message: ${input.parentID}`)
         }
         const userMessage = parent.info
+
+        const trigger = input.auto ? (input.overflow ? "overflow" : "auto") : "manual"
+        const tokenCountBefore = estimateMessagesTokens(input.messages)
+
+        // Fire PreCompact with pre-compaction metrics. A `deny` decision or an
+        // `abort` outcome cancels compaction before any state is mutated.
+        const preResult = yield* hooks.dispatch({
+          event: {
+            hook_event_name: "PreCompact",
+            trigger,
+            custom_instructions: "",
+            message_count: input.messages.length,
+            token_count_before: tokenCountBefore,
+          },
+          sessionID: input.sessionID,
+        })
+        if (preResult.outcome === "abort" || preResult.decisionBehavior === "deny") {
+          log.info("PreCompact denied compaction", {
+            sessionID: input.sessionID,
+            reason: preResult.abortReason ?? preResult.decisionMessage,
+          })
+          return "stop" as const
+        }
 
         let messages = input.messages
         let replay:
@@ -360,7 +417,32 @@ When constructing the summary, try to stick to this template:
         }
 
         if (processor.message.error) return "stop"
-        if (result === "continue") yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
+        if (result === "continue") {
+          // PostCompact: include summary text + kept/dropped message counts.
+          // `dropped` counts messages folded into the summary; `kept` counts
+          // the summary turn plus any replay / synthetic continue turns
+          // added after compaction.
+          const after = yield* session
+            .messages({ sessionID: input.sessionID })
+            .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed<MessageV2.WithParts[]>([])))
+          const summaryIdx = after.findIndex((m) => m.info.role === "assistant" && m.info.summary)
+          const kept = summaryIdx >= 0 ? after.length - summaryIdx : 0
+          const dropped = input.messages.length
+          const summaryText = extractSummaryText(after)
+          const tokenCountAfter = summaryIdx >= 0 ? estimateMessagesTokens(after.slice(summaryIdx)) : 0
+          yield* hooks.dispatch({
+            event: {
+              hook_event_name: "PostCompact",
+              trigger,
+              kept_messages: kept,
+              dropped_messages: dropped,
+              token_count_after: tokenCountAfter,
+              summary: summaryText,
+            },
+            sessionID: input.sessionID,
+          })
+          yield* bus.publish(Event.Compacted, { sessionID: input.sessionID })
+        }
         return result
       })
 
@@ -405,6 +487,7 @@ When constructing the summary, try to stick to this template:
       Layer.provide(SessionProcessor.defaultLayer),
       Layer.provide(Agent.defaultLayer),
       Layer.provide(Plugin.defaultLayer),
+      Layer.provide(Hook.defaultLayer),
       Layer.provide(Bus.layer),
       Layer.provide(Config.defaultLayer),
     ),
