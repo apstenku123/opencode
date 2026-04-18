@@ -420,6 +420,11 @@ export type AccountStatusJSON = {
   plan: string | null
   pool: PoolId | null
   proxy: boolean
+  proxyUrl: string | null
+  envelope: boolean | null
+  machineId: string | null
+  allowedProdModels: string[]
+  allowedTestModels: string[]
   premium: string | null
   health: string
   exhausted: boolean
@@ -483,13 +488,19 @@ export function jsonMigration(input: ReturnType<typeof summarizeMigration> | und
 export function jsonStatus(
   input: ReturnType<typeof accountStatus> & { premium?: string; ghe?: string },
 ): AccountStatusJSON {
+  const pool = accountPoolLabel(input.key, input.plan) ?? null
   return {
     key: input.key,
     label: input.label,
     login: input.login ?? null,
     plan: input.plan ?? null,
-    pool: accountPoolLabel(input.key, input.plan) ?? null,
+    pool,
     proxy: input.proxy,
+    proxyUrl: input.proxyUrl ?? null,
+    envelope: input.envelope ?? null,
+    machineId: input.machineId ?? null,
+    allowedProdModels: pool ? poolAllowedProdModels(pool) : [],
+    allowedTestModels: pool ? poolAllowedTestModels(pool) : [],
     health: input.health,
     exhausted: input.exhausted,
     exhaustedUntil: input.exhaustedUntil ?? null,
@@ -559,7 +570,7 @@ export function accountStatus(input: {
     plan: plan && plan !== "unknown" ? plan : item?.plan,
     proxy: !!item?.proxyUrl,
     proxyUrl: item?.proxyUrl,
-    envelope: !!item?.envelope,
+    envelope: item?.envelope,
     machineId: item?.machineId,
     exhausted,
     exhaustedUntil,
@@ -622,7 +633,7 @@ export function renderAccountStatus(
   // mirror the codex_git app-server bootstrap (see
   // `codex-rs/app-server/src/copilot_bootstrap.rs` discovery logs).
   const proxyLine = status.proxyUrl
-    ? `\n  Proxy: ${status.proxyUrl}${status.envelope ? " (envelope)" : ""}`
+    ? `\n  Proxy: ${status.proxyUrl}${status.envelope === true ? " (envelope)" : ""}`
     : ""
   const machineLine = status.machineId ? `\n  Machine ID: ${status.machineId}` : ""
   const allowedProd = pool ? poolAllowedProdModels(pool) : []

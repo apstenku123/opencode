@@ -26,6 +26,12 @@ import * as providersCmd from "@/cli/cmd/providers"
 import { empty } from "@/plugin/github-copilot/connections"
 import { readFile, rm } from "node:fs/promises"
 
+// Disable the live `/models` discovery probe in unit tests. Without this,
+// the providers command tries to reach `api.githubcopilot.com/models`
+// against the mocked fetch, fails, and mutates the asserted state
+// (health → discovery_error, penalty → 1, routeReason populated).
+process.env.OPENCODE_PROBE_DISCOVERY = "0"
+
 afterEach(async () => {
   await rm(connectionFile, { force: true }).catch(() => undefined)
 })
@@ -241,7 +247,7 @@ test("renderAccountStatus formats premium and discovery info", () => {
       }),
       { premium: "[##--------] 20/100 20%", enterpriseUrl: "ghe.example.com" },
     ),
-  ).toContain("Discovery: ok, 1 models")
+  ).toContain("Discovery: ok, 1 picker-enabled model")
 })
 
 test("jsonStatus emits stable nullable schema", () => {
@@ -253,6 +259,11 @@ test("jsonStatus emits stable nullable schema", () => {
     plan: null,
     pool: null,
     proxy: false,
+    proxyUrl: null,
+    envelope: null,
+    machineId: null,
+    allowedProdModels: [],
+    allowedTestModels: [],
     premium: null,
     health: "ok",
     exhausted: false,
@@ -676,7 +687,13 @@ test("ProvidersQuotaCommand emits json account overview", async () => {
       label: "Primary",
       login: "alice",
       plan: "free",
+      pool: "edu",
       proxy: false,
+      proxyUrl: null,
+      envelope: null,
+      machineId: null,
+      allowedProdModels: ["codex-5.3-xhigh"],
+      allowedTestModels: ["gpt-4.1", "gpt-5-mini-xhigh"],
       premium: null,
       health: "ok",
       exhausted: false,
@@ -759,7 +776,13 @@ test("ProvidersAccountsCommand emits json account overview", async () => {
       label: "Copilot Edu",
       login: "student",
       plan: "edu",
+      pool: "edu",
       proxy: false,
+      proxyUrl: null,
+      envelope: null,
+      machineId: null,
+      allowedProdModels: ["codex-5.3-xhigh"],
+      allowedTestModels: ["gpt-4.1", "gpt-5-mini-xhigh"],
       premium: null,
       health: "ok",
       exhausted: false,
