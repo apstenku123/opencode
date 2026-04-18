@@ -295,3 +295,49 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Config.defaultLayer),
   Layer.provide(CrossSpawnSpawner.defaultLayer),
 )
+
+/**
+ * A self-contained test layer — a Hook.Service that loads no config and
+ * supports in-process registrations. Useful for services that fire
+ * lifecycle events (Permission, Question) when exercised outside the full
+ * `AppLayer` runtime where `Config.defaultLayer` would otherwise pull in
+ * Auth/Plugin/Storage dependencies.
+ */
+export const noopLayer: Layer.Layer<Service> = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const inProcess: RegisteredHook[] = []
+    const register: Interface["register"] = (hook) =>
+      Effect.sync(() => {
+        inProcess.push(hook)
+        return () => {
+          const i = inProcess.indexOf(hook)
+          if (i >= 0) inProcess.splice(i, 1)
+        }
+      })
+    const listed: Interface["listed"] = () => Effect.sync(() => inProcess.map((h) => h.name))
+    const dispatch: Interface["dispatch"] = (input) =>
+      Effect.gen(function* () {
+        const eventName = input.event.hook_event_name
+        const cwd = input.cwd ?? process.cwd()
+        const payload = buildPayload(input, cwd)
+        const responses: HookResponse[] = []
+        for (const reg of inProcess) {
+          if (reg.event !== undefined && reg.event !== eventName) continue
+          if (!matches(reg.matcher, input.event)) continue
+          const result = yield* reg.run(payload).pipe(
+            Effect.catchCause((cause) =>
+              Effect.succeed<HookResult>({
+                kind: "failed_continue",
+                error: `in-process hook '${reg.name}' failed: ${String(cause)}`,
+              }),
+            ),
+          )
+          responses.push({ hook_name: reg.name, result })
+          if (shouldAbort(result)) return reduceResponses(responses)
+        }
+        return reduceResponses(responses)
+      })
+    return Service.of({ register, listed, dispatch })
+  }),
+)

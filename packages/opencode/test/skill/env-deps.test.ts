@@ -3,6 +3,7 @@ import { Effect, Layer } from "effect"
 import { collectEnvVarDependencies, SkillEnvDeps } from "../../src/skill/env-deps"
 import { Question } from "../../src/question"
 import { Bus } from "../../src/bus"
+import * as Hook from "../../src/hook"
 import { Instance } from "../../src/project/instance"
 import { SessionID } from "../../src/session/schema"
 import { provideTmpdirInstance } from "../fixture/fixture"
@@ -50,7 +51,9 @@ describe("skill/env-deps", () => {
 
 describe("skill/env-deps - service", () => {
   const layer = Layer.mergeAll(
-    SkillEnvDeps.layer.pipe(Layer.provide(Question.layer.pipe(Layer.provide(Bus.layer)))),
+    SkillEnvDeps.layer.pipe(
+      Layer.provide(Question.layer.pipe(Layer.provide(Bus.layer), Layer.provide(Hook.noopLayer))),
+    ),
     CrossSpawnSpawner.defaultLayer,
   )
 

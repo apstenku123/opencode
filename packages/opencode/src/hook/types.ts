@@ -14,7 +14,7 @@
  *   - `AfterAgent` (turn-end — analogous to "AssistantMessage")
  *   - `Stop` (existing opencode behaviour — `stopHooks`)
  *   - `SubagentStart` / `SubagentStop`
- *   - `PermissionRequest`
+ *   - `PermissionRequest` / `PermissionGranted` / `PermissionDenied`
  *   - `PreCompact` / `PostCompact`
  *   - `Notification` / `ConfigChange` / `InstructionsLoaded`
  *   - `TeammateIdle` / `TaskCompleted`
@@ -38,6 +38,8 @@ export const HookEventName = z.enum([
   "SubagentStart",
   "SubagentStop",
   "PermissionRequest",
+  "PermissionGranted",
+  "PermissionDenied",
   "PreCompact",
   "PostCompact",
   "Notification",
@@ -209,6 +211,24 @@ const EventPermissionRequest = z.object({
   tool_input: z.unknown(),
 })
 
+const EventPermissionGranted = z.object({
+  hook_event_name: z.literal("PermissionGranted"),
+  tool_name: z.string(),
+  tool_input: z.unknown(),
+  /** How the grant was produced: `allow` rule, user `once`, user `always`, or hook short-circuit. */
+  source: z.enum(["rule", "once", "always", "hook"]),
+})
+
+const EventPermissionDenied = z.object({
+  hook_event_name: z.literal("PermissionDenied"),
+  tool_name: z.string(),
+  tool_input: z.unknown(),
+  /** How the denial was produced: policy `rule`, user `reject`, or hook short-circuit. */
+  source: z.enum(["rule", "reject", "hook"]),
+  /** Optional corrective feedback supplied by the user when rejecting. */
+  reason: z.string().optional(),
+})
+
 const EventPreCompact = z.object({
   hook_event_name: z.literal("PreCompact"),
   trigger: z.string(),
@@ -293,6 +313,8 @@ export const HookEvent = z.discriminatedUnion("hook_event_name", [
   EventSubagentStart,
   EventSubagentStop,
   EventPermissionRequest,
+  EventPermissionGranted,
+  EventPermissionDenied,
   EventPreCompact,
   EventPostCompact,
   EventNotification,
@@ -317,6 +339,8 @@ export function matchTargetFor(event: HookEvent): string | undefined {
     case "PostToolUseFailure":
     case "AfterToolUse":
     case "PermissionRequest":
+    case "PermissionGranted":
+    case "PermissionDenied":
       return event.tool_name
     case "Notification":
       return event.notification_type

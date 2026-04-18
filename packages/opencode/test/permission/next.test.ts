@@ -3,6 +3,7 @@ import os from "os"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import { Bus } from "../../src/bus"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
+import * as Hook from "../../src/hook"
 import { Permission } from "../../src/permission"
 import { PermissionID } from "../../src/permission/schema"
 import { Instance } from "../../src/project/instance"
@@ -11,7 +12,17 @@ import { testEffect } from "../lib/effect"
 import { MessageID, SessionID } from "../../src/session/schema"
 
 const bus = Bus.layer
-const env = Layer.mergeAll(Permission.layer.pipe(Layer.provide(bus)), bus, CrossSpawnSpawner.defaultLayer)
+// Use Hook.noopLayer so the permission flow can dispatch lifecycle
+// events (PermissionRequest/Granted/Denied) without pulling in the full
+// Config.defaultLayer (which needs Auth/Plugin/Storage in the minimal
+// test environment here).
+const hookLayer = Hook.noopLayer
+const env = Layer.mergeAll(
+  Permission.layer.pipe(Layer.provide(bus), Layer.provide(hookLayer)),
+  bus,
+  hookLayer,
+  CrossSpawnSpawner.defaultLayer,
+)
 const it = testEffect(env)
 
 afterEach(async () => {
@@ -983,6 +994,240 @@ it.live("pending permission rejects on instance reload", () =>
     expect(Exit.isFailure(exit)).toBe(true)
     if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(Permission.RejectedError)
   }),
+)
+
+// Hook event lifecycle — PermissionRequest / PermissionGranted /
+// PermissionDenied. These verify that the permission service fires the
+// matching lifecycle events through `Hook.Service.dispatch`, and that a
+// `PermissionRequest` hook returning `permissionDecision = allow|deny`
+// short-circuits the interactive prompt.
+
+type HookCapture = { event: string; tool: string; source?: string }
+
+function captureHook(captured: HookCapture[], decision?: "allow" | "deny" | "ask") {
+  return {
+    name: "test-capture",
+    run: (payload: Hook.HookPayload) =>
+      Effect.sync(() => {
+        const ev = payload.hook_event
+        captured.push({
+          event: ev.hook_event_name,
+          tool: "tool_name" in ev ? (ev as { tool_name: string }).tool_name : "",
+          source: "source" in ev ? (ev as { source: string }).source : undefined,
+        })
+        if (ev.hook_event_name === "PermissionRequest" && decision !== undefined) {
+          return {
+            kind: "success" as const,
+            decision_interrupt: false,
+            suppress_output: false,
+            decision_behavior: decision,
+          }
+        }
+        return {
+          kind: "success" as const,
+          decision_interrupt: false,
+          suppress_output: false,
+        }
+      }),
+  }
+}
+
+it.live("hook - PermissionGranted fires when rule allows", () =>
+  withDir({ git: true }, () =>
+    Effect.gen(function* () {
+      const hook = yield* Hook.Service
+      const captured: HookCapture[] = []
+      const off = yield* hook.register(captureHook(captured))
+      try {
+        yield* ask({
+          sessionID: SessionID.make("session_hg_allow"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "*", action: "allow" }],
+        })
+        const events = captured.map((e) => e.event)
+        expect(events).toContain("PermissionGranted")
+        const granted = captured.find((e) => e.event === "PermissionGranted")
+        expect(granted?.source).toBe("rule")
+      } finally {
+        off()
+      }
+    }),
+  ),
+)
+
+it.live("hook - PermissionDenied fires when rule denies", () =>
+  withDir({ git: true }, () =>
+    Effect.gen(function* () {
+      const hook = yield* Hook.Service
+      const captured: HookCapture[] = []
+      const off = yield* hook.register(captureHook(captured))
+      try {
+        const err = yield* fail(
+          ask({
+            sessionID: SessionID.make("session_hd_deny"),
+            permission: "bash",
+            patterns: ["rm -rf /"],
+            metadata: {},
+            always: [],
+            ruleset: [{ permission: "bash", pattern: "*", action: "deny" }],
+          }),
+        )
+        expect(err).toBeInstanceOf(Permission.DeniedError)
+        const denied = captured.find((e) => e.event === "PermissionDenied")
+        expect(denied?.source).toBe("rule")
+      } finally {
+        off()
+      }
+    }),
+  ),
+)
+
+it.live("hook - PermissionRequest fires before interactive prompt", () =>
+  withDir({ git: true }, () =>
+    Effect.gen(function* () {
+      const hook = yield* Hook.Service
+      const captured: HookCapture[] = []
+      const off = yield* hook.register(captureHook(captured))
+      try {
+        const fiber = yield* ask({
+          sessionID: SessionID.make("session_hr_ask"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        }).pipe(Effect.forkScoped)
+
+        yield* waitForPending(1)
+        expect(captured.some((e) => e.event === "PermissionRequest")).toBe(true)
+
+        yield* rejectAll()
+        yield* Fiber.await(fiber)
+      } finally {
+        off()
+      }
+    }),
+  ),
+)
+
+it.live("hook - decision=allow short-circuits prompt", () =>
+  withDir({ git: true }, () =>
+    Effect.gen(function* () {
+      const hook = yield* Hook.Service
+      const captured: HookCapture[] = []
+      const off = yield* hook.register(captureHook(captured, "allow"))
+      try {
+        const result = yield* ask({
+          sessionID: SessionID.make("session_hr_short"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+        })
+        expect(result).toBeUndefined()
+        // No pending prompt should be created when hook short-circuits.
+        expect(yield* list()).toHaveLength(0)
+        // Both PermissionRequest and PermissionGranted(source=hook) fire.
+        expect(captured.some((e) => e.event === "PermissionRequest")).toBe(true)
+        const granted = captured.find((e) => e.event === "PermissionGranted")
+        expect(granted?.source).toBe("hook")
+      } finally {
+        off()
+      }
+    }),
+  ),
+)
+
+it.live("hook - decision=deny short-circuits with DeniedError", () =>
+  withDir({ git: true }, () =>
+    Effect.gen(function* () {
+      const hook = yield* Hook.Service
+      const captured: HookCapture[] = []
+      const off = yield* hook.register(captureHook(captured, "deny"))
+      try {
+        const err = yield* fail(
+          ask({
+            sessionID: SessionID.make("session_hr_short_deny"),
+            permission: "bash",
+            patterns: ["ls"],
+            metadata: {},
+            always: [],
+            ruleset: [{ permission: "bash", pattern: "*", action: "ask" }],
+          }),
+        )
+        expect(err).toBeInstanceOf(Permission.DeniedError)
+        expect(yield* list()).toHaveLength(0)
+        const denied = captured.find((e) => e.event === "PermissionDenied")
+        expect(denied?.source).toBe("hook")
+      } finally {
+        off()
+      }
+    }),
+  ),
+)
+
+it.live("hook - reply=once fires PermissionGranted source=once", () =>
+  withDir({ git: true }, () =>
+    Effect.gen(function* () {
+      const hook = yield* Hook.Service
+      const captured: HookCapture[] = []
+      const off = yield* hook.register(captureHook(captured))
+      try {
+        const fiber = yield* ask({
+          id: PermissionID.make("per_reply_once"),
+          sessionID: SessionID.make("session_reply_once"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped)
+
+        yield* waitForPending(1)
+        yield* reply({ requestID: PermissionID.make("per_reply_once"), reply: "once" })
+        yield* Fiber.join(fiber)
+
+        const granted = captured.filter((e) => e.event === "PermissionGranted")
+        expect(granted.some((e) => e.source === "once")).toBe(true)
+      } finally {
+        off()
+      }
+    }),
+  ),
+)
+
+it.live("hook - reply=reject fires PermissionDenied source=reject", () =>
+  withDir({ git: true }, () =>
+    Effect.gen(function* () {
+      const hook = yield* Hook.Service
+      const captured: HookCapture[] = []
+      const off = yield* hook.register(captureHook(captured))
+      try {
+        const fiber = yield* ask({
+          id: PermissionID.make("per_reply_reject"),
+          sessionID: SessionID.make("session_reply_reject"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }).pipe(Effect.forkScoped)
+
+        yield* waitForPending(1)
+        yield* reply({ requestID: PermissionID.make("per_reply_reject"), reply: "reject" })
+        yield* Fiber.await(fiber)
+
+        const denied = captured.filter((e) => e.event === "PermissionDenied")
+        expect(denied.some((e) => e.source === "reject")).toBe(true)
+      } finally {
+        off()
+      }
+    }),
+  ),
 )
 
 it.live("reply - does nothing for unknown requestID", () =>
