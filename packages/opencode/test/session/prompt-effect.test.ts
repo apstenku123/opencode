@@ -1682,10 +1682,7 @@ it.live(
   30_000,
 )
 
-it.live.skip(
-  // TODO(R4-S4): runLoop does not yet convert `AdaptiveHooks.Inject` directive
-  // into a synthetic MessageV2.User and re-enter the loop. R3-S4 (inject impl)
-  // was rate-limited before this wiring landed. Unskip once R4 implements it.
+it.live(
   "runLoop converts preBreak Inject into a synthetic MessageV2.User and re-enters the loop",
   () =>
     provideTmpdirServer(
