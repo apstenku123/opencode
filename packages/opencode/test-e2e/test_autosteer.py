@@ -44,14 +44,11 @@ asking for one-sentence or "repeat verbatim" replies.
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 import time
-from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 
-import httpx
 import pytest
 
 from harness import OpencodeClient, OpencodeServer
@@ -112,24 +109,41 @@ def _wait_turn_complete(
     client: OpencodeClient,
     thread_id: str,
     *,
+    expected_assistant_count: int,
     timeout_s: float = 240.0,
-    poll_s: float = 1.0,
-) -> None:
-    """Poll GET /session/:id until ``time.idle`` is populated.
+    poll_s: float = 0.5,
+) -> list[dict[str, Any]]:
+    """Poll until an assistant message at index ``expected_assistant_count - 1``
+    has either ``time.completed`` set OR carries an ``error`` payload.
 
-    We don't rely on the SSE ``session.idle`` event for completion because
-    autosteer may inject a synthetic user turn AFTER the provider's
-    assistant message lands — ``time.idle`` clears during the injected
-    follow-up iteration and re-populates when the loop finally exits.
+    We can't rely on ``session.time.idle`` alone — opencode doesn't populate
+    it when the provider returns an upstream error (the observed behaviour
+    with an unsupported Copilot model on /responses). Every turn produces
+    exactly one new assistant message, so once ``len(assistants)`` reaches
+    ``expected_assistant_count`` and its terminal flag is set, we're done.
+
+    Returns the full message list so the caller doesn't have to re-fetch.
     """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        messages = client.get_messages(thread_id)
+        assistants = _assistant_messages(messages)
+        if len(assistants) >= expected_assistant_count:
+            target = assistants[expected_assistant_count - 1]
+            info = target.get("info") or {}
+            tinfo = info.get("time") or {}
+            if tinfo.get("completed") is not None:
+                return messages
+            if info.get("error"):
+                return messages
+        # Fallback: also accept ``session.time.idle`` for completeness.
         session = client.get_session(thread_id)
-        t = session.get("time") or {}
-        if t.get("idle"):
-            return
+        if (session.get("time") or {}).get("idle"):
+            return messages
         time.sleep(poll_s)
-    raise TimeoutError(f"turn on thread {thread_id} did not complete in {timeout_s:.0f}s")
+    raise TimeoutError(
+        f"turn on thread {thread_id} did not complete in {timeout_s:.0f}s"
+    )
 
 
 def _user_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -171,21 +185,32 @@ def _send(
     text: str,
     model: dict[str, str],
     *,
-    timeout_s: float = 240.0,
+    timeout_s: float = 120.0,
 ) -> dict[str, Any]:
     """Fire a user turn and return the resulting assistant message.
 
     Uses ``POST /session/:id/message`` (``send_message``) which resolves
     synchronously once the assistant reply lands — matching the pattern
     already validated by ``test_autobest.py`` against the same fixture.
+
+    Before sending, we count existing assistant messages so ``_wait_turn_complete``
+    can target the NEW one (turns are additive — the nth turn produces the
+    (n-1)th assistant message).
     """
+    prior_messages = client.get_messages(thread_id)
+    prior_count = len(_assistant_messages(prior_messages))
     result = client.send_message(
         thread_id,
         text,
         providerID=model["providerID"],
         modelID=model["modelID"],
     )
-    _wait_turn_complete(client, thread_id, timeout_s=timeout_s)
+    _wait_turn_complete(
+        client,
+        thread_id,
+        expected_assistant_count=prior_count + 1,
+        timeout_s=timeout_s,
+    )
     return result
 
 
