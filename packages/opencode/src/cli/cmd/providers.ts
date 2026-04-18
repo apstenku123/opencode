@@ -558,6 +558,9 @@ export function accountStatus(input: {
     login: input.quota?.login ?? item?.login,
     plan: plan && plan !== "unknown" ? plan : item?.plan,
     proxy: !!item?.proxyUrl,
+    proxyUrl: item?.proxyUrl,
+    envelope: !!item?.envelope,
+    machineId: item?.machineId,
     exhausted,
     exhaustedUntil,
     quota: input.quota,
@@ -614,16 +617,51 @@ export function renderAccountStatus(
     : "unknown"
   const unsupportedLine =
     unsupported.length > 0 ? `\n  Unsupported: ${unsupported.join(", ")} (returned model_not_supported in live dispatch)` : ""
+  // Proxy / machineId / allowed-models lines anchor the "which physical
+  // identity is this" view the user reviews in `providers accounts` — these
+  // mirror the codex_git app-server bootstrap (see
+  // `codex-rs/app-server/src/copilot_bootstrap.rs` discovery logs).
+  const proxyLine = status.proxyUrl
+    ? `\n  Proxy: ${status.proxyUrl}${status.envelope ? " (envelope)" : ""}`
+    : ""
+  const machineLine = status.machineId ? `\n  Machine ID: ${status.machineId}` : ""
+  const allowedProd = pool ? poolAllowedProdModels(pool) : []
+  const allowedTest = pool ? poolAllowedTestModels(pool) : []
+  const allowedLine = pool
+    ? `\n  Allowed (prod): ${allowedProd.join(", ") || "<none>"}\n  Allowed (test-only): ${allowedTest.join(", ") || "<none>"}`
+    : ""
   return `${status.label} ${UI.Style.TEXT_DIM}${extra}
   Login: ${status.login ?? "unknown"}
-  Plan: ${status.plan ?? "unknown"}
+  Plan: ${status.plan ?? "unknown"}${machineLine}${proxyLine}
   Health: ${status.health}
-  Discovery: ${discoveryLine}${unsupportedLine}${
+  Discovery: ${discoveryLine}${unsupportedLine}${allowedLine}${
     input?.premium
       ? `
   Premium: ${input.premium}`
       : ""
   }`
+}
+
+/**
+ * Production models a pool is permitted to route. Mirrors codex_git model
+ * gating in `DEFAULT_POOL_RULES` + xhigh-only constraint. Enterprise (prod
+ * pool) defaults to gpt-5.4-xhigh + claude-4.7-opus-high; edu defaults to
+ * codex-5.3-xhigh. Expressed here so `providers accounts` shows the user
+ * which models will route to each account without needing to read the
+ * source.
+ */
+export function poolAllowedProdModels(pool: PoolId): string[] {
+  if (pool === "edu") return ["codex-5.3-xhigh"]
+  return ["gpt-5.4-xhigh", "claude-4.7-opus-high"]
+}
+
+/**
+ * Models permitted when the account is consumed as a test slot (edu pool
+ * or CODEX_TEST_COPILOT_TOKENS-style injected slot). Mirrors codex_git
+ * `[test_accounts].supported_models`.
+ */
+export function poolAllowedTestModels(_pool: PoolId): string[] {
+  return ["gpt-4.1", "gpt-5-mini-xhigh"]
 }
 
 export async function loadAccountStatuses() {

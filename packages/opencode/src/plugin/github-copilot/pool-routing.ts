@@ -146,7 +146,13 @@ export function poolForAccount(input: {
   if (!plan) return undefined
   const normalized = plan.toLowerCase()
   if (normalized === "edu" || normalized === "free") return "edu"
-  if (normalized === "enterprise" || normalized === "pro" || normalized === "business" || normalized === "team") {
+  if (
+    normalized === "enterprise" ||
+    normalized === "pro" ||
+    normalized === "business" ||
+    normalized === "team" ||
+    normalized === "individual"
+  ) {
     return "prod"
   }
   return undefined

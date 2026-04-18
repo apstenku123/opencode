@@ -1486,6 +1486,8 @@ test("migration e2e migrates legacy credentials into empty auth store with injec
       const fs = yield* AppFileSystem.Service
       const src = {
         legacy: legacyPath,
+        apps: legacyPath + ".apps",
+        oauth: legacyPath + ".oauth",
         marker: markerPath,
         read(path: string) {
           return fs.readJson(path)

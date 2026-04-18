@@ -1,4 +1,9 @@
-import { legacyCredentialFile, migrationFile } from "./paths"
+import {
+  githubCopilotAppsFile,
+  githubCopilotOAuthFile,
+  legacyCredentialFile,
+  migrationFile,
+} from "./paths"
 import { Auth } from "@/auth"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { Effect } from "effect"
@@ -96,6 +101,80 @@ export function legacy(raw: unknown): CopilotAuth[] {
 }
 
 /**
+ * Parse `~/.config/github-copilot/apps.json` — the VS Code / Neovim
+ * Copilot multiplexer, keyed by `"<host>:<githubAppId>"`. Each slot
+ * carries its own `oauth_token`, so a user with multiple App IDs
+ * (extension vs LSP vs CLI) registers as distinct `github-copilot#<slug>`
+ * keys.  Mirrors codex_git's auth discovery surface for multiplexed
+ * Copilot setups.
+ */
+export function apps(raw: unknown): CopilotAuth[] {
+  if (!raw || typeof raw !== "object") return []
+  const data = raw as Record<string, unknown>
+  const items: CopilotAuth[] = []
+  for (const [compound, value] of Object.entries(data)) {
+    if (!value || typeof value !== "object") continue
+    const item = value as Record<string, unknown>
+    const token = typeof item.oauth_token === "string" ? item.oauth_token : undefined
+    if (!token) continue
+    const user = typeof item.user === "string" ? item.user : undefined
+    const appId = typeof item.githubAppId === "string" ? item.githubAppId : undefined
+    // Compound key form: `"github.com:Iv23ctfURkiMfJ4xr5mv"`. The App ID
+    // is the salient discriminator — different App IDs serve different
+    // Copilot scopes on the same GitHub account. Fall back to the raw
+    // compound key when neither is usable.
+    const slug = appId
+      ? appId.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 16)
+      : compound.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 16)
+    const key = `github-copilot#app-${slug}`
+    items.push({
+      key,
+      label: user ?? label(key),
+      refresh: token,
+      access: token,
+      expires: 0,
+    })
+  }
+  return items
+}
+
+/**
+ * Parse `~/.config/github-copilot/oauth.json` — the classic single-entry
+ * OAuth log-in store, keyed by `"<login-url>"` with an array of sessions.
+ * Each session gets its own account slot so re-logins accumulate rather
+ * than overwrite.
+ */
+export function oauth(raw: unknown): CopilotAuth[] {
+  if (!raw || typeof raw !== "object") return []
+  const data = raw as Record<string, unknown>
+  const items: CopilotAuth[] = []
+  for (const [_host, value] of Object.entries(data)) {
+    if (!Array.isArray(value)) continue
+    for (const entry of value) {
+      if (!entry || typeof entry !== "object") continue
+      const e = entry as Record<string, unknown>
+      const token = typeof e.accessToken === "string" ? e.accessToken : undefined
+      if (!token) continue
+      const account = (e.account && typeof e.account === "object") ? (e.account as Record<string, unknown>) : {}
+      const user = typeof account.label === "string" ? account.label : undefined
+      const id = typeof account.id === "string" ? account.id : typeof e.id === "string" ? e.id : undefined
+      const slug = id
+        ? id.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 16)
+        : "oauth"
+      const key = `github-copilot#oauth-${slug}`
+      items.push({
+        key,
+        label: user ?? label(key),
+        refresh: token,
+        access: token,
+        expires: 0,
+      })
+    }
+  }
+  return items
+}
+
+/**
  * Transient map populated by `migrate()` with proxy metadata from
  * `~/.copilot/auth/credential.json`. `Auth.Info` has no proxy fields
  * (proxy lives on Conn in `copilot-connections.json`), so downstream
@@ -109,8 +188,21 @@ export const migrate = Effect.fn("CopilotAuth.migrate")(function* (src?: Migrati
   const existing = yield* auth.all()
   const existingKeys = new Set(Object.keys(existing).filter((k) => k.startsWith("github-copilot")))
   const raw = yield* fs.read(fs.legacy).pipe(Effect.orElseSucceed(() => ({})))
-  const allFound = legacy(raw)
-  const items = allFound.filter((item) => !existingKeys.has(item.key))
+  const rawApps = yield* fs.read(fs.apps).pipe(Effect.orElseSucceed(() => ({})))
+  const rawOauth = yield* fs.read(fs.oauth).pipe(Effect.orElseSucceed(() => ({})))
+  // Merge all three sources plus env-supplied test tokens. Dedup by final
+  // `key`; the legacy CLI credential file is preferred when the same key
+  // is produced by multiple sources.
+  const envTests = testTokensFromEnv(process.env.OPENCODE_TEST_COPILOT_TOKENS)
+  const allFound = [...legacy(raw), ...apps(rawApps), ...oauth(rawOauth), ...envTests]
+  const seen = new Set<string>()
+  const uniq: CopilotAuth[] = []
+  for (const item of allFound) {
+    if (seen.has(item.key)) continue
+    seen.add(item.key)
+    uniq.push(item)
+  }
+  const items = uniq.filter((item) => !existingKeys.has(item.key))
   // Append, never overwrite: if legacy drops a credential we already have
   // under the same key, prefer the opencode-native one. Re-runs safely on
   // every CLI/plugin boot so edu/GCP-proxy accounts added to
@@ -129,7 +221,7 @@ export const migrate = Effect.fn("CopilotAuth.migrate")(function* (src?: Migrati
   // Stash proxy metadata (not on Auth.Info) for downstream upsert into
   // copilot-connections.json. All legacy entries are considered — not
   // just newly-added — so proxy rotations in the legacy file propagate.
-  for (const item of allFound) {
+  for (const item of uniq) {
     if (item.proxyUrl) proxyImports.set(item.key, { url: item.proxyUrl, token: item.proxyToken })
   }
   const prior = yield* readMigration(fs)
@@ -174,6 +266,8 @@ export const migration = {
 
 export type MigrationIO = {
   legacy: string
+  apps: string
+  oauth: string
   marker: string
   read(path: string): Effect.Effect<unknown, unknown>
   write(path: string, value: unknown): Effect.Effect<void, unknown>
@@ -184,6 +278,8 @@ export function io(): Effect.Effect<MigrationIO, never, AppFileSystem.Service> {
     const fs = yield* AppFileSystem.Service
     return {
       legacy: legacyCredentialFile,
+      apps: githubCopilotAppsFile,
+      oauth: githubCopilotOAuthFile,
       marker: migrationFile,
       read(path: string) {
         return fs.readJson(path)
@@ -210,6 +306,32 @@ export const writeMigration = Effect.fn("CopilotAuth.writeMigration")(function* 
   yield* fs.write(fs.marker, state)
 })
 
+
+/**
+ * Parse a comma-separated list of Copilot tokens (from the
+ * `OPENCODE_TEST_COPILOT_TOKENS` env var, mirroring codex_git's
+ * `CODEX_TEST_COPILOT_TOKENS`) into synthetic test-slot credentials with
+ * keys `github-copilot#edu-N`. These are registered under the edu pool
+ * so they only route for xhigh test-only models and stay hidden from
+ * the production TUI.
+ */
+export function testTokensFromEnv(raw: string | undefined): CopilotAuth[] {
+  if (!raw) return []
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((token, i) => {
+      const key = `github-copilot#edu-${i + 1}`
+      return {
+        key,
+        label: label(key),
+        refresh: token,
+        access: token,
+        expires: 0,
+      } satisfies CopilotAuth
+    })
+}
 
 export function summarizeMigration(state: MigrationState) {
   return {
