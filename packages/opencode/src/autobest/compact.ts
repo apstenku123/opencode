@@ -1,18 +1,22 @@
 /**
- * Compact-window stub reader for Step B plan-check.
+ * Compact-window reader for autobest Step B plan-check.
  *
- * Round 3 — `session/compaction.ts` already runs the compaction pipeline and
- * writes a `summary:true` assistant message into session history, but there is
- * no dedicated API to retrieve the *latest* compact window's structured plan
- * items. This module fills that gap with a lightweight reader that:
+ * `session/compaction.ts` runs the compaction pipeline and writes a
+ * `summary:true` assistant message into session history. This module is
+ * the dedicated reader Step B uses to retrieve the *latest* compact
+ * window's structured plan items:
  *
  *   1. Walks `Session.messages()` newest-first.
  *   2. Returns the first `summary:true` assistant message's concatenated text.
  *   3. Parses the standard compaction template (`## Accomplished`, `## Plan`,
  *      "next steps" headings) into `CompactWindow.actionItems` / `completed`.
  *
- * When `session/compaction.ts` eventually exposes a proper `getLastCompact`
- * method this file becomes a thin adapter, or can be removed entirely.
+ * Round 6 (Stream H) renamed this module from `compact-stub.ts` to
+ * `compact.ts` and documented the production wiring path — the original
+ * "stub" name was a misnomer from round 3 when the reader was introduced
+ * alongside the Step B scaffolding. When the R6 rollout lands a
+ * structured compact-event stream, this module will become a thin
+ * adapter over that source.
  *
  * # Plan marker detection
  *

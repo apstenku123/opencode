@@ -18,14 +18,55 @@ export type StepKind = "a" | "b" | "c" | "d"
 /**
  * Per-session cycle state — tracks iteration count and the last step kind /
  * turn correlation to gate the auto-continue feedback loop.
- * Mirror of the Rust `Session::what_next_asks_used_this_cycle` + iteration
- * bookkeeping from `autobest_extract.rs`.
+ * Mirror of the Rust `Session::what_next_asks_used_this_cycle` +
+ * `where_is_plan_asks_used_this_cycle` + iteration bookkeeping from
+ * `autobest_extract.rs`.
+ *
+ * # Cycle flags
+ *
+ *   - `whatNextAsked`: true after Step C has fired "And what's next?" at
+ *     least once. Prevents re-asking in the same cycle.
+ *   - `whereIsPlanAsked`: true after Step C has fired "Where is the plan?"
+ *     at least once. Symmetric with `whatNextAsked`.
+ *   - `stagnationCount`: monotonic counter incremented each time the
+ *     observer observes a Step A empty / Step B plan-skip ping-pong.
+ *     Decremented on a forward-progress signal (Step A with fresh
+ *     candidates + changed plan). Mirrors Rust `autosteering_stagnation_count`.
  */
 export type CycleState = {
   iteration: number
   stepKind: StepKind
   turnID?: string
   whatNextAsked?: boolean
+  whereIsPlanAsked?: boolean
+  stagnationCount?: number
+}
+
+/**
+ * Per-session autobest cycle configuration. Values mirror Rust's `Session`
+ * bag exposed to `run_step_b` / `decide_empty_followup`. When a flag is
+ * `undefined` the observer falls back to the conservative default
+ * documented below.
+ */
+export type CycleConfig = {
+  /**
+   * When true AND the cycle has not yet asked, Step C issues
+   * "Where is the plan?" instead of "And what's next?". Matches
+   * Rust's `ask_where_is_plan_on_empty`. Default: `false`.
+   */
+  askWhereIsPlanOnEmpty?: boolean
+  /**
+   * Cap on cycle iterations before Step D terminates regardless of
+   * candidate availability. Mirrors Rust `max_autobest_iterations`.
+   * Default: `3`.
+   */
+  maxIterations?: number
+  /**
+   * When true, the observer resets the cycle (iteration=0) whenever a
+   * user message arrives that does not match a stop pattern. Matches
+   * Rust `reset_cycle_on_user_turn`. Default: `true`.
+   */
+  resetOnUserTurn?: boolean
 }
 
 export type State = {
@@ -45,15 +86,44 @@ export function empty(): State {
   return { picks: [] }
 }
 
+/** Default values for {@link CycleConfig} — exported for tests + observer. */
+export const DEFAULT_CYCLE_CONFIG: Required<CycleConfig> = {
+  askWhereIsPlanOnEmpty: false,
+  maxIterations: 3,
+  resetOnUserTurn: true,
+}
+
+/**
+ * Merge a user-supplied {@link CycleConfig} override on top of
+ * {@link DEFAULT_CYCLE_CONFIG}. Unknown / undefined keys fall through to
+ * the default. Pure helper.
+ */
+export function resolveCycleConfig(override?: CycleConfig): Required<CycleConfig> {
+  const src = override ?? {}
+  return {
+    askWhereIsPlanOnEmpty: src.askWhereIsPlanOnEmpty ?? DEFAULT_CYCLE_CONFIG.askWhereIsPlanOnEmpty,
+    maxIterations: src.maxIterations ?? DEFAULT_CYCLE_CONFIG.maxIterations,
+    resetOnUserTurn: src.resetOnUserTurn ?? DEFAULT_CYCLE_CONFIG.resetOnUserTurn,
+  }
+}
+
 /**
  * Advance the cycle state — called each time the observer applies a Step A/B/C/D result.
  * Returns a new state with iteration+1 and the provided stepKind / turnID.
  */
 export function advanceCycle(
   state: State,
-  input: { stepKind: StepKind; turnID?: string; whatNextAsked?: boolean },
+  input: {
+    stepKind: StepKind
+    turnID?: string
+    whatNextAsked?: boolean
+    whereIsPlanAsked?: boolean
+    stagnationDelta?: number
+  },
 ): State {
   const prev = state.cycle ?? { iteration: 0, stepKind: "a" as StepKind }
+  const baseStagnation = prev.stagnationCount ?? 0
+  const delta = input.stagnationDelta ?? 0
   return {
     ...state,
     cycle: {
@@ -61,6 +131,8 @@ export function advanceCycle(
       stepKind: input.stepKind,
       turnID: input.turnID ?? prev.turnID,
       whatNextAsked: input.whatNextAsked ?? prev.whatNextAsked,
+      whereIsPlanAsked: input.whereIsPlanAsked ?? prev.whereIsPlanAsked,
+      stagnationCount: Math.max(0, baseStagnation + delta),
     },
   }
 }
@@ -157,7 +229,11 @@ export type CycleEvent =
       readonly stepKind: StepKind
       readonly turnID?: string
       readonly whatNextAsked?: boolean
+      /** New in R6: symmetric flag for `askWhereIsPlanOnEmpty`. */
+      readonly whereIsPlanAsked?: boolean
       readonly iteration: number
+      /** New in R6: stagnation counter for autosteer (parity with Rust). */
+      readonly stagnationCount?: number
       readonly reason?: string
     }
   | {
@@ -187,6 +263,8 @@ export function reduceCycleEvents(events: readonly CycleEvent[]): CycleState | u
         stepKind: ev.stepKind,
         turnID: ev.turnID ?? state?.turnID,
         whatNextAsked: ev.whatNextAsked ?? state?.whatNextAsked,
+        whereIsPlanAsked: ev.whereIsPlanAsked ?? state?.whereIsPlanAsked,
+        stagnationCount: ev.stagnationCount ?? state?.stagnationCount,
       }
       continue
     }
@@ -208,7 +286,9 @@ export function buildCycleAdvanceEvent(input: {
     stepKind: input.cycle.stepKind,
     turnID: input.cycle.turnID,
     whatNextAsked: input.cycle.whatNextAsked,
+    whereIsPlanAsked: input.cycle.whereIsPlanAsked,
     iteration: input.cycle.iteration,
+    stagnationCount: input.cycle.stagnationCount,
     reason: input.reason,
   }
 }

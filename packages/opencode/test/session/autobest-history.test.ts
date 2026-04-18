@@ -102,7 +102,16 @@ describe("session autobest history", () => {
   test("autobest cycle state advances iteration counter", () => {
     const base = Autobest.empty()
     const once = Autobest.advanceCycle(base, { stepKind: "a", turnID: "t1" })
-    expect(once.cycle).toEqual({ iteration: 1, stepKind: "a", turnID: "t1", whatNextAsked: undefined })
+    // Round-6 (Stream H) extended the cycle bag with `whereIsPlanAsked`
+    // and `stagnationCount`. The default values are `undefined` / `0`.
+    expect(once.cycle).toEqual({
+      iteration: 1,
+      stepKind: "a",
+      turnID: "t1",
+      whatNextAsked: undefined,
+      whereIsPlanAsked: undefined,
+      stagnationCount: 0,
+    })
     const twice = Autobest.advanceCycle(once, { stepKind: "c", whatNextAsked: true })
     expect(twice.cycle?.iteration).toBe(2)
     expect(twice.cycle?.stepKind).toBe("c")

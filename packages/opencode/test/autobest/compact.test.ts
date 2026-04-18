@@ -4,11 +4,11 @@ import {
   compactWindowReaderFromSession,
   detectSkippedPlanStep,
   parseCompactText,
-} from "@/autobest/compact-stub"
+} from "@/autobest/compact"
 import type { Session } from "@/session"
 import type { MessageV2 } from "@/session/message-v2"
 
-describe("autobest/compact-stub — parseCompactText", () => {
+describe("autobest/compact — parseCompactText", () => {
   test("extracts plan items from '## Plan' section", () => {
     const out = parseCompactText(`
 Intro line.
@@ -59,7 +59,7 @@ Intro line.
   })
 })
 
-describe("autobest/compact-stub — detectSkippedPlanStep", () => {
+describe("autobest/compact — detectSkippedPlanStep", () => {
   const w = { id: 1, actionItems: ["deploy the branch", "update changelog"], completed: [] }
 
   test("returns first unfinished item not mentioned in tail", () => {
@@ -104,7 +104,7 @@ describe("autobest/compact-stub — detectSkippedPlanStep", () => {
   })
 })
 
-describe("autobest/compact-stub — compactWindowReaderFromSession", () => {
+describe("autobest/compact — compactWindowReaderFromSession", () => {
   function fakeSession(msgs: MessageV2.WithParts[]): Session.Interface {
     return {
       messages: () => Effect.succeed(msgs),

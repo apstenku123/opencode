@@ -1,5 +1,19 @@
 import { describe, expect, test } from "bun:test"
-import { apply, decide, empty, extract, setActive } from "@/autobest"
+import {
+  advanceCycle,
+  apply,
+  buildCycleAdvanceEvent,
+  buildCycleResetEvent,
+  decide,
+  DEFAULT_CYCLE_CONFIG,
+  empty,
+  extract,
+  reduceCycleEvents,
+  resetCycle,
+  resolveCycleConfig,
+  setActive,
+  type CycleEvent,
+} from "@/autobest"
 
 describe("autobest", () => {
   test("extract sorts candidates by score then key", () => {
@@ -88,5 +102,84 @@ describe("autobest", () => {
       selected: undefined,
       changed: false,
     })
+  })
+})
+
+describe("autobest — cycle config (R6 flags)", () => {
+  test("DEFAULT_CYCLE_CONFIG is the documented conservative baseline", () => {
+    expect(DEFAULT_CYCLE_CONFIG).toEqual({
+      askWhereIsPlanOnEmpty: false,
+      maxIterations: 3,
+      resetOnUserTurn: true,
+    })
+  })
+
+  test("resolveCycleConfig falls through to defaults on partial override", () => {
+    expect(resolveCycleConfig({ askWhereIsPlanOnEmpty: true })).toEqual({
+      askWhereIsPlanOnEmpty: true,
+      maxIterations: 3,
+      resetOnUserTurn: true,
+    })
+    expect(resolveCycleConfig({ maxIterations: 5 })).toEqual({
+      askWhereIsPlanOnEmpty: false,
+      maxIterations: 5,
+      resetOnUserTurn: true,
+    })
+  })
+
+  test("advanceCycle propagates whereIsPlanAsked and stagnationDelta", () => {
+    const s0 = empty()
+    const s1 = advanceCycle(s0, { stepKind: "c", whereIsPlanAsked: true })
+    expect(s1.cycle?.whereIsPlanAsked).toBe(true)
+    expect(s1.cycle?.iteration).toBe(1)
+    const s2 = advanceCycle(s1, { stepKind: "c", stagnationDelta: 1 })
+    expect(s2.cycle?.stagnationCount).toBe(1)
+    expect(s2.cycle?.whereIsPlanAsked).toBe(true) // preserved
+    const s3 = advanceCycle(s2, { stepKind: "a", stagnationDelta: -2 })
+    expect(s3.cycle?.stagnationCount).toBe(0) // clamped to 0
+  })
+
+  test("resetCycle zeroes iteration", () => {
+    const advanced = advanceCycle(empty(), { stepKind: "b", whatNextAsked: true })
+    const reset = resetCycle(advanced)
+    expect(reset.cycle).toEqual({ iteration: 0, stepKind: "a" })
+  })
+
+  test("cycle advance events round-trip whereIsPlanAsked + stagnationCount", () => {
+    const ev = buildCycleAdvanceEvent({
+      sessionID: "ses-1",
+      cycle: {
+        iteration: 5,
+        stepKind: "c",
+        whatNextAsked: true,
+        whereIsPlanAsked: true,
+        stagnationCount: 2,
+      },
+      ts: 100,
+    })
+    expect(ev.whatNextAsked).toBe(true)
+    expect(ev.whereIsPlanAsked).toBe(true)
+    expect(ev.stagnationCount).toBe(2)
+    const reconstructed = reduceCycleEvents([ev])
+    expect(reconstructed).toEqual({
+      iteration: 5,
+      stepKind: "c",
+      turnID: undefined,
+      whatNextAsked: true,
+      whereIsPlanAsked: true,
+      stagnationCount: 2,
+    })
+  })
+
+  test("cycle reset event restores the initial iteration", () => {
+    const evs: CycleEvent[] = [
+      buildCycleAdvanceEvent({
+        sessionID: "s",
+        cycle: { iteration: 3, stepKind: "c", whatNextAsked: true },
+      }),
+      buildCycleResetEvent({ sessionID: "s" }),
+    ]
+    const state = reduceCycleEvents(evs)
+    expect(state).toEqual({ iteration: 0, stepKind: "a" })
   })
 })

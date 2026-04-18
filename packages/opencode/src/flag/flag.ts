@@ -42,6 +42,12 @@ export namespace Flag {
     OPENCODE_DISABLE_CLAUDE_CODE || truthy("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS")
   export const OPENCODE_DISABLE_EXTERNAL_SKILLS =
     OPENCODE_DISABLE_CLAUDE_CODE_SKILLS || truthy("OPENCODE_DISABLE_EXTERNAL_SKILLS")
+  /**
+   * Opt out of the 8 built-in skills embedded in the binary. The bundle is
+   * disabled by default (opt-in via `skills.builtin: true` config). This
+   * flag provides an environment-level override for CI / ad-hoc runs.
+   */
+  export const OPENCODE_DISABLE_BUILTIN_SKILLS = truthy("OPENCODE_DISABLE_BUILTIN_SKILLS")
   export declare const OPENCODE_DISABLE_PROJECT_CONFIG: boolean
   export const OPENCODE_FAKE_VCS = process.env["OPENCODE_FAKE_VCS"]
   export declare const OPENCODE_CLIENT: string
