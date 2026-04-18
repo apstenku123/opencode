@@ -27,6 +27,13 @@ const Conn = Schema.Struct({
   machineId: Schema.optional(Schema.String),
   proxyUrl: Schema.optional(Schema.String),
   proxyToken: Schema.optional(Schema.String),
+  /**
+   * Per-account opt-in for the Rust-compatible `POST {proxy}/fetch` envelope
+   * protocol. Set automatically when a credential is imported from
+   * `~/.copilot/auth/credential.json` (the Rust CLI always envelopes via
+   * the GCP fetch-proxy). Manual connections (URL-rewrite mode) omit this.
+   */
+  envelope: Schema.optional(Schema.Boolean),
   discovery: Schema.optional(Discovery),
   /**
    * Models the server has rejected with `model_not_supported` for this
@@ -296,5 +303,6 @@ export function proxy(state: State, key: string) {
   return {
     url: state.connections[key]?.proxyUrl,
     token: state.connections[key]?.proxyToken,
+    envelope: state.connections[key]?.envelope,
   }
 }

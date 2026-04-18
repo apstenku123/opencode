@@ -575,8 +575,16 @@ test("proxy helper returns per-account proxy config", () => {
       "github-copilot": { proxyUrl: "https://gcp-proxy.example", proxyToken: "tok" },
     },
   }
-  expect(proxy(state, "github-copilot")).toEqual({ url: "https://gcp-proxy.example", token: "tok" })
-  expect(proxyConfig(state, "github-copilot")).toEqual({ url: "https://gcp-proxy.example", token: "tok" })
+  expect(proxy(state, "github-copilot")).toEqual({
+    url: "https://gcp-proxy.example",
+    token: "tok",
+    envelope: undefined,
+  })
+  expect(proxyConfig(state, "github-copilot")).toEqual({
+    url: "https://gcp-proxy.example",
+    token: "tok",
+    envelope: undefined,
+  })
 })
 
 test("proxy headers inject per-account proxy token", () => {

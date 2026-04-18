@@ -82,19 +82,57 @@ export function parse(input: Payload): Quota {
   }
 }
 
-export async function fetchQuota(token: string, enterpriseUrl?: string, proxy?: { url?: string; token?: string }) {
-  const target = proxy?.url
-    ? new URL("/copilot_internal/user", proxy.url).href
-    : "https://api.github.com/copilot_internal/user"
-  // Route through the shared HTTP client so corporate CA bundles + the
-  // unified timeout policy apply; keep the caller-facing error surface
-  // (plain `Error("Failed to fetch quota: <status>")`) for existing tests.
+export async function fetchQuota(
+  token: string,
+  enterpriseUrl?: string,
+  proxy?: { url?: string; token?: string; envelope?: boolean },
+) {
+  const upstream = "https://api.github.com/copilot_internal/user"
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/json",
+    "User-Agent": `opencode/${InstallationVersion}`,
+    ...(enterpriseUrl ? { "X-GitHub-Enterprise-Host": enterpriseUrl } : {}),
+  }
+  // Rust-CLI fetch-proxy uses the envelope protocol: wrap the upstream GET
+  // as a POST to `{proxy}/fetch` with `{url, method, headers, body}` JSON.
+  // Our URL-rewrite fallback (`${proxy}/copilot_internal/user`) does NOT
+  // work against Rust's proxy because the `/fetch` endpoint is the only one
+  // exposed. Prefer envelope when a proxy is configured as envelope=true
+  // (or when env override forces it).
+  const useEnvelope =
+    proxy?.url && (proxy.envelope === true || process.env.OPENCODE_COPILOT_PROXY_ENVELOPE === "1")
+  if (useEnvelope) {
+    const envelopeBody = JSON.stringify({
+      url: upstream,
+      method: "GET",
+      headers,
+      timeout_ms: 10_000,
+    })
+    const res = await HttpClient.request(`${proxy!.url}/fetch`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        ...(proxy!.token ? { Authorization: `Bearer ${proxy!.token}` } : {}),
+      },
+      body: envelopeBody,
+      retry: false,
+      throwOnError: false,
+      timeoutMs: 15_000,
+    })
+    if (!res.ok) throw new Error(`Failed to fetch quota: ${res.status}`)
+    const envelope = (await res.json()) as { status_code?: number; body?: string }
+    if (!envelope.status_code || envelope.status_code >= 400) {
+      throw new Error(`Failed to fetch quota: ${envelope.status_code ?? "no-status"}`)
+    }
+    const innerBody = envelope.body ?? "{}"
+    return parse(JSON.parse(innerBody) as Payload)
+  }
+  const target = proxy?.url ? new URL("/copilot_internal/user", proxy.url).href : upstream
   const res = await HttpClient.request(target, {
     headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-      "User-Agent": `opencode/${InstallationVersion}`,
-      ...(enterpriseUrl ? { "X-GitHub-Enterprise-Host": enterpriseUrl } : {}),
+      ...headers,
       ...(proxy?.token ? { "x-copilot-proxy-token": proxy.token } : {}),
     },
     retry: false,
