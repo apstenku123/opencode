@@ -84,6 +84,39 @@ describe("Hook.matchTargetFor", () => {
       }),
     ).toBeUndefined()
   })
+
+  test("TurnStart / UserMessage / AssistantMessage have no target", () => {
+    expect(
+      matchTargetFor({ hook_event_name: "TurnStart", turn_id: "t1" }),
+    ).toBeUndefined()
+    expect(
+      matchTargetFor({
+        hook_event_name: "UserMessage",
+        turn_id: "t1",
+        message_id: "m1",
+        text: "hi",
+      }),
+    ).toBeUndefined()
+    expect(
+      matchTargetFor({
+        hook_event_name: "AssistantMessage",
+        turn_id: "t1",
+        message_id: "m2",
+        text: "ok",
+      }),
+    ).toBeUndefined()
+  })
+
+  test("TurnStop matches on finish_reason", () => {
+    expect(
+      matchTargetFor({
+        hook_event_name: "TurnStop",
+        turn_id: "t1",
+        iterations: 3,
+        finish_reason: "stop",
+      }),
+    ).toBe("stop")
+  })
 })
 
 describe("Hook.serializeHookPayload", () => {
@@ -106,5 +139,58 @@ describe("Hook.serializeHookPayload", () => {
     expect(wire.tool_name).toBe("shell")
     // hook_event key itself should not appear at the root.
     expect((wire as Record<string, unknown>).hook_event).toBeUndefined()
+  })
+
+  test("turn lifecycle events flatten turn_id alongside session_id", () => {
+    const base = {
+      session_id: "s-1",
+      agent_level: 0,
+      session_context: { source: "cli" as const },
+      cwd: "/tmp",
+      triggered_at: "2025-01-01T00:00:00Z",
+    }
+    const turnStart = serializeHookPayload({
+      ...base,
+      hook_event: { hook_event_name: "TurnStart", turn_id: "t-1" },
+    })
+    expect(turnStart.hook_event_name).toBe("TurnStart")
+    expect(turnStart.turn_id).toBe("t-1")
+    expect(turnStart.session_id).toBe("s-1")
+
+    const userMsg = serializeHookPayload({
+      ...base,
+      hook_event: {
+        hook_event_name: "UserMessage",
+        turn_id: "t-1",
+        message_id: "m-1",
+        text: "hello",
+      },
+    })
+    expect(userMsg.text).toBe("hello")
+    expect(userMsg.message_id).toBe("m-1")
+
+    const assistantMsg = serializeHookPayload({
+      ...base,
+      hook_event: {
+        hook_event_name: "AssistantMessage",
+        turn_id: "t-1",
+        message_id: "m-2",
+        text: "world",
+        tool_calls: ["bash", "read"],
+      },
+    })
+    expect(assistantMsg.tool_calls).toEqual(["bash", "read"])
+
+    const turnStop = serializeHookPayload({
+      ...base,
+      hook_event: {
+        hook_event_name: "TurnStop",
+        turn_id: "t-1",
+        iterations: 2,
+        finish_reason: "stop",
+      },
+    })
+    expect(turnStop.iterations).toBe(2)
+    expect(turnStop.finish_reason).toBe("stop")
   })
 })
