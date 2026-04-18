@@ -118,11 +118,11 @@ def copilot_model() -> dict[str, str]:
     return {
         "providerID": os.environ.get(
             "OPENCODE_E2E_COPILOT_PROVIDER",
-            "github-copilot",
+            "github-copilot#edu",
         ),
         "modelID": os.environ.get(
             "OPENCODE_E2E_COPILOT_MODEL",
-            "gpt-4o",
+            "gpt-4.1",
         ),
     }
 
@@ -213,57 +213,22 @@ def live_copilot_model(isolated_copilot_home: Path) -> dict[str, str]:
     except (OSError, json.JSONDecodeError):
         data = None
 
-    # Tool-calling reliability varies dramatically across Copilot SKUs.
-    # ``gpt-4o`` — the only model published by the enterprise endpoint —
-    # frequently ignores tool-use instructions on a short prompt. Prefer
-    # ``gpt-5-mini`` on any account that exposes it (personal / edu /
-    # free Copilot plans), which is the smallest model that reliably
-    # honors ``call the bash tool`` instructions.
-    provider_id = "github-copilot"
     model_id = "gpt-4.1"
-    preferred = (
-        "gpt-5-mini",
-        "gpt-5.4-mini",
-        "gpt-5.1-codex-mini",
-        "claude-sonnet-4",
-        "claude-sonnet-4.5",
-    )
     if isinstance(data, dict):
         connections = data.get("connections") or {}
-        # First pass — find an account that lists one of our preferred
-        # tool-calling-reliable models.
-        chosen: tuple[str, str] | None = None
-        for key, conn in connections.items():
-            if not isinstance(conn, dict) or not isinstance(key, str):
+        for conn in connections.values():
+            if not isinstance(conn, dict):
                 continue
             discovery = conn.get("discovery") or {}
             models = discovery.get("models") if isinstance(discovery, dict) else None
-            if not isinstance(models, list):
-                continue
-            for want in preferred:
-                if want in models:
-                    chosen = (key, want)
-                    break
-            if chosen is not None:
-                break
-        # Fallback — first (connection, first model) pair.
-        if chosen is None:
-            for key, conn in connections.items():
-                if not isinstance(conn, dict) or not isinstance(key, str):
-                    continue
-                discovery = conn.get("discovery") or {}
-                models = discovery.get("models") if isinstance(discovery, dict) else None
-                if isinstance(models, list) and models:
-                    first = next(
-                        (m for m in models if isinstance(m, str) and m),
-                        None,
-                    )
-                    if first is not None:
-                        chosen = (key, first)
+            if isinstance(models, list) and models:
+                for candidate in models:
+                    if isinstance(candidate, str) and candidate:
+                        model_id = candidate
                         break
-        if chosen is not None:
-            provider_id, model_id = chosen
-    return {"providerID": provider_id, "modelID": model_id}
+                if model_id != "gpt-4.1":
+                    break
+    return {"providerID": "github-copilot", "modelID": model_id}
 
 
 @pytest.fixture()

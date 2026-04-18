@@ -89,7 +89,17 @@ export const makeMemoryBridge = (
           return text.length > 0 ? text : null
         },
         catch: (err) => err,
-      }).pipe(Effect.catchCause(() => Effect.succeed(null as string | null)))
+      }).pipe(
+        Effect.catchCause((c) => {
+          // Surface failures only when the debug env var is set — memory
+          // bridges degrade silently by design so a missing model doesn't
+          // block the main turn loop.
+          if (process.env.OPENCODE_MEMORY_BRIDGE_DEBUG === "1") {
+            process.stderr.write(`[llm-bridge] generateText failed: ${String(c)}\n`)
+          }
+          return Effect.succeed(null as string | null)
+        }),
+      )
 
     return bridge
   })

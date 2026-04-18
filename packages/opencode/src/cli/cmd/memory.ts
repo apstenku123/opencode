@@ -5,10 +5,12 @@
  * serve daemon.
  *
  * Subcommands:
- *   - `status`  → per-project sextuple counts + foreign-ingest totals.
- *   - `reset`   → truncate project sextuples + foreign-ingest checkpoints.
- *   - `ingest`  → run the foreign-ingest pipeline (claude|cursor|codex|...).
- *   - `crawl`   → walk recent commits and emit sextuples to the JSONL cache.
+ *   - `status`   → per-project sextuple counts + foreign-ingest totals.
+ *   - `reset`    → truncate project sextuples + foreign-ingest checkpoints.
+ *   - `ingest`   → run the foreign-ingest pipeline (claude|cursor|codex|...).
+ *   - `crawl`    → walk recent commits and emit sextuples to the JSONL cache.
+ *   - `seed`     → insert a sextuple from JSON on stdin (test-harness aid).
+ *   - `retrieve` → query the memory store, print scored hits as JSON.
  */
 
 import type { Argv } from "yargs"
@@ -32,18 +34,26 @@ import {
   type ForeignIngestSources,
   type SessionExtractor,
 } from "../../memory/foreign-ingest"
-import { crawl } from "../../memory/commit-crawler"
+import {
+  crawl,
+  type CommitPolisher,
+  type CommitRecord,
+  parsePolisherJson,
+} from "../../memory/commit-crawler"
 import { NOOP_POLISHER } from "../../memory/auto-trigger"
 import {
+  Memory,
   layer as memoryFacadeLayer,
   memoryRetrievalLayer,
   memoryStorageLayer,
   mockEmbeddingLayer,
   makeMemoryBridge,
+  type RetrievalMode,
 } from "../../memory"
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
 import { Config } from "../../config"
 import { Provider } from "../../provider"
+import { AppRuntime } from "../../effect/app-runtime"
 
 const NO_OP_EXTRACTOR: SessionExtractor = () => Effect.succeed([])
 
@@ -64,10 +74,13 @@ const resolveLlmExtractor = Effect.gen(function* () {
   return makeLlmSessionExtractor({ model: bridge })
 })
 
-const memoryStack = Layer.provideMerge(
-  memoryFacadeLayer,
-  Layer.mergeAll(memoryStorageLayer, memoryRetrievalLayer, mockEmbeddingLayer()),
-)
+const memoryStack = (() => {
+  // `memoryRetrievalLayer` needs `MemoryStorage` → wire it through
+  // explicitly (matches `defaultLayer` composition in `memory/index.ts`).
+  const retrieval = Layer.provide(memoryRetrievalLayer, memoryStorageLayer)
+  const deps = Layer.mergeAll(memoryStorageLayer, retrieval, mockEmbeddingLayer())
+  return Layer.provideMerge(memoryFacadeLayer, deps)
+})()
 const ingestStack = Layer.provideMerge(memoryStack, foreignIngestCheckpointLayer)
 
 // --------------------------------------------------------------------------
@@ -227,13 +240,8 @@ const IngestCommand = cmd({
       const dataDir = Global.Path.data
       const sources = sourcesForTool(tool, args.path ?? "")
 
-      const extractor = args.extract
-        ? await Effect.runPromise(
-            resolveLlmExtractor.pipe(
-              Effect.provide(Config.defaultLayer),
-              Effect.provide(Provider.defaultLayer),
-            ) as Effect.Effect<SessionExtractor, unknown, never>,
-          ).catch(() => NO_OP_EXTRACTOR)
+      const extractor: SessionExtractor = args.extract
+        ? await AppRuntime.runPromise(resolveLlmExtractor).catch(() => NO_OP_EXTRACTOR)
         : NO_OP_EXTRACTOR
 
       const program = ingest({
@@ -274,6 +282,37 @@ const IngestCommand = cmd({
 // `memory crawl`
 // --------------------------------------------------------------------------
 
+/**
+ * Resolve an LLM-backed {@link CommitPolisher} from the configured
+ * `memories.polishModel` / `memories.extractionModel` / `cfg.model` spec.
+ * Returns {@link NOOP_POLISHER} when no spec is configured — matches the
+ * graceful-degrade contract of the auto-trigger + observer paths.
+ *
+ * The bridge call-prompt format follows the inline `PROMPT_TEMPLATE` in
+ * `commit-crawler.ts` — the JSON response is parsed via
+ * {@link parsePolisherJson} so prose-wrapped or fenced responses still
+ * land in the JSONL cache.
+ */
+const resolveLlmPolisher = Effect.gen(function* () {
+  const cfg = yield* Config.Service.use((svc) => svc.get())
+  const spec =
+    cfg.memories?.polishModel?.trim() ||
+    cfg.memories?.extractionModel?.trim() ||
+    cfg.model?.trim()
+  if (!spec) return NOOP_POLISHER
+  const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+    Effect.catchCause(() => Effect.succeed(undefined as undefined)),
+  )
+  if (!bridge) return NOOP_POLISHER
+  const polisher: CommitPolisher = (_commit: CommitRecord, prompt: string) =>
+    Effect.gen(function* () {
+      const raw = yield* bridge(prompt)
+      if (!raw) return undefined
+      return parsePolisherJson(raw)
+    }).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+  return polisher
+})
+
 const CrawlCommand = cmd({
   command: "crawl",
   describe: "walk recent commits in the current repo and emit sextuples",
@@ -284,6 +323,12 @@ const CrawlCommand = cmd({
         type: "number",
         default: 50,
       })
+      .option("polish", {
+        describe:
+          "run a real LLM polisher on each commit — requires `memories.polishModel` / `memories.extractionModel` / `model` to be configured",
+        type: "boolean",
+        default: false,
+      })
       .option("json", {
         describe: "output as JSON",
         type: "boolean",
@@ -293,12 +338,15 @@ const CrawlCommand = cmd({
     await bootstrap(process.cwd(), async () => {
       const repoRoot = Instance.worktree
       const dataDir = Global.Path.data
+      const polisher: CommitPolisher = args.polish
+        ? await AppRuntime.runPromise(resolveLlmPolisher).catch(() => NOOP_POLISHER)
+        : NOOP_POLISHER
       const stats = await Effect.runPromise(
         crawl({
           repoRoot,
           dataDir,
           limit: args.limit,
-          polish: NOOP_POLISHER,
+          polish: polisher,
         }),
       )
       if (args.json) {
@@ -319,6 +367,165 @@ const CrawlCommand = cmd({
 })
 
 // --------------------------------------------------------------------------
+// `memory seed` — insert a sextuple from JSON on stdin (test-harness aid)
+// --------------------------------------------------------------------------
+
+const SeedCommand = cmd({
+  command: "seed",
+  describe:
+    "insert a sextuple from the JSON body on stdin (embeds via mock embedder). Intended for e2e harnesses that need to prime the memory store before a live turn.",
+  builder: (yargs: Argv) =>
+    yargs.option("json", {
+      describe: "output result as JSON",
+      type: "boolean",
+      default: false,
+    }),
+  handler: async (args) => {
+    const raw = await new Promise<string>((resolve, reject) => {
+      const chunks: Buffer[] = []
+      process.stdin.on("data", (c: Buffer) => chunks.push(c))
+      process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")))
+      process.stdin.on("error", reject)
+    })
+    let body: any
+    try {
+      body = JSON.parse(raw)
+    } catch (err) {
+      UI.error(`invalid JSON on stdin: ${(err as Error).message}${EOL}`)
+      process.exit(1)
+    }
+    const keywords = Array.isArray(body?.keywords)
+      ? body.keywords.filter((k: unknown) => typeof k === "string")
+      : []
+    const problem = typeof body?.problem === "string" ? body.problem : ""
+    const rootCause =
+      typeof body?.rootCause === "string"
+        ? body.rootCause
+        : typeof body?.root_cause === "string"
+          ? body.root_cause
+          : ""
+    const solution = typeof body?.solution === "string" ? body.solution : ""
+    await bootstrap(process.cwd(), async () => {
+      const projectID = currentProjectID() ?? undefined
+      const program = Effect.gen(function* () {
+        const memory = yield* Memory
+        const res = yield* memory.add({
+          keywords,
+          problem,
+          rootCause,
+          solution,
+          projectID,
+          source: {
+            _tag: "foreign" as const,
+            tool: typeof body?.source?.tool === "string" ? body.source.tool : "seed",
+            sourceID:
+              typeof body?.source?.sourceID === "string"
+                ? body.source.sourceID
+                : `seed-${Date.now()}`,
+            projectID,
+            timestamp: Date.now(),
+          },
+        })
+        return res
+      }).pipe(Effect.provide(memoryStack))
+      const result = await Effect.runPromise(program as Effect.Effect<any, any, never>)
+      if (args.json) {
+        process.stdout.write(
+          JSON.stringify(
+            {
+              inserted: result.inserted,
+              embedded: result.embedded,
+              hashId: result.record?.hashId,
+              id: result.record?.id,
+            },
+            null,
+            2,
+          ) + EOL,
+        )
+        return
+      }
+      UI.empty()
+      prompts.intro("Memory seed")
+      prompts.log.info(`inserted: ${result.inserted}`)
+      prompts.log.info(`embedded: ${result.embedded}`)
+      prompts.log.info(`hashId:   ${result.record?.hashId}`)
+      prompts.outro("Done")
+    })
+  },
+})
+
+// --------------------------------------------------------------------------
+// `memory retrieve` — query the memory store, print scored hits as JSON
+// --------------------------------------------------------------------------
+
+const RetrieveCommand = cmd({
+  command: "retrieve",
+  describe: "retrieve scored sextuples matching a query (cosine | bm25 | hybrid)",
+  builder: (yargs: Argv) =>
+    yargs
+      .option("query", {
+        describe: "query text",
+        type: "string",
+        demandOption: true,
+      })
+      .option("mode", {
+        describe: "retrieval mode",
+        choices: ["cosine", "bm25", "hybrid"] as const,
+        default: "hybrid" as const,
+      })
+      .option("top-k", {
+        describe: "max number of hits to return",
+        type: "number",
+        default: 5,
+      })
+      .option("min-score", {
+        describe: "minimum score floor",
+        type: "number",
+        default: 0,
+      })
+      .option("json", {
+        describe: "output as JSON",
+        type: "boolean",
+        default: true,
+      }),
+  handler: async (args) => {
+    await bootstrap(process.cwd(), async () => {
+      const projectID = currentProjectID() ?? undefined
+      const program = Effect.gen(function* () {
+        const memory = yield* Memory
+        const hits = yield* memory.retrieve({
+          queryText: args.query as string,
+          projectID,
+          topK: args["top-k"] as number,
+          minScore: args["min-score"] as number,
+          mode: args.mode as RetrievalMode,
+        })
+        return hits
+      }).pipe(Effect.provide(memoryStack))
+      const hits = await Effect.runPromise(program as Effect.Effect<any, any, never>)
+      const rows = (hits as ReadonlyArray<any>).map((h) => ({
+        score: h.score,
+        hashId: h.record?.hashId,
+        problem: h.record?.problem,
+        rootCause: h.record?.rootCause,
+        solution: h.record?.solution,
+        keywords: h.record?.keywords,
+      }))
+      if (args.json) {
+        process.stdout.write(JSON.stringify({ mode: args.mode, hits: rows }, null, 2) + EOL)
+        return
+      }
+      UI.empty()
+      prompts.intro(`Memory retrieve (${args.mode})`)
+      for (const row of rows) {
+        prompts.log.info(`[${row.score.toFixed(3)}] ${row.problem}`)
+      }
+      prompts.outro("Done")
+    })
+  },
+})
+
+// --------------------------------------------------------------------------
 // Top-level `memory` command
 // --------------------------------------------------------------------------
 
@@ -331,6 +538,8 @@ export const MemoryCommand = cmd({
       .command(ResetCommand)
       .command(IngestCommand)
       .command(CrawlCommand)
+      .command(SeedCommand)
+      .command(RetrieveCommand)
       .demandCommand(),
   async handler() {},
 })

@@ -534,6 +534,7 @@ export function accountStatus(input: {
           err: discovery.err,
         }
       : undefined,
+    unsupportedModels: item?.unsupportedModels ? [...item.unsupportedModels] : [],
     penalties: {
       recent429: recent429(input.state, input.key, now),
       recentDiscoveryError: recentDiscoveryError(input.state, input.key, now),
@@ -560,11 +561,21 @@ export function renderAccountStatus(
   ]
     .filter(Boolean)
     .join(", ")
+  const unsupported = status.unsupportedModels ?? []
+  const discoveryLine = status.discovery
+    ? `${status.discovery.ok ? "ok" : "error"}${
+        status.discovery.models?.length
+          ? `, ${status.discovery.models.length} picker-enabled model${status.discovery.models.length === 1 ? "" : "s"}`
+          : ""
+      }${status.discovery.err ? `, ${status.discovery.err}` : ""}`
+    : "unknown"
+  const unsupportedLine =
+    unsupported.length > 0 ? `\n  Unsupported: ${unsupported.join(", ")} (returned model_not_supported in live dispatch)` : ""
   return `${status.label} ${UI.Style.TEXT_DIM}${extra}
   Login: ${status.login ?? "unknown"}
   Plan: ${status.plan ?? "unknown"}
   Health: ${status.health}
-  Discovery: ${status.discovery ? `${status.discovery.ok ? "ok" : "error"}${status.discovery.models?.length ? `, ${status.discovery.models.length} models` : ""}${status.discovery.err ? `, ${status.discovery.err}` : ""}` : "unknown"}${
+  Discovery: ${discoveryLine}${unsupportedLine}${
     input?.premium
       ? `
   Premium: ${input.premium}`
@@ -842,7 +853,17 @@ export function renderBestPerVendor(state: State): string[] {
   for (const [key, conn] of Object.entries(state.connections)) {
     const catalog = conn.discovery?.models ?? []
     if (catalog.length === 0) continue
-    const items = catalog.map((id) => ({ id }))
+    const unsupported = new Set(conn.unsupportedModels ?? [])
+    // Exclude models that have been marked unsupported by a live dispatch so
+    // the displayed "best per vendor" reflects what the account can actually
+    // route today. Otherwise "best OpenAI=gpt-4o" contradicts
+    // "Unsupported: gpt-4o" on the same account.
+    const usable = catalog.filter((id) => !unsupported.has(id))
+    if (usable.length === 0) {
+      lines.push(`${copilotAliasLabel(key)} ${UI.Style.TEXT_DIM}best (none — all discovered models unsupported)`)
+      continue
+    }
+    const items = usable.map((id) => ({ id }))
     const best = CopilotModels.bestPerVendor(items)
     if (best.length === 0) continue
     const display = best.map((b) => `${b.vendor}=${b.modelId}`).join(", ")

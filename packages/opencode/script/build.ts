@@ -233,6 +233,16 @@ for (const item of targets) {
   // Smoke test: only run if binary is for current platform
   if (item.os === process.platform && item.arch === process.arch && !item.abi) {
     const binaryPath = `dist/${name}/bin/opencode`
+    // macOS ad-hoc codesign so Gatekeeper doesn't SIGKILL the Bun SEA on
+    // first launch (empirically reproduces as silent 137 exits). Non-fatal
+    // on non-Darwin or if codesign is unavailable.
+    if (process.platform === "darwin") {
+      try {
+        await $`codesign --force --sign - ${binaryPath}`.quiet()
+      } catch (e) {
+        console.warn(`codesign failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`)
+      }
+    }
     console.log(`Running smoke test: ${binaryPath} --version`)
     try {
       const versionOutput = await $`${binaryPath} --version`.text()

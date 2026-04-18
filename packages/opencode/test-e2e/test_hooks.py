@@ -360,6 +360,25 @@ def test_session_start_additional_context_stdout(hook_log_dir: Path) -> None:
 # collect + run the HTTP-only tests but cannot reach Copilot.
 _SKIP_LIVE = os.environ.get("OPENCODE_SKIP_LIVE_TESTS") == "1"
 
+
+# The session-scoped ``live_copilot_model`` fixture in conftest inspects the
+# user's ``copilot-connections.json`` and picks the first model under the
+# first live connection. On this workstation that's ``github-copilot/gpt-4o``
+# — which reliably replies to free-form text but routinely *ignores*
+# imperative ``call the bash tool`` prompts. Tool-exercising tests below
+# need a model that actually follows tool-use instructions; the rest of the
+# suite (turn-lifecycle, PreCompact/PostCompact) is model-independent and
+# keeps using the conftest fixture verbatim.
+#
+# Precedence for tool-calling tests, local to this module:
+#   1. Explicit ``OPENCODE_E2E_PROVIDER`` + ``OPENCODE_E2E_MODEL`` env.
+#   2. ``github-copilot#personal`` / ``gpt-5-mini`` — smallest Copilot model
+#      that reliably follows imperative tool-use instructions on this
+#      workstation. Matches ``test_subagent.py::DEFAULT_*``.
+_TOOL_PROVIDER = os.environ.get("OPENCODE_E2E_PROVIDER", "github-copilot#personal")
+_TOOL_MODEL = os.environ.get("OPENCODE_E2E_MODEL", "gpt-5-mini")
+TOOL_MODEL: dict[str, str] = {"providerID": _TOOL_PROVIDER, "modelID": _TOOL_MODEL}
+
 _skip_if_live_disabled = pytest.mark.skipif(
     _SKIP_LIVE,
     reason="OPENCODE_SKIP_LIVE_TESTS=1 — live-LLM hook tests disabled",
@@ -516,7 +535,6 @@ def test_precompact_postcompact_hooks_fire_on_summarize(
 def test_pretooluse_deny_short_circuits_tool(
     hook_log_dir: Path,
     isolated_copilot_home: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """PreToolUse hook with permissionDecision=deny causes the tool call
     to NOT execute — assistant either reports an error or skips."""
@@ -547,8 +565,8 @@ def test_pretooluse_deny_short_circuits_tool(
                 client.send_message(
                     session["id"],
                     "Use the bash tool to run `echo hi`. If blocked, say BLOCKED.",
-                    providerID=live_copilot_model["providerID"],
-                    modelID=live_copilot_model["modelID"],
+                    providerID=TOOL_MODEL["providerID"],
+                    modelID=TOOL_MODEL["modelID"],
                 )
                 # PreToolUse only fires after the model commits to a tool
                 # call. When Copilot's ``/responses`` API rejects the
@@ -676,7 +694,6 @@ def _spawn_live_with_permission_overrides(
 @_skip_if_live_disabled
 def test_pretooluse_updated_input_rewrites_bash_command(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """Hook returns updatedInput that replaces the model's bash command.
 
@@ -684,11 +701,18 @@ def test_pretooluse_updated_input_rewrites_bash_command(
     ``echo hooked``. We assert the tool's captured stdout contains
     ``hooked`` rather than ``original``.
     """
+    # `updatedInput` is a full replacement of the tool's args — not a
+    # partial merge (see ``src/tool/registry.ts`` line 376). The bash
+    # tool's zod schema requires ``command`` + ``description``, so we
+    # include both verbatim so downstream validation passes cleanly.
     hook_stdout = json.dumps(
         {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "updatedInput": {"command": "echo hooked"},
+                "updatedInput": {
+                    "command": "echo hooked",
+                    "description": "Print hooked string",
+                },
             }
         }
     )
@@ -708,18 +732,40 @@ def test_pretooluse_updated_input_rewrites_bash_command(
         try:
             with _live_client(server) as client:
                 session = client.create_session()
-                client.send_message(
+                # Use the non-blocking start_turn + poll pattern so a long
+                # model round-trip doesn't time out the HTTP connection
+                # itself (the sync ``send_message`` blocks the wire until
+                # the turn settles, which for an updatedInput roundtrip
+                # can exceed 60s when the model loops back after the
+                # tool result).
+                client.start_turn(
                     session["id"],
                     "Run `echo original` via the bash tool. Then stop.",
-                    providerID=live_copilot_model["providerID"],
-                    modelID=live_copilot_model["modelID"],
+                    model={
+                        "providerID": TOOL_MODEL["providerID"],
+                        "modelID": TOOL_MODEL["modelID"],
+                    },
                 )
-                payload = _read_hook_log(hook_log_dir, "PreToolUse", timeout_s=60.0)
+                # Wait for the hook to fire — that proves bash was
+                # invoked and the PreToolUse path ran with the rewritten
+                # input (tool_input on the log was the original, the
+                # effective input is what the executor received).
+                payload = _read_hook_log(hook_log_dir, "PreToolUse", timeout_s=180.0)
                 assert payload["hook_event_name"] == "PreToolUse"
                 assert payload["tool_name"] == "bash"
 
-                msgs = client.get_messages(session["id"])
-                bash_outs = _tool_outputs(msgs, "bash")
+                # Wait for the bash tool's output to surface on a message.
+                # The turn may still be running when our poll starts — we
+                # keep polling until a bash tool part shows a ``state.output``
+                # or a deadline elapses.
+                deadline = time.monotonic() + 180.0
+                bash_outs: list[str] = []
+                while time.monotonic() < deadline:
+                    msgs = client.get_messages(session["id"])
+                    bash_outs = _tool_outputs(msgs, "bash")
+                    if bash_outs and any(bo.strip() for bo in bash_outs):
+                        break
+                    time.sleep(1.0)
                 if not bash_outs:
                     pytest.skip(
                         "model did not invoke bash — cannot assert "
@@ -745,7 +791,6 @@ def test_pretooluse_updated_input_rewrites_bash_command(
 @_skip_if_live_disabled
 def test_posttooluse_updated_output_replaces_tool_result(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """PostToolUse hook returns ``updatedMCPToolOutput: "REPLACED"`` —
     the captured tool output string is overwritten."""
@@ -776,8 +821,8 @@ def test_posttooluse_updated_output_replaces_tool_result(
                 client.send_message(
                     session["id"],
                     "Run `echo marker42` via the bash tool. Stop.",
-                    providerID=live_copilot_model["providerID"],
-                    modelID=live_copilot_model["modelID"],
+                    providerID=TOOL_MODEL["providerID"],
+                    modelID=TOOL_MODEL["modelID"],
                 )
                 payload = _read_hook_log(hook_log_dir, "PostToolUse", timeout_s=60.0)
                 assert payload["hook_event_name"] == "PostToolUse"
@@ -808,7 +853,6 @@ def test_posttooluse_updated_output_replaces_tool_result(
 @_skip_if_live_disabled
 def test_pretooluse_ask_emits_permission_request(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """PreToolUse hook returns permissionDecision=ask — Permission.Service
     emits a ``permission.asked`` SSE event whose metadata carries
@@ -849,8 +893,8 @@ def test_pretooluse_ask_emits_permission_request(
                         client.send_message(
                             session["id"],
                             "Run `echo hi` via the bash tool. Stop.",
-                            providerID=live_copilot_model["providerID"],
-                            modelID=live_copilot_model["modelID"],
+                            providerID=TOOL_MODEL["providerID"],
+                            modelID=TOOL_MODEL["modelID"],
                         )
                     except Exception:
                         pass
@@ -909,7 +953,6 @@ def test_pretooluse_ask_emits_permission_request(
 @_skip_if_live_disabled
 def test_stop_hook_failed_abort_injects_stop_abort_tag(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """Stop-hook exits with code 2 and stderr ``abort: test``. runLoop must
     inject ``<stop-abort>\\nabort: test\\n</stop-abort>`` into the next turn
@@ -928,17 +971,48 @@ def test_stop_hook_failed_abort_injects_stop_abort_tag(
         try:
             with _live_client(server) as client:
                 session = client.create_session()
-                client.send_message(
-                    session["id"],
-                    "Reply with: ok",
-                    providerID=live_copilot_model["providerID"],
-                    modelID=live_copilot_model["modelID"],
-                )
-                payload = _read_hook_log(hook_log_dir, "Stop", timeout_s=60.0)
+                # Fire the turn on a background thread so the test is
+                # resilient to both slow LLM responses and mid-turn
+                # server disconnects (the stop-abort path injects
+                # synthetic user text which can race the HTTP socket
+                # closure on some builds).
+                import threading
+
+                def _fire() -> None:
+                    try:
+                        client.send_message(
+                            session["id"],
+                            "Reply with exactly: ok",
+                            providerID=TOOL_MODEL["providerID"],
+                            modelID=TOOL_MODEL["modelID"],
+                        )
+                    except Exception:
+                        pass
+
+                t = threading.Thread(target=_fire, daemon=True)
+                t.start()
+
+                payload = _read_hook_log(hook_log_dir, "Stop", timeout_s=180.0)
                 assert payload["hook_event_name"] == "Stop"
 
-                msgs = client.get_messages(session["id"])
-                flat = json.dumps(msgs)
+                # The stop-abort tag is injected via AdaptiveHooks.Inject
+                # which prepends it to the NEXT iteration's user turn
+                # text. Poll until it surfaces in a message frame — the
+                # runLoop continues briefly after the abort to emit the
+                # synthetic turn.
+                deadline = time.monotonic() + 180.0
+                flat = ""
+                while time.monotonic() < deadline:
+                    try:
+                        msgs = client.get_messages(session["id"])
+                    except Exception:
+                        time.sleep(1.0)
+                        continue
+                    flat = json.dumps(msgs)
+                    if "<stop-abort>" in flat and "abort: test" in flat:
+                        break
+                    time.sleep(1.0)
+                t.join(timeout=5.0)
                 assert "<stop-abort>" in flat, (
                     f"<stop-abort> tag missing from messages: {flat[:400]!r}"
                 )
@@ -960,7 +1034,6 @@ def test_stop_hook_failed_abort_injects_stop_abort_tag(
 @_skip_if_live_disabled
 def test_posttooluse_normal_fires_after_tool(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """No hook output — just verify the hook fires and payload has
     ``tool_name`` + ``tool_response``."""
@@ -976,8 +1049,8 @@ def test_posttooluse_normal_fires_after_tool(
                 client.send_message(
                     session["id"],
                     "Run `echo ping` via the bash tool. Stop.",
-                    providerID=live_copilot_model["providerID"],
-                    modelID=live_copilot_model["modelID"],
+                    providerID=TOOL_MODEL["providerID"],
+                    modelID=TOOL_MODEL["modelID"],
                 )
                 payload = _read_hook_log(hook_log_dir, "PostToolUse", timeout_s=60.0)
                 assert payload["hook_event_name"] == "PostToolUse"
@@ -999,7 +1072,6 @@ def test_posttooluse_normal_fires_after_tool(
 @_skip_if_live_disabled
 def test_subagent_start_stop_fire_on_sync_task(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """Sync ``task`` fires SubagentStart + SubagentStop with matching
     parent/child ids and ``reason: "completed"``."""
@@ -1019,8 +1091,8 @@ def test_subagent_start_stop_fire_on_sync_task(
                         "Call the `task` tool once with subagent_type='general', "
                         "description='t', prompt='Reply DONE', async=false. Stop."
                     ),
-                    providerID=live_copilot_model["providerID"],
-                    modelID=live_copilot_model["modelID"],
+                    providerID=TOOL_MODEL["providerID"],
+                    modelID=TOOL_MODEL["modelID"],
                 )
                 start = _read_hook_log(hook_log_dir, "SubagentStart", timeout_s=120.0)
                 assert start["hook_event_name"] == "SubagentStart"
@@ -1052,7 +1124,6 @@ def test_subagent_start_stop_fire_on_sync_task(
 @_skip_if_live_disabled
 def test_subagent_stop_cancelled_on_interrupt(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """Start an async task, then interrupt its turn — the subagent
     lifecycle must close with ``reason: "cancelled"``."""
@@ -1077,8 +1148,8 @@ def test_subagent_stop_cancelled_on_interrupt(
                                 "description='slow', prompt='Wait for SECRET "
                                 "then reply DONE', async=true. Stop."
                             ),
-                            providerID=live_copilot_model["providerID"],
-                            modelID=live_copilot_model["modelID"],
+                            providerID=TOOL_MODEL["providerID"],
+                            modelID=TOOL_MODEL["modelID"],
                         )
                     except Exception:
                         pass
@@ -1121,7 +1192,6 @@ def test_subagent_stop_cancelled_on_interrupt(
 @_skip_if_live_disabled
 def test_permission_denied_source_reject(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """No preapproved rule for bash; user replies ``reject`` → a
     PermissionDenied hook must fire with ``source: "reject"``.
@@ -1145,8 +1215,8 @@ def test_permission_denied_source_reject(
                         client.send_message(
                             session["id"],
                             "Run `echo hi` via the bash tool. Stop.",
-                            providerID=live_copilot_model["providerID"],
-                            modelID=live_copilot_model["modelID"],
+                            providerID=TOOL_MODEL["providerID"],
+                            modelID=TOOL_MODEL["modelID"],
                         )
                     except Exception:
                         pass
@@ -1196,7 +1266,6 @@ def test_permission_denied_source_reject(
 @_skip_if_live_disabled
 def test_permission_granted_source_hook(
     hook_log_dir: Path,
-    live_copilot_model: dict[str, str],
 ) -> None:
     """A PreToolUse hook returning ``permissionDecision: "allow"`` must
     short-circuit the permission flow — no user prompt — and fire
@@ -1251,8 +1320,8 @@ def test_permission_granted_source_hook(
                 client.send_message(
                     session["id"],
                     "Run `echo hi` via the bash tool. Stop.",
-                    providerID=live_copilot_model["providerID"],
-                    modelID=live_copilot_model["modelID"],
+                    providerID=TOOL_MODEL["providerID"],
+                    modelID=TOOL_MODEL["modelID"],
                 )
 
                 payload = _read_hook_log(
