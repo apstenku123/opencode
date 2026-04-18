@@ -32,6 +32,8 @@ import { SessionRevert } from "@/session/revert"
 import { SessionSummary } from "@/session/summary"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionAutosteerObserver } from "@/session/autosteer-observer"
+import { SessionMemoryObserver } from "@/session/memory-observer"
+import { defaultLayer as MemoryDefaultLayer } from "@/memory"
 import { Instruction } from "@/session/instruction"
 import { LLM } from "@/session/llm"
 import { LSP } from "@/lsp"
@@ -82,6 +84,8 @@ export const AppLayer = Layer.mergeAll(
   SessionSummary.defaultLayer,
   SessionPrompt.defaultLayer,
   SessionAutosteerObserver.defaultLayer,
+  SessionMemoryObserver.defaultLayer,
+  MemoryDefaultLayer,
   Instruction.defaultLayer,
   LLM.defaultLayer,
   LSP.defaultLayer,

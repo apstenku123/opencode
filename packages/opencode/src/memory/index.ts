@@ -20,7 +20,9 @@
  */
 
 import { Context, Effect, Layer, Option } from "effect"
-import { EmbeddingService } from "./embedding"
+import { EmbeddingService, mockLayer as mockEmbeddingLayerImpl } from "./embedding"
+import { layer as storageLayerImpl } from "./storage"
+import { layer as retrievalLayerImpl } from "./retrieval"
 import {
   type DefectSextuple,
   type DefectSextupleInput,
@@ -34,6 +36,7 @@ import { MemoryRetrieval, type RetrieveInput, type ScoredSextuple } from "./retr
 import { MemoryStorage } from "./storage"
 import {
   enrichUserPromptWithMemories,
+  extractAndRefineTurnSextuples,
   type EnrichUserPromptInput,
   type EnrichUserPromptResult,
 } from "./turn-hooks"
@@ -119,11 +122,44 @@ export namespace Memory {
       readonly model?: Phase1Model
       readonly timeoutMs?: number
     }) => Effect.Effect<RunPhase1Result>
+
+    /**
+     * Convenience wrapper — given a sessionID + raw user text, synthesize
+     * the `<similar_past_problems>` block (if any) using the default
+     * retrieval knobs. Shorter signature intended for in-process callers
+     * (session/prompt.ts turn loop, tests). Never throws; on any miss the
+     * `block` field is `null`.
+     */
+    readonly enrichPromptForSession: (
+      sessionID: string,
+      text: string,
+      options?: {
+        readonly projectID?: string
+        readonly topK?: number
+        readonly minScore?: number
+      },
+    ) => Effect.Effect<EnrichUserPromptResult>
+
+    /**
+     * Convenience wrapper for the post-turn extractor. Accepts a flat
+     * list of `{ role, text }` turn events (most-recent-last) — assistant
+     * entries are concatenated to form the turn summary, user entries
+     * are forwarded as the recent-user-messages window.
+     */
+    readonly extractFromTurn: (input: {
+      readonly turnEvents: ReadonlyArray<{ readonly role: "user" | "assistant"; readonly text: string }>
+      readonly source: SextupleSource
+      readonly projectID?: string
+      readonly extractionModel?: Phase1Model
+      readonly polishModel?: import("./refining").RefiningModel
+    }) => Effect.Effect<import("./turn-hooks").ExtractAndRefineResult>
   }
 }
 
 export class Memory extends Context.Service<Memory, Memory.Interface>()("@opencode/memory/Memory") {}
 
+// Re-exported below (see "Re-exports"); declared here so `defaultLayer`
+// can reference it without introducing a circular import at parse time.
 export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval | EmbeddingService> = Layer.effect(
   Memory,
   Effect.gen(function* () {
@@ -138,17 +174,42 @@ export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval |
         yield* storage.updateEmbedding(record.hashId, vector)
       })
 
-    return {
-      add: (input) =>
+    const addImpl = (input: DefectSextupleInput) =>
+      Effect.gen(function* () {
+        const { inserted, record } = yield* storage.store(input)
+        if (!inserted && record.embedding) {
+          return { inserted: false, embedded: true, record }
+        }
+        yield* embedOne(record)
+        return { inserted, embedded: true, record }
+      })
+
+    // Build a Memory.Interface-shaped sub-facade used by `enrichPrompt` /
+    // `runPhase1` / `extractFromTurn` to avoid a self-referential capture
+    // cycle. The sub-facade exposes only the calls the pipeline needs
+    // (retrieval, storage peeks, `add`); everything else is wired to
+    // `Effect.die` so misuse surfaces loudly.
+    const subFacade = (tag: string): Memory.Interface => ({
+      add: (i) => addImpl(i),
+      addWithoutEmbedding: () => Effect.die(`${tag}: addWithoutEmbedding not allowed`),
+      embed: () => Effect.die(`${tag}: embed not allowed`),
+      get: (hashId) => storage.getByHash(hashId),
+      listByProject: (projectID, limit) => storage.listByProject(projectID, limit),
+      retrieve: ({ queryText, projectID, topK, minScore }) =>
         Effect.gen(function* () {
-          const { inserted, record } = yield* storage.store(input)
-          // If the row already exists and already has an embedding, nothing to do.
-          if (!inserted && record.embedding) {
-            return { inserted: false, embedded: true, record }
-          }
-          yield* embedOne(record)
-          return { inserted, embedded: true, record }
+          const queryEmbedding = yield* embedder.embed(queryText)
+          return yield* retrieval.retrieve({ queryEmbedding, projectID, topK, minScore })
         }),
+      retrieveByEmbedding: (i) => retrieval.retrieve(i),
+      enrichPrompt: () => Effect.die(`${tag}: enrichPrompt recursion not allowed`),
+      runPhase1: () => Effect.die(`${tag}: runPhase1 recursion not allowed`),
+      enrichPromptForSession: () =>
+        Effect.die(`${tag}: enrichPromptForSession recursion not allowed`),
+      extractFromTurn: () => Effect.die(`${tag}: extractFromTurn recursion not allowed`),
+    })
+
+    return {
+      add: addImpl,
 
       addWithoutEmbedding: (input) =>
         Effect.gen(function* () {
@@ -175,65 +236,66 @@ export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval |
       retrieveByEmbedding: (input) => retrieval.retrieve(input),
 
       enrichPrompt: (input) =>
-        // Defer construction of `Memory.Interface` here to avoid a self-
-        // referential capture cycle: turn-hooks reaches into `memory.retrieve`,
-        // and that closure wraps `embedder` + `retrieval` from the outer
-        // scope. We rebuild a lightweight wrapper that mirrors the public
-        // `retrieve`/`retrieveByEmbedding` so enrichment can run without
-        // routing back through this same factory.
+        enrichUserPromptWithMemories({ ...input, memory: subFacade("Memory.enrichPrompt") }),
+
+      runPhase1: (input) => runPhase1Impl(subFacade("Memory.runPhase1"), input),
+
+      enrichPromptForSession: (_sessionID, text, options) =>
         enrichUserPromptWithMemories({
-          ...input,
-          memory: {
-            // Only `retrieve` is exercised by the enrichment path; the rest
-            // are wired so the type-check passes and unexpected callers
-            // surface as a defect rather than silent no-ops.
-            add: () => Effect.die("Memory.enrichPrompt → add not allowed"),
-            addWithoutEmbedding: () =>
-              Effect.die("Memory.enrichPrompt → addWithoutEmbedding not allowed"),
-            embed: () => Effect.die("Memory.enrichPrompt → embed not allowed"),
-            get: (hashId) => storage.getByHash(hashId),
-            listByProject: (projectID, limit) => storage.listByProject(projectID, limit),
-            retrieve: ({ queryText, projectID, topK, minScore }) =>
-              Effect.gen(function* () {
-                const queryEmbedding = yield* embedder.embed(queryText)
-                return yield* retrieval.retrieve({ queryEmbedding, projectID, topK, minScore })
-              }),
-            retrieveByEmbedding: (i) => retrieval.retrieve(i),
-            enrichPrompt: () =>
-              Effect.die("Memory.enrichPrompt → enrichPrompt recursion not allowed"),
-            runPhase1: () => Effect.die("Memory.enrichPrompt → runPhase1 not allowed"),
-          },
+          memory: subFacade("Memory.enrichPromptForSession"),
+          userPrompt: text,
+          projectID: options?.projectID,
+          topK: options?.topK,
+          minScore: options?.minScore,
         }),
 
-      runPhase1: (input) =>
-        // Build a thin façade that exposes only `add` (the pipeline never
-        // calls anything else); same self-referential rationale as above.
-        runPhase1Impl(
-          {
-            add: (i) =>
-              Effect.gen(function* () {
-                const { inserted, record } = yield* storage.store(i)
-                if (!inserted && record.embedding) {
-                  return { inserted: false, embedded: true, record }
-                }
-                yield* embedOne(record)
-                return { inserted, embedded: true, record }
-              }),
-            addWithoutEmbedding: () =>
-              Effect.die("Memory.runPhase1 → addWithoutEmbedding not allowed"),
-            embed: () => Effect.die("Memory.runPhase1 → embed not allowed"),
-            get: (hashId) => storage.getByHash(hashId),
-            listByProject: () => Effect.die("Memory.runPhase1 → listByProject not allowed"),
-            retrieve: () => Effect.die("Memory.runPhase1 → retrieve not allowed"),
-            retrieveByEmbedding: () =>
-              Effect.die("Memory.runPhase1 → retrieveByEmbedding not allowed"),
-            enrichPrompt: () => Effect.die("Memory.runPhase1 → enrichPrompt not allowed"),
-            runPhase1: () => Effect.die("Memory.runPhase1 → runPhase1 recursion not allowed"),
-          },
-          input,
-        ),
+      extractFromTurn: (input) => {
+        // Split turn events into assistant summary + recent user-messages
+        // window, then hand off to the refining pipeline.
+        const assistant = input.turnEvents
+          .filter((e) => e.role === "assistant")
+          .map((e) => e.text.trim())
+          .filter(Boolean)
+        const users = input.turnEvents
+          .filter((e) => e.role === "user")
+          .map((e) => e.text.trim())
+          .filter(Boolean)
+        return extractAndRefineTurnSextuples({
+          memory: subFacade("Memory.extractFromTurn"),
+          turnSummary: assistant.join("\n"),
+          recentUserMessages: users,
+          source: input.source,
+          projectID: input.projectID,
+          extractionModel: input.extractionModel,
+          polishModel: input.polishModel,
+        })
+      },
     }
   }),
+)
+
+/**
+ * Default, self-contained Memory layer suitable for `AppLayer`.
+ *
+ * Bundles:
+ *   - `MemoryStorage.layer` (SQLite-backed CRUD)
+ *   - `MemoryRetrieval.layer` (cosine ranker)
+ *   - `mockEmbeddingLayer` (deterministic hash embeddings — safe no-LLM default)
+ *   - `Memory.layer` (facade)
+ *
+ * The mock embedding layer is a deliberate default: round-3 keeps memories
+ * OFF by default (`memories.enabled=false`) so the embedding backend is
+ * effectively unused until a user opts in. When an embedding provider is
+ * configured via `openAICompatLayer` it can be substituted by replacing
+ * this layer at `AppLayer` composition time.
+ */
+export const defaultLayer: Layer.Layer<Memory | MemoryStorage | MemoryRetrieval | EmbeddingService> = Layer.suspend(
+  () => {
+    const deps = Layer.mergeAll(storageLayerImpl, mockEmbeddingLayerImpl())
+    const retrieval = Layer.provide(retrievalLayerImpl, storageLayerImpl)
+    const facade = Layer.provide(layer, Layer.mergeAll(deps, retrieval))
+    return Layer.mergeAll(deps, retrieval, facade)
+  },
 )
 
 // Re-exports so callers can `import { Memory, EmbeddingService, … } from "@/memory"`.

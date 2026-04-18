@@ -505,5 +505,8 @@ function noopMemory(): Memory.Interface {
       Effect.die("noopMemory.retrieveByEmbedding called from turn-hooks") as never,
     enrichPrompt: () => Effect.die("noopMemory.enrichPrompt called from turn-hooks") as never,
     runPhase1: () => Effect.die("noopMemory.runPhase1 called from turn-hooks") as never,
+    enrichPromptForSession: () =>
+      Effect.die("noopMemory.enrichPromptForSession called from turn-hooks") as never,
+    extractFromTurn: () => Effect.die("noopMemory.extractFromTurn called from turn-hooks") as never,
   }
 }

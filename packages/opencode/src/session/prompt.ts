@@ -51,6 +51,8 @@ import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
 import { SessionAutobestObserver, shouldContinue as autobestShouldContinue } from "./autobest-observer"
 import { AdaptiveHooks } from "./adaptive"
+import { SessionMemoryObserver } from "./memory-observer"
+import { dequeueEnrichmentBlock } from "@/memory/turn-hooks"
 import { EffectBridge } from "@/effect"
 
 // @ts-ignore
@@ -129,6 +131,7 @@ export namespace SessionPrompt {
       const sys = yield* SystemPrompt.Service
       const llm = yield* LLM.Service
       const adaptive = yield* AdaptiveHooks.Service
+      const memoryObserver = yield* SessionMemoryObserver.Service
       const runner = Effect.fn("SessionPrompt.runner")(function* () {
         return yield* EffectBridge.make()
       })
@@ -1370,6 +1373,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           let step = 0
           const session = yield* sessions.get(sessionID)
 
+          // Lazy-register the memory turn observer inside the Instance
+          // scope of this runLoop — safe across repeated calls because
+          // `ensureRegistered` is idempotent. Behavior-neutral when
+          // `memories.enabled = false` (config default).
+          yield* memoryObserver
+            .ensureRegistered()
+            .pipe(Effect.catchCause(() => Effect.void))
+
           while (true) {
             yield* status.set(sessionID, { type: "busy" })
             yield* slog.info("loop", { step })
@@ -1554,6 +1565,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const system = [...env, ...(skills ? [skills] : []), ...instructions]
               const format = lastUser.format ?? { type: "text" as const }
               if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+              // Memory enrichment — if the memory turn observer queued a
+              // `<similar_past_problems>` block during `runPreIteration`,
+              // inject it as a system-level reminder so the model gets the
+              // cross-session context without mutating durable history.
+              const adaptiveState = yield* adaptive.stateFor(sessionID)
+              const enrichmentBlock = dequeueEnrichmentBlock(adaptiveState)
+              if (enrichmentBlock) system.push(enrichmentBlock)
               const result = yield* handle.process({
                 user: lastUser,
                 agent,
@@ -1855,6 +1873,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           LLM.defaultLayer,
           Bus.layer,
           CrossSpawnSpawner.defaultLayer,
+          SessionMemoryObserver.defaultLayer,
         ),
       ),
     ),
