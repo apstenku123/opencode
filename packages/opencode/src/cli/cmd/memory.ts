@@ -32,13 +32,14 @@ import {
   type ForeignIngestSources,
   type SessionExtractor,
 } from "../../memory/foreign-ingest"
-import { crawl } from "../../memory/commit-crawler"
+import {
+  crawl,
+  parsePolisherJson,
+  type CommitPolisher,
+} from "../../memory/commit-crawler"
 import { NOOP_POLISHER } from "../../memory/auto-trigger"
 import {
-  layer as memoryFacadeLayer,
-  memoryRetrievalLayer,
-  memoryStorageLayer,
-  mockEmbeddingLayer,
+  defaultLayer as memoryDefaultLayer,
   makeMemoryBridge,
 } from "../../memory"
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
@@ -64,11 +65,32 @@ const resolveLlmExtractor = Effect.gen(function* () {
   return makeLlmSessionExtractor({ model: bridge })
 })
 
-const memoryStack = Layer.provideMerge(
-  memoryFacadeLayer,
-  Layer.mergeAll(memoryStorageLayer, memoryRetrievalLayer, mockEmbeddingLayer()),
-)
-const ingestStack = Layer.provideMerge(memoryStack, foreignIngestCheckpointLayer)
+/**
+ * Resolve the configured polish model (or session default) into a
+ * `CommitPolisher` backed by a real LLM bridge. Returns `NOOP_POLISHER`
+ * when no model is available — mirrors the crawl observer fallback.
+ */
+const resolveLlmPolisher = Effect.gen(function* () {
+  const cfg = yield* Config.Service.use((svc) => svc.get())
+  const spec =
+    cfg.memories?.polishModel?.trim() ||
+    cfg.memories?.extractionModel?.trim() ||
+    cfg.model?.trim()
+  if (!spec) return NOOP_POLISHER
+  const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+    Effect.catchCause(() => Effect.succeed(undefined as undefined)),
+  )
+  if (!bridge) return NOOP_POLISHER
+  const polisher: CommitPolisher = (_commit, prompt) =>
+    Effect.gen(function* () {
+      const raw = yield* bridge(prompt)
+      if (!raw) return undefined
+      return parsePolisherJson(raw)
+    }).pipe(Effect.catchCause(() => Effect.succeed(undefined as undefined)))
+  return polisher
+})
+
+const ingestStack = Layer.mergeAll(memoryDefaultLayer, foreignIngestCheckpointLayer)
 
 // --------------------------------------------------------------------------
 // `memory status`
@@ -284,6 +306,12 @@ const CrawlCommand = cmd({
         type: "number",
         default: 50,
       })
+      .option("polish", {
+        describe:
+          "use a real LLM polisher (requires `memories.polishModel` / `memories.extractionModel` / `model` in config)",
+        type: "boolean",
+        default: false,
+      })
       .option("json", {
         describe: "output as JSON",
         type: "boolean",
@@ -293,12 +321,20 @@ const CrawlCommand = cmd({
     await bootstrap(process.cwd(), async () => {
       const repoRoot = Instance.worktree
       const dataDir = Global.Path.data
+      const polisher = args.polish
+        ? await Effect.runPromise(
+            resolveLlmPolisher.pipe(
+              Effect.provide(Config.defaultLayer),
+              Effect.provide(Provider.defaultLayer),
+            ) as Effect.Effect<CommitPolisher, unknown, never>,
+          ).catch(() => NOOP_POLISHER)
+        : NOOP_POLISHER
       const stats = await Effect.runPromise(
         crawl({
           repoRoot,
           dataDir,
           limit: args.limit,
-          polish: NOOP_POLISHER,
+          polish: polisher,
         }),
       )
       if (args.json) {

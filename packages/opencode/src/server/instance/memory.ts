@@ -22,12 +22,7 @@ import { Bus } from "../../bus"
 import { BusEvent } from "../../bus/bus-event"
 import { Database, eq, sql as drizzleSql } from "../../storage"
 import { Instance } from "../../project/instance"
-import {
-  layer as memoryFacadeLayer,
-  memoryRetrievalLayer,
-  memoryStorageLayer,
-  mockEmbeddingLayer,
-} from "../../memory"
+import { defaultLayer as memoryDefaultLayer } from "../../memory"
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
 import { ForeignIngestDoneTable, MemorySextupleTable } from "../../memory/memory.sql"
 import {
@@ -174,12 +169,7 @@ const CrawlResponse = z
  * the real provider is not configured — round-3 swaps in the
  * `openAICompatLayer` once the embedding-config plumbing lands.
  */
-const memoryStack = Layer.provideMerge(
-  memoryFacadeLayer,
-  Layer.mergeAll(memoryStorageLayer, memoryRetrievalLayer, mockEmbeddingLayer()),
-)
-
-const ingestStack = Layer.provideMerge(memoryStack, foreignIngestCheckpointLayer)
+const ingestStack = Layer.mergeAll(memoryDefaultLayer, foreignIngestCheckpointLayer)
 
 // --------------------------------------------------------------------------
 // Routes
