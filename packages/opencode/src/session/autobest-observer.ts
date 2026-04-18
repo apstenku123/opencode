@@ -216,21 +216,21 @@ export namespace SessionAutobestObserver {
 
           if (decision.kind === "a" && candidates.length) {
             // Step A: persist the candidate via `applyAutobest` (writes
-            // `autobest.result` + `autobest.active` history events) and
-            // record the cycle advance. Returns `Continue` without an
-            // Inject directive — the runLoop ends this turn at the
-            // assistant message boundary. Auto-continuation of Step A
-            // (re-entering the loop carrying the top candidate as the
-            // next user turn) is deferred: the old inline
-            // `continuePrompt` path in `prompt.ts` has been removed as
-            // part of the round-4 consolidation, and the hook-driven
-            // replacement lives in Step B/C/D where an assistant message
-            // has already been produced this iteration (so the next
-            // iteration's `lastUser` lookup walks past the synthetic to
-            // the original user message and preserves agent/model context).
-            yield* session
+            // `autobest.result` + `autobest.active` history events),
+            // record the cycle advance, and auto-continue by injecting
+            // the chosen bullet as the next synthetic user turn. The
+            // max-iterations guard above (decision.kind falls through to
+            // Step D when `iteration >= maxIterations`) prevents infinite
+            // loops. `shouldContinue` callers can also short-circuit via
+            // STOP_PATTERNS in the most recent user message.
+            const result = yield* session
               .applyAutobest({ sessionID: args.sessionID, candidates, ts: Date.now() })
-              .pipe(Effect.ignore)
+              .pipe(
+                Effect.match({
+                  onFailure: () => undefined as undefined,
+                  onSuccess: (v) => v,
+                }),
+              )
             const next = Autobest.buildCycleAdvanceEvent({
               sessionID: args.sessionID,
               cycle: {
@@ -243,7 +243,12 @@ export namespace SessionAutobestObserver {
             })
             yield* Effect.promise(() => History.append(args.sessionID, next))
             state.iteration = iteration + 1
-            return AdaptiveHooks.Continue
+            const activeKey = result?.decision.active?.key ?? candidates[0]?.key
+            if (!activeKey) return AdaptiveHooks.Continue
+            return AdaptiveHooks.Inject({
+              text: activeKey,
+              source: "autobest:step-a",
+            })
           }
 
           if (decision.kind === "b" && decision.action) {
