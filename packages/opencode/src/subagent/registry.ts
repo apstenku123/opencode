@@ -76,6 +76,22 @@ export namespace SubagentRegistry {
     readonly cancel?: () => void
   }
 
+  /**
+   * Row returned by {@link Interface.listChildren}. Combines active child state
+   * with finished-child summaries so the `task_list` tool can present a single
+   * view of every child owned by a parent.
+   */
+  export interface ChildRow {
+    readonly sessionID: SessionID
+    readonly parentID: SessionID
+    readonly startedAt: number
+    /** `"running"` for active, matches {@link ChildSummary.status} otherwise. */
+    readonly status: "running" | ChildSummary["status"]
+    readonly finishedAt?: number
+    readonly result?: string
+    readonly error?: string
+  }
+
   export interface Interface {
     readonly spawn: (
       parentID: SessionID,
@@ -86,6 +102,18 @@ export namespace SubagentRegistry {
       parentID: SessionID,
       options?: { timeoutMs?: number },
     ) => Effect.Effect<ReadonlyArray<ChildSummary>>
+    /**
+     * Wait for the specific set of child IDs (must all be under `parentID`)
+     * and return their summaries in completion order. Unknown or foreign-parent
+     * IDs are rejected synchronously. Already-finished IDs resolve with their
+     * recorded summary. Timeout returns whatever summaries have landed so far.
+     * Mirrors Rust `wait.rs::Handler::handle` (multi_agents/wait.rs).
+     */
+    readonly waitForIds: (
+      parentID: SessionID,
+      ids: ReadonlyArray<SessionID>,
+      options?: { timeoutMs?: number },
+    ) => Effect.Effect<ReadonlyArray<ChildSummary>, Error>
     readonly active: (parentID: SessionID) => Effect.Effect<ReadonlySet<SessionID>>
     readonly close: (
       childID: SessionID,
@@ -95,8 +123,20 @@ export namespace SubagentRegistry {
     ) => Effect.Effect<void>
     /** Cancel every child under a parent session and mark them as cancelled. */
     readonly cancelAll: (parentID: SessionID) => Effect.Effect<number>
+    /**
+     * Cancel a single child under a parent. Returns `true` when the child was
+     * active and got cancelled, `false` for unknown or foreign-parent ids.
+     * Port of `close_agent.rs::Handler::handle`.
+     */
+    readonly cancelChild: (parentID: SessionID, childID: SessionID) => Effect.Effect<boolean>
     /** Child-id → summary lookup for children that have already finished. */
     readonly summary: (childID: SessionID) => Effect.Effect<ChildSummary | undefined>
+    /**
+     * List every child registered under `parentID` — both running and
+     * completed — as a single snapshot. Port of
+     * `list_agents.rs::Handler::handle`. Used by the `task_list` tool.
+     */
+    readonly listChildren: (parentID: SessionID) => Effect.Effect<ReadonlyArray<ChildRow>>
     /**
      * Depth of the chain of registered ancestors for a given session id.
      * Returns 0 when the session id isn't registered as a child anywhere.
@@ -249,6 +289,115 @@ export namespace SubagentRegistry {
       const summary: Interface["summary"] = (childID) =>
         Effect.map(getState, (state) => state.summaries.get(childID))
 
+      const waitForIds: Interface["waitForIds"] = (parentID, ids, options) =>
+        Effect.gen(function* () {
+          const state = yield* getState
+          // Validate every id belongs to this parent (either still active or
+          // recorded in summaries). Reject the whole call on foreign/unknown
+          // to mirror Rust's `agent_id` validation step.
+          for (const id of ids) {
+            const active = state.children.get(id)
+            const finished = state.summaries.get(id)
+            if (!active && !finished) {
+              return yield* Effect.fail(new Error(`Unknown child session: ${id}`))
+            }
+            const owner = active?.parentID ?? finished?.parentID
+            if (owner !== parentID) {
+              return yield* Effect.fail(
+                new Error(`Child ${id} is owned by ${owner}, not ${parentID}`),
+              )
+            }
+          }
+          if (ids.length === 0) return [] as ReadonlyArray<ChildSummary>
+          const pending: Array<Effect.Effect<ChildSummary>> = []
+          const alreadyDone: ChildSummary[] = []
+          for (const id of ids) {
+            const active = state.children.get(id)
+            const finished = state.summaries.get(id)
+            if (active) pending.push(Deferred.await(active.done))
+            else if (finished) alreadyDone.push(finished)
+          }
+          if (pending.length === 0) return alreadyDone as ReadonlyArray<ChildSummary>
+          const all = Effect.all(pending, { concurrency: "unbounded" })
+          const timeoutMs = options?.timeoutMs
+          if (timeoutMs === undefined) {
+            const waited = yield* all
+            return [...alreadyDone, ...waited] as ReadonlyArray<ChildSummary>
+          }
+          const waited = yield* all.pipe(
+            Effect.timeout(timeoutMs),
+            Effect.catchTag("TimeoutError", () =>
+              Effect.sync(() => {
+                return ids
+                  .map((id) => state.summaries.get(id))
+                  .filter((s): s is ChildSummary => s !== undefined) as ReadonlyArray<ChildSummary>
+              }),
+            ),
+          )
+          // When a timeout occurs the fallback already returns every
+          // currently-known summary (including ids we already had), so dedupe.
+          const seen = new Set<SessionID>()
+          const merged: ChildSummary[] = []
+          for (const s of [...alreadyDone, ...waited]) {
+            if (seen.has(s.sessionID)) continue
+            seen.add(s.sessionID)
+            merged.push(s)
+          }
+          return merged as ReadonlyArray<ChildSummary>
+        })
+
+      const cancelChild: Interface["cancelChild"] = (parentID, childID) =>
+        Effect.gen(function* () {
+          const state = yield* getState
+          const entry = state.children.get(childID)
+          if (!entry || entry.parentID !== parentID) return false
+          try {
+            entry.cancel?.()
+          } catch {
+            // swallow — best-effort
+          }
+          const summary: ChildSummary = {
+            sessionID: childID,
+            parentID: entry.parentID,
+            startedAt: entry.startedAt,
+            finishedAt: Date.now(),
+            status: "cancelled",
+          }
+          state.summaries.set(childID, summary)
+          state.children.delete(childID)
+          yield* Deferred.succeed(entry.done, summary)
+          return true
+        })
+
+      const listChildren: Interface["listChildren"] = (parentID) =>
+        Effect.map(getState, (state) => {
+          const rows: ChildRow[] = []
+          for (const [childID, entry] of state.children.entries()) {
+            if (entry.parentID !== parentID) continue
+            rows.push({
+              sessionID: childID,
+              parentID: entry.parentID,
+              startedAt: entry.startedAt,
+              status: "running",
+            })
+          }
+          for (const [childID, s] of state.summaries.entries()) {
+            if (s.parentID !== parentID) continue
+            rows.push({
+              sessionID: childID,
+              parentID: s.parentID,
+              startedAt: s.startedAt,
+              status: s.status,
+              finishedAt: s.finishedAt,
+              result: s.result,
+              error: s.error,
+            })
+          }
+          // Stable sort: oldest started first (ascending).
+          rows.sort((a, b) => a.startedAt - b.startedAt)
+          return rows as ReadonlyArray<ChildRow>
+        })
+
       const depth: Interface["depth"] = (sessionID) =>
         Effect.map(getState, (state) => {
           let current: SessionID | undefined = state.parentOf.get(sessionID)
@@ -269,10 +418,13 @@ export namespace SubagentRegistry {
       return Service.of({
         spawn,
         waitForAll,
+        waitForIds,
         active,
         close,
         cancelAll,
+        cancelChild,
         summary,
+        listChildren,
         depth,
         parentOf,
       })

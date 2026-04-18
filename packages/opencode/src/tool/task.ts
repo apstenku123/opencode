@@ -210,6 +210,20 @@ export const TaskTool = Tool.define(
           )
         }
 
+        // Concurrency ceiling — port of Rust `agent::exceeds_concurrent_children_limit`.
+        // The parent may already own N active children; reject before the
+        // spawn rather than after, so failure surfaces in the tool output and
+        // the model can retry with `task_wait` first. Default 8.
+        const maxConcurrent = cfg.experimental?.subagent?.maxConcurrent ?? 8
+        const activeChildren = yield* subagents.active(SessionID.make(ctx.sessionID))
+        if (activeChildren.size >= maxConcurrent) {
+          return yield* Effect.fail(
+            new Error(
+              `Sub-agent concurrency limit reached: ${activeChildren.size} active >= ${maxConcurrent}. Call task_wait or task_close first.`,
+            ),
+          )
+        }
+
         // Cascade-breaker — Rust `should_throttle_spawns`
         // (`core/src/account_pool.rs:1390-1430`). When > 50% of Copilot
         // accounts are in cooldown, defer spawning a new async child so we

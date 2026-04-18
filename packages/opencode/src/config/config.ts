@@ -507,6 +507,14 @@ export const Info = z
               .describe(
                 "Maximum nesting depth for async sub-agent spawns (`task` tool with `async: true`). Default 3.",
               ),
+            maxConcurrent: z
+              .number()
+              .int()
+              .positive()
+              .optional()
+              .describe(
+                "Maximum number of concurrently-active async children per parent session. Additional async `task` spawns beyond this limit are rejected with a retry-later message. Default 8.",
+              ),
             autoWaitTimeoutMs: z
               .number()
               .int()

@@ -7,6 +7,10 @@ import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
+import { TaskWaitTool } from "./task-wait"
+import { TaskSendInputTool } from "./task-send-input"
+import { TaskCloseTool } from "./task-close"
+import { TaskListTool } from "./task-list"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
@@ -106,6 +110,10 @@ export const layer: Layer.Layer<
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
+    const taskWait = yield* TaskWaitTool
+    const taskSendInput = yield* TaskSendInputTool
+    const taskClose = yield* TaskCloseTool
+    const taskList = yield* TaskListTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
@@ -191,6 +199,10 @@ export const layer: Layer.Layer<
           edit: Tool.init(edit),
           write: Tool.init(writetool),
           task: Tool.init(task),
+          task_wait: Tool.init(taskWait),
+          task_send_input: Tool.init(taskSendInput),
+          task_close: Tool.init(taskClose),
+          task_list: Tool.init(taskList),
           fetch: Tool.init(webfetch),
           todo: Tool.init(todo),
           search: Tool.init(websearch),
@@ -215,6 +227,10 @@ export const layer: Layer.Layer<
             tool.edit,
             tool.write,
             tool.task,
+            tool.task_wait,
+            tool.task_send_input,
+            tool.task_close,
+            tool.task_list,
             tool.fetch,
             tool.todo,
             tool.search,
