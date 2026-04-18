@@ -49,8 +49,14 @@ describe("checkAccountStatus single account", () => {
         new Response(
           JSON.stringify({
             user_login: "alice",
-            entitlements: { premium_requests: 100 },
-            quota_snapshots: [{ quota_id: "premium_requests", remaining: 50, percent_remaining: 50 }],
+            copilot_plan: "enterprise",
+            quota_snapshots: {
+              premium_interactions: {
+                entitlement: 100,
+                remaining: 50,
+                percent_remaining: 50,
+              },
+            },
           }),
           { status: 200 },
         ),
@@ -68,8 +74,14 @@ describe("checkAccountStatus single account", () => {
         new Response(
           JSON.stringify({
             user_login: "bob",
-            entitlements: { premium_requests: 100 },
-            quota_snapshots: [{ quota_id: "premium_requests", remaining: 0, percent_remaining: 0 }],
+            copilot_plan: "enterprise",
+            quota_snapshots: {
+              premium_interactions: {
+                entitlement: 100,
+                remaining: 0,
+                percent_remaining: 0,
+              },
+            },
           }),
           { status: 200 },
         ),
