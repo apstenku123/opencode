@@ -3,10 +3,27 @@ import { Effect, Layer, Record, Result, Schema, Context } from "effect"
 import { zod } from "@/util/effect-zod"
 import { Global } from "../global"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
+import { Log } from "../util"
+import * as Keyring from "./keyring"
 
 export const OAUTH_DUMMY_KEY = "opencode-oauth-dummy-key"
 
 const file = path.join(Global.Path.data, "auth.json")
+
+/**
+ * Keyring service name. Refresh tokens + API keys are keyed under this
+ * service in the OS keyring when available, with the provider id as the
+ * account. Enabled by setting OPENCODE_USE_KEYRING=1 (or via config in the
+ * future). When disabled — or when the keyring backend fails — auth falls
+ * back to the existing plaintext `auth.json` behaviour.
+ */
+const KEYRING_SERVICE = "opencode"
+
+const log = Log.create({ service: "auth" })
+
+function keyringEnabled(): boolean {
+  return process.env.OPENCODE_USE_KEYRING === "1"
+}
 
 const fail = (message: string) => (cause: unknown) => new AuthError({ message, cause })
 
@@ -49,11 +66,107 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Auth") {}
 
+/**
+ * Secret fields per Info variant. When the keyring is enabled these fields
+ * are stripped from `auth.json` and persisted to the OS keyring instead.
+ * On read they are stitched back together. If the keyring call fails we
+ * transparently fall through to the values stored inline in the file (so
+ * existing deployments keep working during migration).
+ */
+const SECRET_FIELDS = {
+  oauth: ["refresh", "access"] as const,
+  api: ["key"] as const,
+  wellknown: ["token"] as const,
+}
+
+function secretAccount(provider: string, field: string): string {
+  return `${provider}::${field}`
+}
+
+function splitSecrets(info: Info): { stripped: Info; secrets: Record<string, string> } {
+  const secrets: Record<string, string> = {}
+  const clone = { ...info } as any
+  if (info.type === "oauth") {
+    for (const f of SECRET_FIELDS.oauth) {
+      secrets[f] = (info as any)[f]
+      clone[f] = ""
+    }
+  } else if (info.type === "api") {
+    for (const f of SECRET_FIELDS.api) {
+      secrets[f] = (info as any)[f]
+      clone[f] = ""
+    }
+  } else if (info.type === "wellknown") {
+    for (const f of SECRET_FIELDS.wellknown) {
+      secrets[f] = (info as any)[f]
+      clone[f] = ""
+    }
+  }
+  return { stripped: clone as Info, secrets }
+}
+
+function mergeSecrets(info: Info, secrets: Record<string, string>): Info {
+  const clone = { ...info } as any
+  for (const [k, v] of Object.entries(secrets)) {
+    if (v && !clone[k]) clone[k] = v
+  }
+  return clone as Info
+}
+
+function secretFieldsFor(info: Info): ReadonlyArray<string> {
+  if (info.type === "oauth") return SECRET_FIELDS.oauth as unknown as string[]
+  if (info.type === "api") return SECRET_FIELDS.api as unknown as string[]
+  return SECRET_FIELDS.wellknown as unknown as string[]
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fsys = yield* AppFileSystem.Service
     const decode = Schema.decodeUnknownOption(Info)
+
+    // Lazily resolved once — either real keytar or encrypted-file fallback.
+    // When keyringEnabled() is false, keyring is undefined and auth.ts
+    // behaves exactly like before (fully backwards compatible).
+    let keyring: Keyring.Interface | undefined
+    if (keyringEnabled()) {
+      keyring = yield* Keyring.make().pipe(Effect.provideService(AppFileSystem.Service, fsys))
+      const backend = yield* keyring.backend()
+      log.info("keyring.enabled", { backend })
+    }
+
+    const keyringGet = (provider: string, field: string): Effect.Effect<string | undefined, never> => {
+      if (!keyring) return Effect.succeed(undefined as string | undefined)
+      return keyring.get(KEYRING_SERVICE, secretAccount(provider, field)).pipe(
+        Effect.catch((err: Keyring.KeyringError) => {
+          log.info("keyring.get.fallback", { provider, field, error: err.message })
+          return Effect.succeed(undefined as string | undefined)
+        }),
+      )
+    }
+
+    const keyringSet = (provider: string, field: string, value: string): Effect.Effect<void, never> => {
+      if (!keyring) return Effect.void
+      return keyring.set(KEYRING_SERVICE, secretAccount(provider, field), value).pipe(
+        Effect.catch((err: Keyring.KeyringError) => {
+          log.info("keyring.set.fallback", { provider, field, error: err.message })
+          return Effect.void
+        }),
+      )
+    }
+
+    const keyringRemove = (provider: string, fields: ReadonlyArray<string>): Effect.Effect<void, never> =>
+      Effect.gen(function* () {
+        if (!keyring) return
+        for (const f of fields) {
+          yield* keyring.remove(KEYRING_SERVICE, secretAccount(provider, f)).pipe(
+            Effect.catch((err: Keyring.KeyringError) => {
+              log.info("keyring.remove.fallback", { provider, field: f, error: err.message })
+              return Effect.succeed(false)
+            }),
+          )
+        }
+      })
 
     const all = Effect.fn("Auth.all")(function* () {
       if (process.env.OPENCODE_AUTH_CONTENT) {
@@ -63,7 +176,23 @@ export const layer = Layer.effect(
       }
 
       const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
-      return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+      const decoded = Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+
+      if (!keyring) return decoded
+
+      // Stitch secrets back from the keyring. Any missing values stay as
+      // whatever was in the file (pre-migration compatibility).
+      const result: Record<string, Info> = {}
+      for (const [key, info] of Object.entries(decoded)) {
+        const fields = secretFieldsFor(info)
+        const secrets: Record<string, string> = {}
+        for (const f of fields) {
+          const v = yield* keyringGet(key, f)
+          if (v !== undefined) secrets[f] = v
+        }
+        result[key] = mergeSecrets(info, secrets)
+      }
+      return result
     })
 
     const get = Effect.fn("Auth.get")(function* (providerID: string) {
@@ -75,16 +204,32 @@ export const layer = Layer.effect(
       const data = yield* all()
       if (norm !== key) delete data[key]
       delete data[norm + "/"]
+
+      let toPersist: Info = info
+      if (keyring) {
+        const { stripped, secrets } = splitSecrets(info)
+        for (const [f, v] of Object.entries(secrets)) {
+          yield* keyringSet(norm, f, v)
+        }
+        toPersist = stripped
+      }
+
       yield* fsys
-        .writeJson(file, { ...data, [norm]: info }, 0o600)
+        .writeJson(file, { ...data, [norm]: toPersist }, 0o600)
         .pipe(Effect.mapError(fail("Failed to write auth data")))
     })
 
     const remove = Effect.fn("Auth.remove")(function* (key: string) {
       const norm = key.replace(/\/+$/, "")
       const data = yield* all()
+      const existing = data[norm] ?? data[key]
       delete data[key]
       delete data[norm]
+
+      if (keyring && existing) {
+        yield* keyringRemove(norm, secretFieldsFor(existing))
+      }
+
       yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
     })
 

@@ -14,6 +14,8 @@ import { Deferred, Effect, Layer, Schema, Context } from "effect"
 import os from "os"
 import { evaluate as evalRule } from "./evaluate"
 import { PermissionID } from "./schema"
+import { DSL } from "./dsl"
+import type { CompiledPolicy, ToolInvocation } from "./dsl"
 
 const log = Log.create({ service: "permission" })
 
@@ -147,6 +149,35 @@ export function evaluate(permission: string, pattern: string, ...rulesets: Rules
   log.info("evaluate", { permission, pattern, ruleset: rulesets.flat() })
   return evalRule(permission, pattern, ...rulesets)
 }
+
+/**
+ * DSL-aware evaluate. Consults the compiled exec-policy first; if it
+ * produces a decision, that decision wins (mirrors Codex `exec_policy.rs`
+ * semantics where a matching DSL rule short-circuits the approval flow).
+ * Otherwise falls back to the existing ruleset evaluator.
+ *
+ * `invocation` carries the additional context needed by the DSL (command
+ * text, file path, cwd). Callers that don't have this context can pass
+ * `undefined` as the policy and this behaves identically to `evaluate`.
+ */
+export function evaluateWithDSL(
+  permission: string,
+  pattern: string,
+  invocation: ToolInvocation | undefined,
+  policy: CompiledPolicy | undefined,
+  ...rulesets: Ruleset[]
+): Rule {
+  if (policy && invocation) {
+    const decision = DSL.decide(policy, invocation)
+    if (decision) {
+      log.info("evaluate.dsl", { permission, pattern, action: decision.action, ruleIndex: decision.rule.index })
+      return { permission, pattern, action: decision.action }
+    }
+  }
+  return evaluate(permission, pattern, ...rulesets)
+}
+
+export { DSL }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Permission") {}
 
