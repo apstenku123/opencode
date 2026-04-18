@@ -9,7 +9,7 @@ import { MessageV2 } from "../../src/session/message-v2"
 import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID } from "../../src/session/schema"
 import { ModelID, ProviderID } from "../../src/provider/schema"
-import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { TaskTool, SPAWN_THROTTLE_MAX_WAIT_MS, type TaskPromptOps } from "../../src/tool/task"
 import { Truncate } from "../../src/tool"
 import { ToolRegistry } from "../../src/tool"
 import { SubagentRegistry } from "../../src/subagent/registry"
@@ -384,6 +384,101 @@ describe("tool.task", () => {
           },
         },
       },
+    ),
+  )
+
+  it.live("async spawn fails fast when pool is persistently exhausted", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const promptOps = stubOps()
+
+        // Sanity: SPAWN_THROTTLE_MAX_WAIT_MS is set — we use a checker that
+        // always returns true, so the throttle must eventually fail out.
+        expect(SPAWN_THROTTLE_MAX_WAIT_MS).toBeGreaterThan(0)
+
+        let checks = 0
+        const started = Date.now()
+        const exit = yield* def
+          .execute(
+            {
+              description: "spawn under pressure",
+              prompt: "do the thing",
+              subagent_type: "general",
+              async: true,
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              extra: {
+                promptOps,
+                shouldThrottleSpawns: () => {
+                  checks += 1
+                  return true
+                },
+                spawnThrottleMaxWaitMs: 100,
+                spawnThrottlePollMs: 20,
+              },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+        const elapsed = Date.now() - started
+        // Bounded by the injected 100 ms deadline (+ slack for test harness).
+        expect(elapsed).toBeLessThan(3_000)
+        expect(checks).toBeGreaterThan(0)
+        // The tool wraps execute with Effect.orDie so the Error becomes a
+        // defect — Effect.exit catches it, yielding a Failure exit.
+        expect(exit._tag).toBe("Failure")
+      }),
+    ),
+  )
+
+  it.live("async spawn proceeds when shouldThrottleSpawns returns false", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const promptOps = stubOps({ text: "async done" })
+
+        let checks = 0
+        const result = yield* def.execute(
+          {
+            description: "spawn ok",
+            prompt: "do the thing",
+            subagent_type: "general",
+            async: true,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps,
+              shouldThrottleSpawns: () => {
+                checks += 1
+                return false
+              },
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(checks).toBe(1)
+        expect((result.metadata as { async?: boolean }).async).toBe(true)
+        expect(result.output).toContain("async; use task_id to resume or poll")
+      }),
     ),
   )
 })

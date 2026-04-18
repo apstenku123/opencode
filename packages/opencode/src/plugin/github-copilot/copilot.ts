@@ -18,7 +18,7 @@ import {
   type Event,
   type Runtime,
 } from "./runtime"
-import { AccountPool } from "./account-pool"
+import { AccountPool, type Lease } from "./account-pool"
 import { openRateStore } from "./account-pool-sqlite"
 import path from "path"
 import { classifyPlan, fetchQuota } from "./quota"
@@ -868,7 +868,7 @@ export async function dispatch(input: {
   isVision: boolean
   isAgent: boolean
   modelId: string
-}) {
+}): Promise<Response> {
   const info = await input.getAuth()
   if (info.type !== "oauth") return fetch(input.request, input.init)
   const loaded = await input.read()
@@ -893,7 +893,7 @@ export async function dispatch(input: {
   // Acquire a slot via the AccountPool when available — RAII lease w/
   // bounded 5-min wait + secondary preference for sub-agents (`isAgent`).
   // Otherwise fall back to the legacy autobest batch reservation.
-  const release = await reserveSlot({
+  const slot = await reserveSlot({
     pool: input.pool,
     runtime: input.runtime,
     auths: input.auths,
@@ -903,11 +903,67 @@ export async function dispatch(input: {
     key: live.key,
     isAgent: input.isAgent,
   })
+  // `leaseRef` is updated in-place when an atomic `reassign` happens on 429;
+  // the closure below reads from it so `release()` frees the *current* lease.
+  const leaseRef = { lease: slot.lease }
+  const release = () => {
+    if (leaseRef.lease) {
+      leaseRef.lease.release()
+      leaseRef.lease = undefined
+    } else if (slot.fallbackRelease) {
+      slot.fallbackRelease()
+    }
+  }
+  const res = await dispatchOnce({
+    input,
+    state,
+    live,
+    leaseRef,
+  })
+  // 429 retry: if a pool + viable failover target exists, atomically
+  // reassign the lease to the new key and retry once. Mirrors Rust
+  // `account_pool.rs:1038-1142` + `:1390-1430`.
+  if (input.pool && leaseRef.lease && copilotStatus(res).rateLimited) {
+    const failoverKey = input.pool.failoverTokenForModel(live.key, input.modelId)
+    const failoverAuth = failoverKey
+      ? (input.auths.find((a) => a.key === failoverKey) ?? undefined)
+      : undefined
+    if (failoverKey && failoverAuth) {
+      try {
+        const newLease = leaseRef.lease.reassign(failoverKey)
+        leaseRef.lease = newLease
+        // Re-read state (it was updated in the first attempt's body).
+        const nextLoaded = await input.read()
+        const nextState = syncAccount(nextLoaded, input.auths)
+        return await dispatchOnce({
+          input,
+          state: nextState,
+          live: failoverAuth,
+          leaseRef,
+          alreadyRetried: true,
+        })
+      } catch {
+        // reassign failed (no headroom on failover) — fall through to return
+        // the original 429 so the caller's outer retry loop can decide.
+      }
+    }
+  }
+  release()
+  return res
+}
+
+async function dispatchOnce(ctx: {
+  input: Parameters<typeof dispatch>[0]
+  state: State
+  live: CopilotAuth
+  leaseRef: { lease: Lease | undefined }
+  alreadyRetried?: boolean
+}): Promise<Response> {
+  const { input, live, state } = ctx
   const isPremium = input.modelId ? premiumState(input.premium, live.key, input.modelId) : !input.isAgent
   const fresh = await refreshAccount({ state, key: live.key, token: live.refresh, enterpriseUrl: live.enterpriseUrl })
   const [nextState, machineId] = machine(routed(fresh, live.key), live.key)
   await input.write(nextState)
-  const s = runtimeScore({ state: nextState, runtime: input.runtime, key: live.key, modelId: input.modelId })
   const debug = routeDebug({
     auths: input.auths,
     state: nextState,
@@ -939,7 +995,6 @@ export async function dispatch(input: {
   const res = await routedFetch(input.request, { ...input.init, headers }, cfg)
   const triage = copilotStatus(res)
   if (triage.rateLimited) {
-    release()
     // Honor Retry-After when present; else run the headerless-429 escalator
     // (11m → 21m → 41m). `record429` is monotonic — it never shortens an
     // existing cooldown (Rust `set_exhaustion` semantics). Routed through
@@ -952,22 +1007,30 @@ export async function dispatch(input: {
       : (await import("./runtime")).record429(input.runtime, live.key, { retryAfterMs })
     await input.write(mark(nextState, live.key, result.until))
     if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
+    // On the retried attempt we do NOT release here; the caller decides.
+    // On the first attempt we leave the lease live so the caller can reassign.
     return res
   }
   if (triage.authError) {
-    release()
     // 401/403 means the token is invalid or the account has been deactivated.
     // Flag the account so subsequent dispatches skip it (mirror Rust
     // `check_account_statuses` → `AccountStatus::is_deactivated`).
     await input.write(markDeactivated(nextState, live.key))
     if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
+    if (ctx.leaseRef.lease) {
+      ctx.leaseRef.lease.release()
+      ctx.leaseRef.lease = undefined
+    }
     return res
   }
   if (triage.networkError) {
     // 5xx is transient server-side: don't mark the account, but roll back
     // the premium stamp so the retry is free to re-claim it.
-    release()
     if (input.modelId && isPremium) premiumRollback(input.premium, live.key, input.modelId)
+    if (ctx.leaseRef.lease) {
+      ctx.leaseRef.lease.release()
+      ctx.leaseRef.lease = undefined
+    }
     return res
   }
   // model_not_supported: server rejects the model on this account. Mark the
@@ -992,7 +1055,10 @@ export async function dispatch(input: {
     else recordSuccess(input.runtime, live.key)
     await input.write(clear(nextState, live.key))
   }
-  release()
+  if (ctx.leaseRef.lease) {
+    ctx.leaseRef.lease.release()
+    ctx.leaseRef.lease = undefined
+  }
   touch(input.runtime, live.key)
   void modelUnsupportedNoticed // surfaced via `markModelUnsupported` side-effects only
   return res
@@ -1007,14 +1073,14 @@ async function reserveSlot(input: {
   providerID?: string
   key: string
   isAgent: boolean
-}): Promise<() => void> {
+}): Promise<{ lease: Lease | undefined; fallbackRelease?: () => void }> {
   if (input.pool) {
     try {
       const lease = await input.pool.acquire(input.key, {
         timeoutMs: 5 * 60 * 1000,
         preferSecondary: input.isAgent,
       })
-      return () => lease.release()
+      return { lease }
     } catch {
       // fall through to the legacy reservation path so we never deadlock the
       // dispatcher just because the pool can't immediately give us the slot.
@@ -1035,7 +1101,7 @@ async function reserveSlot(input: {
     held.held.filter((item) => item !== slot).forEach((item) => item.release())
   }
   const pick = slot ?? reserve(input.runtime, input.key)
-  return () => pick.release()
+  return { lease: undefined, fallbackRelease: () => pick.release() }
 }
 
 /**

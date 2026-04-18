@@ -83,6 +83,122 @@ describe("github-copilot auth helpers", () => {
     expect(headers["X-Interaction-Type"]).toBe("conversation-user")
   })
 
+  test("dispatch retries via pool.reassign on 429 when a failover account is available", async () => {
+    // Two accounts; first dispatch hits 429 on the primary, reassign must
+    // atomically swap the lease to the backup and retry once. Mirrors Rust
+    // `core/src/account_pool.rs:1038-1142` + `:1390-1430`.
+    const { AccountPool } = await import("@/plugin/github-copilot/account-pool")
+    let state = empty()
+    // `refreshAccount` inside dispatch calls fetchQuota() against
+    // `api.github.com/copilot_internal/user` — swallow that route separately
+    // so we only count the actual chat/completions dispatches.
+    const dispatches: { url: string; token?: string }[] = []
+    globalThis.fetch = mock((url: RequestInfo | URL, init?: RequestInit) => {
+      const href = url instanceof URL ? url.href : url.toString()
+      const auth = (init?.headers as Record<string, string> | undefined)?.Authorization
+      if (href.includes("/copilot_internal/user")) {
+        // Pretend quota lookup fails cheaply — dispatch falls through the
+        // catch path without mutating exhaustion state.
+        return Promise.resolve(new Response("nope", { status: 500 }))
+      }
+      dispatches.push({ url: href, token: auth })
+      if (dispatches.length === 1) return Promise.resolve(new Response("rate", { status: 429 }))
+      return Promise.resolve(new Response("ok", { status: 200 }))
+    }) as unknown as typeof fetch
+
+    const runtime = owner()
+    const pool = new AccountPool({
+      accounts: [{ key: "github-copilot" }, { key: "github-copilot#work" }],
+      runtime,
+      limit: 2,
+    })
+    // Mark model supported on the failover account so
+    // `failoverTokenForModel` prefers it.
+    pool.setAccountCapabilities("github-copilot#work", ["gpt-5-mini"])
+
+    const auths: CopilotAuth[] = [
+      { key: "github-copilot", label: "Primary", refresh: "root", access: "root", expires: 0 },
+      { key: "github-copilot#work", label: "Work", refresh: "work-token", access: "work-token", expires: 0 },
+    ]
+
+    const res = await dispatch({
+      getAuth: async () => ({ type: "oauth", refresh: "root", access: "root", expires: 0 }),
+      auths,
+      read: async () => state,
+      write: async (next: State) => {
+        state = next
+      },
+      premium: new Map(),
+      runtime,
+      pool,
+      request: "https://api.githubcopilot.com/chat/completions",
+      init: { headers: {} },
+      isVision: false,
+      isAgent: false,
+      modelId: "gpt-5-mini",
+    })
+
+    expect(dispatches.length).toBe(2)
+    expect(res.status).toBe(200)
+    // Two dispatches, second one on the failover token.
+    expect(dispatches[0]?.token).toBe("Bearer root")
+    expect(dispatches[1]?.token).toBe("Bearer work-token")
+    // Primary was marked exhausted; work key is not.
+    expect(state.connections["github-copilot"]?.exhaustedUntil).toBeGreaterThan(Date.now() - 1000)
+    // Lease fully released after successful retry — no leaked reservations on
+    // either slot (raw runtime pool count, not effective slots: primary is
+    // in cooldown so `availableSlots` would be 0).
+    expect(runtime.pool["github-copilot"] ?? 0).toBe(0)
+    expect(runtime.pool["github-copilot#work"] ?? 0).toBe(0)
+  })
+
+  test("dispatch does not retry on 429 when no failover candidate exists", async () => {
+    // Single-account pool — failoverTokenForModel returns undefined, so the
+    // original 429 response is surfaced to the caller.
+    const { AccountPool } = await import("@/plugin/github-copilot/account-pool")
+    let state = empty()
+    const dispatches: string[] = []
+    globalThis.fetch = mock((url: RequestInfo | URL) => {
+      const href = url instanceof URL ? url.href : url.toString()
+      if (href.includes("/copilot_internal/user")) {
+        return Promise.resolve(new Response("nope", { status: 500 }))
+      }
+      dispatches.push(href)
+      return Promise.resolve(new Response("rate", { status: 429 }))
+    }) as unknown as typeof fetch
+
+    const runtime = owner()
+    const pool = new AccountPool({
+      accounts: [{ key: "github-copilot" }],
+      runtime,
+      limit: 2,
+    })
+
+    const res = await dispatch({
+      getAuth: async () => ({ type: "oauth", refresh: "root", access: "root", expires: 0 }),
+      auths: [{ key: "github-copilot", label: "Primary", refresh: "root", access: "root", expires: 0 }],
+      read: async () => state,
+      write: async (next: State) => {
+        state = next
+      },
+      premium: new Map(),
+      runtime,
+      pool,
+      request: "https://api.githubcopilot.com/chat/completions",
+      init: { headers: {} },
+      isVision: false,
+      isAgent: false,
+      modelId: "gpt-5-mini",
+    })
+
+    expect(dispatches.length).toBe(1)
+    expect(res.status).toBe(429)
+    // After 429 record the account is in cooldown → effective slots drop to 0.
+    // What matters for lease accounting is that the runtime pool count is 0
+    // (no leaked reservation after release).
+    expect(runtime.pool["github-copilot"] ?? 0).toBe(0)
+  })
+
   test("dispatch persists machine id and marks 429 exhaustion", async () => {
     const writes: State[] = []
     let state = empty()

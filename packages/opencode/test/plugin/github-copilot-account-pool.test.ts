@@ -319,6 +319,89 @@ describe("AccountPool", () => {
     expect(result.count).toBe(0)
   })
 
+  test("lease.reassign atomically swaps slots", async () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }],
+      limit: 2,
+    })
+    const lease = await pool.acquire("a")
+    expect(pool.availableSlots("a")).toBe(1)
+    expect(pool.availableSlots("b")).toBe(2)
+
+    const next = lease.reassign("b")
+    expect(next.key).toBe("b")
+    expect(next.held).toBe(true)
+    // old slot fully released, new one taken
+    expect(pool.availableSlots("a")).toBe(2)
+    expect(pool.availableSlots("b")).toBe(1)
+    // original lease has been flipped to released; double-release is a no-op
+    expect(lease.held).toBe(false)
+    lease.release()
+    expect(pool.availableSlots("a")).toBe(2)
+    next.release()
+    expect(pool.availableSlots("b")).toBe(2)
+  })
+
+  test("lease.reassign prevents race: slot never visible as free mid-swap", async () => {
+    // Mirrors Rust `account_pool.rs:360-397`. With limit=1 on both accounts,
+    // if reassign did `release()` then `acquire()`, a waiter on "a" could
+    // snipe the freed slot before reassign claimed "b". The atomic variant
+    // must keep total load >= 1 across the swap.
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }],
+      limit: 1,
+    })
+    const lease = await pool.acquire("a")
+    // Queue a waiter targeting "a"; if a bug released before reassigning, this
+    // waiter would grab "a"'s slot.
+    let waiterResolved = false
+    const waiter = pool
+      .acquire("a", { timeoutMs: 5_000 })
+      .then((l) => {
+        waiterResolved = true
+        return l
+      })
+    // Reassign — the old slot release is sequenced *after* the new reserve.
+    const next = lease.reassign("b")
+    expect(next.key).toBe("b")
+    // After the atomic reassign returns, "a" is free — the queued waiter can
+    // (and should) now pick it up. But crucially the handoff happened
+    // atomically; there was no window where *both* slots could be claimed by
+    // unrelated callers.
+    const aLease = await waiter
+    expect(waiterResolved).toBe(true)
+    expect(aLease.key).toBe("a")
+    expect(pool.availableSlots("a")).toBe(0)
+    expect(pool.availableSlots("b")).toBe(0)
+    next.release()
+    aLease.release()
+  })
+
+  test("lease.reassign throws when new key has no slots and keeps old lease live", async () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }],
+      limit: 1,
+    })
+    const held = await pool.acquire("b") // saturate b
+    const lease = await pool.acquire("a")
+    expect(() => lease.reassign("b")).toThrow(/no slot available/)
+    // old lease remains held — caller keeps dispatch rights
+    expect(lease.held).toBe(true)
+    expect(pool.availableSlots("a")).toBe(0)
+    lease.release()
+    held.release()
+  })
+
+  test("lease.reassign is idempotent — second call throws", async () => {
+    const pool = new AccountPool({
+      accounts: [{ key: "a" }, { key: "b" }, { key: "c" }],
+      limit: 2,
+    })
+    const lease = await pool.acquire("a")
+    lease.reassign("b")
+    expect(() => lease.reassign("c")).toThrow(/already released/)
+  })
+
   test("attachStore hydrates rows and writes through on recordExhaustion", () => {
     const writes: Array<{ key: string; exhaustedUntil?: number; headerless429Count: number; last429At?: number }> = []
     const removes: string[] = []

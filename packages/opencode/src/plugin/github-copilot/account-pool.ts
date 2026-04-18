@@ -66,6 +66,22 @@ export type Lease = {
   key: string
   held: boolean
   release(): void
+  /**
+   * Atomically release this lease and acquire a new one on `newKey`.
+   *
+   * Mirrors Rust `AccountLease::reassign` (`core/src/account_pool.rs:360-397`).
+   * The critical property is atomicity: between releasing the old slot and
+   * claiming the new one, no other caller can pick up the just-freed slot
+   * first. This prevents the "two dispatches both pick newly-freed account"
+   * race that would otherwise happen under `release()` + `acquire()`.
+   *
+   * Returns the new lease. The old `Lease` object is left in the
+   * `held: false` state so double-release is a no-op.
+   *
+   * If `newKey` cannot be immediately reserved, `reassign` throws and the
+   * old slot remains held (caller keeps dispatch rights).
+   */
+  reassign(newKey: string): Lease
   /** Allow `await using lease = …` in callers that want RAII. */
   [Symbol.dispose]?(): void
 }
@@ -254,6 +270,7 @@ export class AccountPool {
       release: () => this.releaseLease(record),
     }
     this.leases.add(record)
+    const pool = this
     const lease: Lease = {
       key,
       held: true,
@@ -262,9 +279,41 @@ export class AccountPool {
         this.held = false
         record.release()
       },
+      reassign: (newKey: string): Lease => {
+        if (!lease.held) {
+          throw new Error("AccountPool.reassign: lease already released")
+        }
+        return pool.reassignLease(lease, record, newKey)
+      },
     }
     lease[Symbol.dispose] = () => lease.release()
     return lease
+  }
+
+  /**
+   * Atomic release-and-reacquire. Implements Rust
+   * `AccountLease::reassign` (`account_pool.rs:360-397`): the old slot is
+   * only released *after* we've successfully reserved the new one, so a
+   * racing `acquire()` cannot snipe the newly-freed slot between steps.
+   *
+   * If no slot is currently available on `newKey`, we atomically roll back
+   * by keeping the old reservation in place and throw.
+   */
+  private reassignLease(oldLease: Lease, oldRecord: LeaseRecord, newKey: string): Lease {
+    const now = Date.now()
+    // Take a pre-emptive reservation on the new key BEFORE releasing the old
+    // one. The only caveat is per-account cap — if `newKey` has no slots we
+    // must not over-commit, so we check availableSlots first and bail.
+    if (this.availableSlots(newKey, now) <= 0) {
+      throw new Error(`AccountPool.reassign: no slot available on ${newKey}`)
+    }
+    const newLease = this.reserve(newKey, now)
+    // Flip the old lease to not-held and drop its record. We do this AFTER
+    // `reserve(newKey)` so an outside observer sees pool load briefly
+    // elevated by +1 (both slots held) but never -1 (neither held).
+    oldLease.held = false
+    this.releaseLease(oldRecord)
+    return newLease
   }
 
   private releaseLease(record: LeaseRecord) {

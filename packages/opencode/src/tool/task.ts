@@ -10,6 +10,38 @@ import { Config } from "../config"
 import { SubagentRegistry } from "../subagent/registry"
 import { Cause, Effect, Fiber } from "effect"
 
+/**
+ * Max wait for an available Copilot slot before giving up and returning
+ * `"Copilot pool exhausted, retry later"` from an async `task` spawn.
+ * Mirrors the 10 s soft deadline used by Rust's spawn-throttle path.
+ */
+export const SPAWN_THROTTLE_MAX_WAIT_MS = 10_000
+export const SPAWN_THROTTLE_POLL_MS = 500
+
+/**
+ * Default cascade-breaker check: consults the Copilot runtime state's
+ * `shouldThrottleSpawns` hook. Dynamically imports the Copilot plugin module
+ * the first time it's needed so non-Copilot deployments are unaffected, and
+ * so we avoid a tool-layer → plugin-layer compile-time cycle.
+ */
+let copilotRuntimeStateCache:
+  | { shouldThrottleSpawns?: () => boolean }
+  | undefined
+
+async function copilotShouldThrottleSpawnsAsync(): Promise<boolean> {
+  try {
+    if (!copilotRuntimeStateCache) {
+      const mod = (await import("../plugin/github-copilot/copilot")) as {
+        CopilotRuntimeState?: { shouldThrottleSpawns?: () => boolean }
+      }
+      copilotRuntimeStateCache = mod.CopilotRuntimeState ?? {}
+    }
+    return copilotRuntimeStateCache.shouldThrottleSpawns?.() ?? false
+  } catch {
+    return false
+  }
+}
+
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): void
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
@@ -177,6 +209,51 @@ export const TaskTool = Tool.define(
             ),
           )
         }
+
+        // Cascade-breaker — Rust `should_throttle_spawns`
+        // (`core/src/account_pool.rs:1390-1430`). When > 50% of Copilot
+        // accounts are in cooldown, defer spawning a new async child so we
+        // don't amplify the outage. Wait up to `SPAWN_THROTTLE_MAX_WAIT_MS`
+        // polling at 500 ms; if the pool never recovers, fail with a
+        // retry-later message so the parent can back off.
+        const throttleChecker = ctx.extra?.shouldThrottleSpawns as
+          | (() => boolean | Promise<boolean>)
+          | undefined
+        const throttleMaxWaitMs =
+          (ctx.extra?.spawnThrottleMaxWaitMs as number | undefined) ?? SPAWN_THROTTLE_MAX_WAIT_MS
+        const throttlePollMs =
+          (ctx.extra?.spawnThrottlePollMs as number | undefined) ?? SPAWN_THROTTLE_POLL_MS
+        yield* Effect.callback<void, Error>((resume) => {
+          const deadline = Date.now() + throttleMaxWaitMs
+          let cancelled = false
+          let timer: ReturnType<typeof setTimeout> | undefined
+          const check = async () => {
+            if (cancelled) return
+            let throttled = false
+            try {
+              throttled = throttleChecker
+                ? await throttleChecker()
+                : await copilotShouldThrottleSpawnsAsync()
+            } catch {
+              throttled = false
+            }
+            if (cancelled) return
+            if (!throttled) {
+              resume(Effect.void)
+              return
+            }
+            if (Date.now() >= deadline) {
+              resume(Effect.fail(new Error("Copilot pool exhausted, retry later")))
+              return
+            }
+            timer = setTimeout(() => void check(), throttlePollMs)
+          }
+          void check()
+          return Effect.sync(() => {
+            cancelled = true
+            if (timer) clearTimeout(timer)
+          })
+        })
 
         let cancelFiber: (() => void) | undefined
         yield* subagents.spawn(SessionID.make(ctx.sessionID), nextSession.id, {
