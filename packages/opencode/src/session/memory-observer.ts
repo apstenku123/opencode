@@ -226,56 +226,72 @@ export namespace SessionMemoryObserver {
       const session = yield* Session.Service
       const config = yield* Config.Service
       const hooks = yield* AdaptiveHooks.Service
-      const provider = yield* Effect.serviceOption(Provider.Service)
+      const providerOpt = yield* Effect.serviceOption(Provider.Service)
 
-      // Resolve the LLM bridges eagerly at layer-build time. We read the
-      // config once and bind the bridges to the currently configured
-      // models; subsequent config edits require a process restart to
-      // pick up (matches the semantics of `autobest.model` et al).
+      // Bridge resolution is DEFERRED until `ensureRegistered()` fires
+      // (which runs inside an Instance scope) because `config.get()` and
+      // `Provider.getLanguage()` both read `InstanceState`. Eager
+      // resolution at layer-build would crash in minimal test stacks and
+      // any code path that builds the layer outside an Instance.
       //
       // When `Provider.Service` is unavailable (e.g. minimal test
       // stacks) we skip bridge resolution entirely and the observer
       // degrades to deterministic fallbacks per `makeObserverOptions`.
-      const cfg = yield* config.get()
-      const bridges: {
+      const resolveBridges = (): Effect.Effect<{
         extraction?: Phase1Model
         rerank?: RerankModel
         polish?: RefiningModel
         querySynth?: SynthesizeModel
-      } = {}
-      if (provider._tag === "Some") {
-        const providerSvc = provider.value
-        const tryResolve = (phase: "extraction" | "rerank" | "polish" | "querySynth") =>
-          Effect.gen(function* () {
-            const spec = resolveModelSpec(cfg, phase)
-            if (!spec) return undefined
-            const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
-              Effect.provideService(Provider.Service, providerSvc),
-              Effect.catchCause(() => Effect.succeed(undefined as Phase1Model | undefined)),
-            )
-            return bridge
-          })
-        bridges.extraction = yield* tryResolve("extraction")
-        bridges.rerank = yield* tryResolve("rerank")
-        bridges.polish = yield* tryResolve("polish")
-        bridges.querySynth = yield* tryResolve("querySynth")
-      }
+      }> =>
+        Effect.gen(function* () {
+          const bridges: {
+            extraction?: Phase1Model
+            rerank?: RerankModel
+            polish?: RefiningModel
+            querySynth?: SynthesizeModel
+          } = {}
+          if (providerOpt._tag !== "Some") return bridges
+          const providerSvc = providerOpt.value
+          const cfg = yield* config
+            .get()
+            .pipe(Effect.catchCause(() => Effect.succeed(undefined as Parameters<typeof resolveModelSpec>[0])))
+          if (!cfg) return bridges
+          const tryResolve = (phase: "extraction" | "rerank" | "polish" | "querySynth") =>
+            Effect.gen(function* () {
+              const spec = resolveModelSpec(cfg, phase)
+              if (!spec) return undefined
+              return yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+                Effect.provideService(Provider.Service, providerSvc),
+                Effect.catchCause(() => Effect.succeed(undefined as Phase1Model | undefined)),
+              )
+            })
+          bridges.extraction = yield* tryResolve("extraction")
+          bridges.rerank = yield* tryResolve("rerank")
+          bridges.polish = yield* tryResolve("polish")
+          bridges.querySynth = yield* tryResolve("querySynth")
+          return bridges
+        })
 
-      const opts = makeObserverOptions({ memory, session, config, bridges })
-
-      const resolveConfig = opts.config
+      const resolveConfig = () =>
+        Effect.gen(function* () {
+          const cfg = yield* config.get()
+          return buildHooksConfig(cfg)
+        })
 
       // Registration is deferred — wrapping in a guard so repeated calls
-      // from runLoop don't stack observers.
+      // from runLoop don't stack observers. Bridges resolve lazily here
+      // (inside the Instance scope of the caller).
       let registered = false
       const ensureRegistered = () =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
           if (registered) return
           registered = true
-          // `hooks.register` returns an unregister callback; we ignore it
-          // because the observer is process-lifetime. Fire the Effect
-          // synchronously — `register` is a pure sync push onto an array.
-          Effect.runSync(hooks.register({ ...registerMemoryTurnObserver(opts) }))
+          const bridges = yield* resolveBridges()
+          const opts = makeObserverOptions({ memory, session, config, bridges })
+          // `hooks.register` is a pure sync push; running through the
+          // Effect runtime keeps the observer Effect and its hooks Effect
+          // sharing the same runtime context.
+          yield* hooks.register({ ...registerMemoryTurnObserver(opts) })
         })
 
       return Service.of({
