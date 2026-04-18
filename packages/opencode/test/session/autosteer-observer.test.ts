@@ -102,7 +102,7 @@ describe("SessionAutosteerObserver", () => {
     })
   })
 
-  test("two consecutive planning-only replies trigger nudge injection", async () => {
+  test("two consecutive planning-only replies trigger nudge signal (detection-only)", async () => {
     await Instance.provide({
       directory: projectRoot,
       fn: async () => {
@@ -119,15 +119,12 @@ describe("SessionAutosteerObserver", () => {
         expect(second.stagnant).toBe(true)
         expect(second.nudge).toBe(true)
         expect(second.count).toBe(0)
-
-        // A user message with the canned nudge text should now be present.
-        const items: MessageV2.WithParts[] = []
-        for (const item of MessageV2.stream(session.id)) items.push(item)
-        const userMsgs = items.filter((i) => i.info.role === "user")
-        const nudged = userMsgs.some((m) =>
-          m.parts.some((p) => p.type === "text" && p.text === SessionAutosteer.NUDGE_TEXT),
-        )
-        expect(nudged).toBe(true)
+        expect(second.nudgeText).toBe(SessionAutosteer.NUDGE_TEXT)
+        // Post round-4 consolidation, `evaluateSession` is detection-only
+        // and does NOT append a synthetic user message — that is the
+        // runLoop's job via the `Inject` directive. See the
+        // "registered postIteration observer emits Inject directive on nudge"
+        // test below for the full hook-driven pathway.
       },
     })
   })
@@ -154,16 +151,32 @@ describe("SessionAutosteerObserver", () => {
     })
   })
 
-  test("cumulative nudge counter accumulates across nudges", async () => {
+  test("cumulative nudge counter accumulates across nudges via postIteration path", async () => {
     await Instance.provide({
       directory: projectRoot,
       fn: async () => {
         const session = await createSession({})
         await appendAssistantText(session.id, "My plan is to refactor.")
-        await evaluateSession(session.id)
+        await AppRuntime.runPromise(
+          AdaptiveHooks.Service.use((svc) =>
+            svc.runPostIteration({
+              sessionID: session.id as any,
+              step: 1,
+              defaultOutcome: "continue",
+            }),
+          ),
+        )
         await appendAssistantText(session.id, "Here's my plan: refactor again.")
-        const second = await evaluateSession(session.id)
-        expect(second.nudge).toBe(true)
+        const merged = await AppRuntime.runPromise(
+          AdaptiveHooks.Service.use((svc) =>
+            svc.runPostIteration({
+              sessionID: session.id as any,
+              step: 2,
+              defaultOutcome: "continue",
+            }),
+          ),
+        )
+        expect(merged.kind).toBe("inject")
 
         const total = await AppRuntime.runPromise(
           SessionAutosteerObserver.Service.use((svc) => svc.cumulativeNudgeCount()),

@@ -11,23 +11,23 @@ import { SessionAutosteer } from "./autosteer"
 import { AdaptiveHooks } from "./adaptive"
 
 /**
- * Autosteer observer (round 3).
+ * Autosteer observer (round 4 consolidation).
  *
  * Ported to the {@link AdaptiveHooks} pipeline — round 1's
  * `Bus.subscribeCallback(SessionStatus.Event.Idle)` has been removed.
- * Stagnation detection now runs in a `postIteration` observer so the hook
+ * Stagnation detection runs in a `postIteration` observer so the hook
  * runner arbitrates directive precedence (`break` > `inject` > `continue`)
  * between autosteer, autobest, and any other registered observers.
  *
- * The observer no longer calls `Session.Service.appendUserText` itself —
- * that is now the runLoop's responsibility via the `Inject` directive
- * plumbing in `prompt.ts`. This avoids racing a bus-thread `appendUserText`
- * against the runLoop's next iteration.
+ * Round-4 consolidation removed the legacy `{inject: true}` back-compat
+ * path: `evaluateSession` is now pure detection and never appends a user
+ * message itself. All nudge injection flows through the postIteration
+ * observer's `Inject` directive, which the runLoop handles by calling
+ * `Session.Service.appendUserText` with the enclosing turn's
+ * agent/model/provider context (see `prompt.ts` post-iteration branch).
  *
  * The Service interface is preserved for the TUI sidebar + server routes
- * (autosteering toggle, cumulative nudge count). Tests call
- * `evaluateSession` with `{inject: true}` to retain the round-2
- * append-user-message side-effect; the hook pathway passes `{inject: false}`.
+ * (autosteering toggle, cumulative nudge count).
  */
 export namespace SessionAutosteerObserver {
   export interface Interface {
@@ -35,18 +35,12 @@ export namespace SessionAutosteerObserver {
     readonly getCount: (sessionID: SessionID) => Effect.Effect<number>
     /**
      * Evaluate now against the last two assistant messages. Returns the
-     * evaluation outcome plus (optionally) the text the runner should
-     * inject as a synthetic user turn.
-     *
-     * @param opts.inject — when `true` (the default, for back-compat with
-     *   the round-2 test suite), performs the legacy side-effect of
-     *   appending a synthetic user message via `Session.Service.appendUserText`
-     *   when a nudge fires. The hook-driven path passes `false`.
+     * evaluation outcome plus the text the runner should inject as a
+     * synthetic user turn. Detection-only — after round-4 consolidation
+     * this method never mutates session state; actual injection happens
+     * via the registered `postIteration` observer (see layer body).
      */
-    readonly evaluateSession: (
-      sessionID: SessionID,
-      opts?: { inject?: boolean },
-    ) => Effect.Effect<{
+    readonly evaluateSession: (sessionID: SessionID) => Effect.Effect<{
       stagnant: boolean
       nudge: boolean
       count: number
@@ -93,7 +87,6 @@ export namespace SessionAutosteerObserver {
     Service,
     Effect.gen(function* () {
       const bus = yield* Bus.Service
-      const session = yield* Session.Service
       const config = yield* Config.Service
       const adaptive = yield* AdaptiveHooks.Service
 
@@ -143,7 +136,7 @@ export namespace SessionAutosteerObserver {
           return new Map(map) as ReadonlyMap<SessionID, number>
         })
 
-      const evaluateSession: Interface["evaluateSession"] = (sessionID, opts) =>
+      const evaluateSession: Interface["evaluateSession"] = (sessionID) =>
         Effect.gen(function* () {
           const enabled = yield* isEnabled()
           if (!enabled) return { stagnant: false, nudge: false, count: 0 }
@@ -182,26 +175,6 @@ export namespace SessionAutosteerObserver {
           }
           const out = SessionAutosteer.evaluate(state, latest, thresholds)
           map.set(sessionID, out.nextState)
-
-          if (out.nudge) {
-            // Backwards-compatible side-effect path — when the caller opts
-            // into direct injection (default), persist the nudge as a
-            // synthetic user message exactly as round-2 did.
-            if (opts?.inject !== false) {
-              yield* session.appendUserText({
-                sessionID,
-                text: SessionAutosteer.NUDGE_TEXT,
-                synthetic: true,
-              })
-            }
-            const counts = yield* InstanceState.get(nudgeCounts)
-            const nextLifetime = (counts.get(sessionID) ?? 0) + 1
-            counts.set(sessionID, nextLifetime)
-            yield* bus.publish(Event.NudgeInjected, {
-              sessionID,
-              count: nextLifetime,
-            })
-          }
           return {
             stagnant: out.stagnant,
             nudge: out.nudge,
@@ -210,19 +183,27 @@ export namespace SessionAutosteerObserver {
           }
         })
 
-      // Register postIteration observer — replaces the round-2
-      // Bus.subscribeCallback(SessionStatus.Event.Idle) path. The runLoop
+      // Register postIteration observer — this is the single entrypoint
+      // for autosteer behavior after round-4 consolidation. The runLoop
       // invokes `runPostIteration` at the end of each assistant step; we
-      // evaluate stagnation and surface `Inject` so the runner appends the
-      // synthetic user message and continues the loop. We pass
-      // `inject: false` to `evaluateSession` so the runner (not this
-      // observer) performs the append — prevents double-injection.
+      // evaluate stagnation and surface `Inject` so the runner appends
+      // the synthetic user message (with the turn's agent/model/provider
+      // context preserved) and continues the loop. Cumulative-nudge
+      // telemetry is updated here so it tracks real nudge injections
+      // only — evaluateSession itself is detection-only.
       yield* adaptive.register({
         name: "autosteer",
         postIteration: (_state, args) =>
           Effect.gen(function* () {
-            const out = yield* evaluateSession(args.sessionID, { inject: false })
+            const out = yield* evaluateSession(args.sessionID)
             if (!out.nudge || !out.nudgeText) return AdaptiveHooks.Continue
+            const counts = yield* InstanceState.get(nudgeCounts)
+            const nextLifetime = (counts.get(args.sessionID) ?? 0) + 1
+            counts.set(args.sessionID, nextLifetime)
+            yield* bus.publish(Event.NudgeInjected, {
+              sessionID: args.sessionID,
+              count: nextLifetime,
+            })
             return AdaptiveHooks.Inject({
               text: out.nudgeText,
               source: "autosteer:nudge",
