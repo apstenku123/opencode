@@ -19,6 +19,8 @@ import { Discovery } from "./discovery"
 import { Bm25Index } from "./bm25"
 import { hybridRank, type HybridHit, type HybridWeights } from "./retrieval"
 import { cosineSimilarity } from "@/embedding"
+import { builtinSkillsEnabled, loadAllBuiltinSkills } from "./builtin"
+import { buildRoutedRanking, type RouterKind, type RoutedSkill } from "./router"
 
 const log = Log.create({ service: "skill" })
 const EXTERNAL_DIRS = [".claude", ".agents"]
@@ -118,6 +120,23 @@ export interface Interface {
    * disk-scanned state — it does not touch disk itself.
    */
   readonly notifyHotInserted: (skill: Info) => Effect.Effect<void>
+  /**
+   * Memento-style router search. Dispatches to
+   * {@link buildRoutedRanking} with the configured kind
+   * (`skills.router.kind`; defaults to `"bm25"` for parity). Returns the
+   * scored `RoutedSkill` rows so callers can inspect each channel's
+   * contribution. When the query produces no matches the list is empty;
+   * callers typically fall back to substring `recommend()`.
+   */
+  readonly searchRouted: (input: {
+    query: string
+    topK?: number
+    kind?: RouterKind
+    /** Per-skill cosine scores (optional). Feeds the RRF / Boltzmann paths. */
+    cosineScores?: ReadonlyMap<string, number>
+    /** Per-skill historical success rate 0–1. Missing ⇒ 0. */
+    utilityTable?: ReadonlyMap<string, number>
+  }) => Effect.Effect<RoutedSkill[]>
 }
 
 const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.Interface) {
@@ -192,6 +211,33 @@ const scan = Effect.fnUntraced(function* (
   })
 })
 
+/**
+ * Register the 8 bundled built-in skills into the live state. Pure
+ * filesystem-free path: reads the markdown via `Bun.file()` relative to
+ * `src/skill/builtin/` and hands each entry to `add()` so it shares the
+ * same frontmatter validator as disk-discovered skills.
+ */
+const registerBuiltinSkills = Effect.fnUntraced(function* (state: State, bus: Bus.Interface) {
+  const bundle = yield* Effect.tryPromise({
+    try: () => loadAllBuiltinSkills(),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch(
+      Effect.fnUntraced(function* (err) {
+        log.error("failed to load builtin skills", { err })
+        return [] as Awaited<ReturnType<typeof loadAllBuiltinSkills>>
+      }),
+    ),
+  )
+  for (const entry of bundle) {
+    // The `add()` helper parses the markdown frontmatter and writes into
+    // `state.skills`. We pass the real bundle location so the display
+    // path points at the built-in SKILL.md rather than a synthetic URI.
+    yield* add(state, entry.location, bus)
+  }
+  log.info("registered builtin skills", { count: bundle.length, names: bundle.map((s) => s.name) })
+})
+
 const loadSkills = Effect.fnUntraced(function* (
   state: State,
   config: Config.Interface,
@@ -223,6 +269,15 @@ const loadSkills = Effect.fnUntraced(function* (
   }
 
   const cfg = yield* config.get()
+
+  // Built-in skill bundle — opt-in via `skills.builtin: true` or override
+  // via `OPENCODE_DISABLE_BUILTIN_SKILLS=1`. Skills parsed from the
+  // embedded markdown are registered under their declared frontmatter
+  // name; any disk-discovered skill with the same name overrides.
+  if (builtinSkillsEnabled(cfg.skills?.builtin)) {
+    yield* registerBuiltinSkills(state, bus)
+  }
+
   for (const item of cfg.skills?.paths ?? []) {
     const expanded = item.startsWith("~/") ? path.join(os.homedir(), item.slice(2)) : item
     const dir = path.isAbsolute(expanded) ? expanded : path.join(directory, expanded)
@@ -363,7 +418,37 @@ export const layer = Layer.effect(
       return hybridRank(list, bm25Hits, cosineScores, topK, input.weights)
     })
 
-    return Service.of({ get, all, dirs, available, notifyHotInserted, search, searchHybrid })
+    const searchRouted = Effect.fn("Skill.searchRouted")(function* (input: {
+      query: string
+      topK?: number
+      kind?: RouterKind
+      cosineScores?: ReadonlyMap<string, number>
+      utilityTable?: ReadonlyMap<string, number>
+    }) {
+      const s = yield* InstanceState.get(state)
+      const list = Object.values(s.skills)
+      if (list.length === 0) return [] as RoutedSkill[]
+      if (!s.bm25) s.bm25 = Bm25Index.build(list)
+      const cfg = yield* config.get()
+      const routerCfg = cfg.skills?.router ?? {}
+      const kind = input.kind ?? routerCfg.kind ?? "bm25"
+      return buildRoutedRanking({
+        skills: list,
+        query: input.query,
+        bm25: s.bm25,
+        cosineScores: input.cosineScores,
+        utilityTable: input.utilityTable,
+        kind,
+        config: {
+          utilityWeight: routerCfg.utilityWeight,
+          temperature: routerCfg.temperature,
+          minScoreThreshold: routerCfg.minScoreThreshold,
+          maxCandidates: input.topK ?? routerCfg.maxCandidates,
+        },
+      })
+    })
+
+    return Service.of({ get, all, dirs, available, notifyHotInserted, search, searchHybrid, searchRouted })
   }),
 )
 

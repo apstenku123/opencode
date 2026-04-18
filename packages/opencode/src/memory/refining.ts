@@ -36,10 +36,11 @@
  * exercise every branch without spinning up a model client.
  */
 
-import { Effect, Option } from "effect"
+import { Effect } from "effect"
 
 import type { DefectSextuple, DefectSextupleInput } from "./schema"
 import { cleanKeywords, validateInput } from "./schema"
+import { polishCandidate } from "./refining-llm"
 
 // --------------------------------------------------------------------------
 // Constants
@@ -482,36 +483,20 @@ export function refineSextuple(
         path: "kept-verbatim" as const,
       }
     }
-    const prompt = buildRefiningPrompt(input.candidate, score)
-    const raw: string | null = yield* options
-      .model(prompt)
-      .pipe(
-        Effect.timeoutOption(options.timeoutMs ?? POLISH_TIMEOUT_MS),
-        Effect.catchCause(() => Effect.succeed(Option.none<string | null>())),
-        Effect.map((opt) => Option.match(opt, { onNone: () => null, onSome: (v) => v ?? null })),
-      )
-    if (!raw) {
-      return {
-        refined: input.candidate,
-        score,
-        reason: "polish LLM unavailable — keeping candidate verbatim",
-        path: "kept-verbatim" as const,
-      }
-    }
-    const polished = parseRefiningResponse(raw)
-    if (!polished) {
-      return {
-        refined: input.candidate,
-        score,
-        reason: "polish parse failure — keeping candidate verbatim",
-        path: "kept-verbatim" as const,
-      }
-    }
-    return {
-      refined: polished,
+    // Delegate to the dedicated polish layer. This keeps the 4-signal
+    // gate (above) and the polish stage on separate code paths so
+    // downstream callers can reach for just the polish when they already
+    // have a score.
+    const polish = yield* polishCandidate({
+      candidate: input.candidate,
       score,
-      reason: "polish ok",
-      path: "llm-polished" as const,
+      options: { model: options.model, timeoutMs: options.timeoutMs },
+    })
+    return {
+      refined: polish.candidate,
+      score,
+      reason: polish.reason,
+      path: polish.path === "polished" ? ("llm-polished" as const) : ("kept-verbatim" as const),
     }
   })
 }
