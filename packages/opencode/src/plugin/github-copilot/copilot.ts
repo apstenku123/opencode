@@ -1118,10 +1118,9 @@ async function reserveSlot(input: {
 }): Promise<{ lease: Lease | undefined; fallbackRelease?: () => void }> {
   if (input.pool) {
     try {
-      const lease = await input.pool.acquire(input.key, {
-        timeoutMs: 5 * 60 * 1000,
-        preferSecondary: input.isAgent,
-      })
+      const lease = input.isAgent
+        ? await input.pool.acquirePreferSecondary(input.key, { timeoutMs: 5 * 60 * 1000 })
+        : await input.pool.acquire(input.key, { timeoutMs: 5 * 60 * 1000 })
       return { lease }
     } catch {
       // fall through to the legacy reservation path so we never deadlock the
