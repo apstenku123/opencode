@@ -2404,6 +2404,9 @@ test("cloudflare-ai-gateway forwards config metadata options", async () => {
   })
 })
 
+// Plugin init hits disk + dynamic import; the default 5s test-boundary flakes
+// under heavy contention (bun --bail repro: ~5001ms). Bump to 60s to match the
+// live-test floor enforced by the harness.
 test("plugin config providers persist after instance dispose", async () => {
   await using tmp = await tmpdir({
     init: async (dir) => {
@@ -2461,7 +2464,7 @@ test("plugin config providers persist after instance dispose", async () => {
   })
   expect(second[ProviderID.make("demo")]).toBeDefined()
   expect(second[ProviderID.make("demo")].models[ModelID.make("chat")]).toBeDefined()
-})
+}, 60_000)
 
 test("plugin config enabled and disabled providers are honored", async () => {
   await using tmp = await tmpdir({
