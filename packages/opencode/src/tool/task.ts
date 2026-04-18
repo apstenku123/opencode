@@ -8,7 +8,8 @@ import { Agent } from "../agent/agent"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "../config"
 import { SubagentRegistry } from "../subagent/registry"
-import { Cause, Effect, Fiber } from "effect"
+import * as Hook from "../hook"
+import { Cause, Effect, Fiber, Option } from "effect"
 
 /**
  * Max wait for an available Copilot slot before giving up and returning
@@ -179,6 +180,27 @@ export const TaskTool = Tool.define(
 
       const messageID = MessageID.ascending()
 
+      // Round 7 Stream 3: fire `SubagentStart` for every spawn (sync + async).
+      // Hook service is a soft dependency — when unavailable (e.g. in unit
+      // tests that don't provide the hook layer) we silently skip dispatch.
+      const hookOpt = yield* Effect.serviceOption(Hook.Service)
+      const fireSubagentStart = Effect.gen(function* () {
+        if (Option.isNone(hookOpt)) return
+        yield* hookOpt.value
+          .dispatch({
+            event: {
+              hook_event_name: "SubagentStart",
+              agent_id: nextSession.id,
+              agent_type: next.name,
+              parent_session_id: ctx.sessionID,
+              child_session_id: nextSession.id,
+              prompt: params.prompt,
+            },
+            sessionID: ctx.sessionID,
+          })
+          .pipe(Effect.ignore)
+      })
+
       function cancel() {
         ops.cancel(nextSession.id)
       }
@@ -272,7 +294,9 @@ export const TaskTool = Tool.define(
         let cancelFiber: (() => void) | undefined
         yield* subagents.spawn(SessionID.make(ctx.sessionID), nextSession.id, {
           cancel: () => cancelFiber?.(),
+          agentType: next.name,
         })
+        yield* fireSubagentStart
         const runChild = Effect.gen(function* () {
           const parts = yield* ops.resolvePromptParts(params.prompt)
           return yield* ops.prompt({
@@ -327,6 +351,37 @@ export const TaskTool = Tool.define(
         }
       }
 
+      // Synchronous variant also fires SubagentStart before the child runs.
+      // SubagentStop is fired on completion / failure / cancellation below —
+      // the sync variant doesn't go through SubagentRegistry.close, so we
+      // dispatch the stop event directly here (mirrors what the registry's
+      // close() does for async spawns).
+      yield* fireSubagentStart
+      const fireSubagentStopSync = (opts: {
+        reason: "completed" | "cancelled" | "failed"
+        summary: string
+        lastAssistantMessage: string | null
+      }) =>
+        Effect.gen(function* () {
+          if (Option.isNone(hookOpt)) return
+          yield* hookOpt.value
+            .dispatch({
+              event: {
+                hook_event_name: "SubagentStop",
+                stop_hook_active: false,
+                agent_id: nextSession.id,
+                agent_type: next.name,
+                parent_session_id: ctx.sessionID,
+                child_session_id: nextSession.id,
+                summary: opts.summary,
+                reason: opts.reason,
+                last_assistant_message: opts.lastAssistantMessage,
+              },
+              sessionID: ctx.sessionID,
+            })
+            .pipe(Effect.ignore)
+        })
+
       return yield* Effect.acquireUseRelease(
         Effect.sync(() => {
           ctx.abort.addEventListener("abort", cancel)
@@ -334,18 +389,44 @@ export const TaskTool = Tool.define(
         () =>
           Effect.gen(function* () {
             const parts = yield* ops.resolvePromptParts(params.prompt)
-            const result = yield* ops.prompt({
-              messageID,
-              sessionID: nextSession.id,
-              model: {
-                modelID: model.modelID,
-                providerID: model.providerID,
+            const result = yield* Effect.matchCauseEffect(
+              ops.prompt({
+                messageID,
+                sessionID: nextSession.id,
+                model: {
+                  modelID: model.modelID,
+                  providerID: model.providerID,
+                },
+                agent: next.name,
+                tools: childTools,
+                parts,
+              }),
+              {
+                onSuccess: (value) =>
+                  Effect.gen(function* () {
+                    const text = value.parts.findLast((item) => item.type === "text")?.text ?? ""
+                    yield* fireSubagentStopSync({
+                      reason: "completed",
+                      summary: text,
+                      lastAssistantMessage: text.length > 0 ? text : null,
+                    })
+                    return { ok: true as const, value }
+                  }),
+                onFailure: (cause) =>
+                  Effect.gen(function* () {
+                    const reason: "cancelled" | "failed" = Cause.hasInterruptsOnly(cause)
+                      ? "cancelled"
+                      : "failed"
+                    yield* fireSubagentStopSync({
+                      reason,
+                      summary: reason === "failed" ? Cause.pretty(cause) : "",
+                      lastAssistantMessage: null,
+                    })
+                    return { ok: false as const, cause }
+                  }),
               },
-              agent: next.name,
-              tools: childTools,
-              parts,
-            })
-
+            )
+            if (!result.ok) return yield* Effect.failCause(result.cause)
             return {
               title: params.description,
               metadata: {
@@ -356,7 +437,7 @@ export const TaskTool = Tool.define(
                 `task_id: ${nextSession.id} (for resuming to continue this task if needed)`,
                 "",
                 "<task_result>",
-                result.parts.findLast((item) => item.type === "text")?.text ?? "",
+                result.value.parts.findLast((item) => item.type === "text")?.text ?? "",
                 "</task_result>",
               ].join("\n"),
             }

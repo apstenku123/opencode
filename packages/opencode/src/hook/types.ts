@@ -178,6 +178,14 @@ const EventSubagentStart = z.object({
   hook_event_name: z.literal("SubagentStart"),
   agent_id: z.string(),
   agent_type: z.string(),
+  // Round 7 Stream 3: explicit parent / child session identifiers and the
+  // prompt string the subagent was spawned with. `agent_id` aliases the
+  // child_session_id and is retained for wire compatibility with
+  // codex-rs hooks. All three new fields are optional — hooks written
+  // against the original shape keep working.
+  parent_session_id: z.string().optional(),
+  child_session_id: z.string().optional(),
+  prompt: z.string().optional(),
 })
 
 const EventSubagentStop = z.object({
@@ -186,6 +194,13 @@ const EventSubagentStop = z.object({
   agent_id: z.string(),
   agent_type: z.string(),
   last_assistant_message: z.string().nullable().optional(),
+  // Round 7 Stream 3: explicit parent / child session identifiers, the
+  // summary (final assistant text or error message) and a normalized
+  // completion reason. `reason` values: "completed" | "cancelled" | "failed".
+  parent_session_id: z.string().optional(),
+  child_session_id: z.string().optional(),
+  summary: z.string().optional(),
+  reason: z.enum(["completed", "cancelled", "failed"]).optional(),
 })
 
 const EventPermissionRequest = z.object({
