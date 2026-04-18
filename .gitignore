@@ -29,3 +29,9 @@ UPCOMING_CHANGELOG.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+
+# Python e2e harness artefacts
+__pycache__/
+*.pyc
+packages/opencode/test-e2e/.venv/
+packages/opencode/test-e2e/.pytest_cache/

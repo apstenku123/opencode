@@ -1,0 +1,123 @@
+"""SSE parser for opencode's ``GET /event`` stream.
+
+Each ``data:`` line is a JSON object of shape::
+
+    {"type": "<event.name>", "properties": {...}}
+
+This module provides ``SSEEvent`` (a typed NamedTuple-like dataclass) and
+``EventStream`` (an iterable context manager over the SSE connection).
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any, Iterator, Optional
+
+import httpx
+
+
+@dataclass(frozen=True)
+class SSEEvent:
+    """One parsed SSE message."""
+
+    type: str
+    properties: dict[str, Any]
+    raw: str
+
+    @classmethod
+    def from_json(cls, data: str) -> "SSEEvent":
+        obj = json.loads(data)
+        return cls(
+            type=obj.get("type", ""),
+            properties=obj.get("properties", {}) or {},
+            raw=data,
+        )
+
+
+class EventStream:
+    """Iterable context manager over ``GET /event``.
+
+    Example::
+
+        with EventStream(base_url) as events:
+            for ev in events:
+                if ev.type == "session.idle":
+                    break
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout_s: Optional[float] = None,
+        directory: Optional[str] = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        # None read-timeout keeps the SSE connection open across heartbeats.
+        self._timeout = httpx.Timeout(
+            connect=5.0,
+            read=None,
+            write=5.0,
+            pool=5.0,
+        ) if timeout_s is None else httpx.Timeout(timeout_s)
+        self._headers = {"x-opencode-directory": directory} if directory else {}
+        self._client: Optional[httpx.Client] = None
+        self._response: Optional[httpx.Response] = None
+        self._stream_ctx = None
+
+    def __enter__(self) -> "EventStream":
+        self._client = httpx.Client(timeout=self._timeout, headers=self._headers)
+        # ``/event`` is the instance-routed SSE stream. It goes through the
+        # WorkspaceRouterMiddleware which picks up ``x-opencode-directory``.
+        self._stream_ctx = self._client.stream("GET", f"{self.base_url}/event")
+        self._response = self._stream_ctx.__enter__()
+        self._response.raise_for_status()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if self._stream_ctx is not None:
+                self._stream_ctx.__exit__(exc_type, exc, tb)
+        finally:
+            self._stream_ctx = None
+            self._response = None
+            if self._client is not None:
+                self._client.close()
+                self._client = None
+
+    def __iter__(self) -> Iterator[SSEEvent]:
+        if self._response is None:
+            raise RuntimeError("EventStream used outside its context manager")
+        yield from _iter_sse(self._response)
+
+
+def _iter_sse(response: httpx.Response) -> Iterator[SSEEvent]:
+    """Parse SSE frames from an httpx streaming response.
+
+    Follows the basic ``data: ...\\n\\n`` framing. Multiple data lines in one
+    frame are concatenated with newlines (per the SSE spec).
+    """
+    buf: list[str] = []
+    for line in response.iter_lines():
+        # httpx yields already-decoded str lines (no CR/LF).
+        if line == "":
+            if buf:
+                data = "\n".join(buf)
+                buf = []
+                try:
+                    yield SSEEvent.from_json(data)
+                except json.JSONDecodeError:
+                    # Skip non-JSON frames rather than crashing the test.
+                    continue
+            continue
+        if line.startswith(":"):
+            # SSE comment — heartbeat or keepalive, skip.
+            continue
+        if line.startswith("data:"):
+            # Per spec: one optional space after the colon.
+            payload = line[5:]
+            if payload.startswith(" "):
+                payload = payload[1:]
+            buf.append(payload)
+        # Other SSE fields (event:, id:, retry:) are ignored — opencode doesn't use them.

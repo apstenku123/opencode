@@ -6,6 +6,7 @@ import { lazy } from "@/util/lazy"
 import { AuthMiddleware, CompressionMiddleware, CorsMiddleware, ErrorMiddleware, LoggerMiddleware } from "./middleware"
 import { FenceMiddleware } from "./fence"
 import { InstanceRoutes } from "./instance"
+import { WorkspaceRouterMiddleware } from "./instance/middleware"
 import { initProjectors } from "./projectors"
 import { Log } from "@/util"
 import { Flag } from "@/flag/flag"
@@ -55,6 +56,7 @@ export namespace Server {
         .use(LoggerMiddleware)
         .use(CompressionMiddleware)
         .use(CorsMiddleware(opts))
+        .use(WorkspaceRouterMiddleware(runtime.upgradeWebSocket))
         .route("/", ControlPlaneRoutes())
         .route("/", InstanceRoutes(runtime.upgradeWebSocket))
         .route("/", UIRoutes()),
