@@ -1,5 +1,5 @@
 import { afterEach, describe, expect } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { Config } from "../../src/config"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
@@ -75,6 +75,7 @@ function stubOps(opts?: { onPrompt?: (input: SessionPrompt.PromptInput) => void;
         opts?.onPrompt?.(input)
         return reply(input, opts?.text ?? "done")
       }),
+    fork: (effect) => Effect.runFork(effect),
   }
 }
 

@@ -9,7 +9,7 @@
  * (verified in `test/subagent/registry-hooks.test.ts`).
  */
 import { afterEach, describe, expect } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Fiber, Layer } from "effect"
 import { Agent } from "../../src/agent/agent"
 import { Config } from "../../src/config"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
@@ -145,6 +145,7 @@ function stubOps(opts?: {
           ],
         } satisfies MessageV2.WithParts
       }),
+    fork: (effect) => Effect.runFork(effect),
   }
 }
 
@@ -295,6 +296,7 @@ describe("tool.task hook events", () => {
           resolvePromptParts: (template) =>
             Effect.succeed([{ type: "text" as const, text: template }]),
           prompt: () => Effect.never,
+          fork: (effect) => Effect.runFork(effect),
         }
         const result = yield* def.execute(
           {

@@ -104,6 +104,7 @@ function stubOps(text = "done"): TaskPromptOps {
           ],
         } as MessageV2.WithParts
       }),
+    fork: (effect) => Effect.runFork(effect),
   }
 }
 
