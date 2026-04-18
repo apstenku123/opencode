@@ -324,6 +324,16 @@ def test_accounts_json_schema(accounts: dict[str, dict[str, Any]]) -> None:
     for key, item in accounts.items():
         status = item["status"]
 
+        # Synthetic test-pool accounts (github-copilot#edu-*) are
+        # registered from config/env and don't have an upstream quota
+        # probe yet — their status shape includes the new fields but
+        # login/plan/quota are empty. Skip the live-only assertions for
+        # these; they're covered by the separate edu-pool membership
+        # test below.
+        if "#edu-" in key:
+            assert status.get("pool") == "edu", f"{key}: expected pool=edu for test-pool key"
+            continue
+
         # Core identity fields.
         assert isinstance(status.get("login"), str) and status["login"], (
             f"{key}: login missing/empty"
