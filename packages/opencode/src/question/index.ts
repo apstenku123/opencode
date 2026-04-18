@@ -2,6 +2,7 @@ import { Deferred, Effect, Layer, Schema, Context } from "effect"
 import { Bus } from "@/bus"
 import { BusEvent } from "@/bus/bus-event"
 import { InstanceState } from "@/effect"
+import * as Hook from "@/hook"
 import { SessionID, MessageID } from "@/session/schema"
 import { zod } from "@/util/effect-zod"
 import { Log } from "@/util"
@@ -149,6 +150,7 @@ export namespace Question {
     Service,
     Effect.gen(function* () {
       const bus = yield* Bus.Service
+      const hooks = yield* Hook.Service
       const state = yield* InstanceState.make<State>(
         Effect.fn("Question.state")(function* () {
           const state = {
@@ -187,6 +189,79 @@ export namespace Question {
         pending.set(id, { info, deferred })
         yield* bus.publish(Event.Asked, info)
 
+        // Tool-bound questions behave as permission requests: fire the
+        // PermissionRequest hook AFTER registering so pollers see pending
+        // immediately. A hook returning `permissionDecision = allow|deny`
+        // short-circuits the interactive prompt — we remove the pending
+        // entry and synthesise an answer (allow) or reject (deny).
+        if (input.tool) {
+          const hookResult = yield* hooks.dispatch({
+            event: {
+              hook_event_name: "PermissionRequest",
+              tool_name: "question",
+              tool_input: {
+                questions: input.questions,
+                tool: input.tool,
+              },
+            },
+            sessionID: input.sessionID,
+          })
+
+          if (hookResult.outcome === "abort") {
+            pending.delete(id)
+            yield* hooks
+              .dispatch({
+                event: {
+                  hook_event_name: "PermissionDenied",
+                  tool_name: "question",
+                  tool_input: { questions: input.questions, tool: input.tool },
+                  source: "hook",
+                  reason: hookResult.abortReason,
+                },
+                sessionID: input.sessionID,
+              })
+              .pipe(Effect.ignore)
+            return yield* Effect.fail(new RejectedError())
+          }
+
+          if (hookResult.decisionBehavior === "allow") {
+            pending.delete(id)
+            yield* hooks
+              .dispatch({
+                event: {
+                  hook_event_name: "PermissionGranted",
+                  tool_name: "question",
+                  tool_input: { questions: input.questions, tool: input.tool },
+                  source: "hook",
+                },
+                sessionID: input.sessionID,
+              })
+              .pipe(Effect.ignore)
+            const synthesized: Answer[] = input.questions.map((q) => {
+              const first = q.options[0]
+              return first ? [first.label] : []
+            })
+            return synthesized as ReadonlyArray<Answer>
+          }
+
+          if (hookResult.decisionBehavior === "deny") {
+            pending.delete(id)
+            yield* hooks
+              .dispatch({
+                event: {
+                  hook_event_name: "PermissionDenied",
+                  tool_name: "question",
+                  tool_input: { questions: input.questions, tool: input.tool },
+                  source: "hook",
+                  reason: hookResult.decisionMessage,
+                },
+                sessionID: input.sessionID,
+              })
+              .pipe(Effect.ignore)
+            return yield* Effect.fail(new RejectedError())
+          }
+        }
+
         return yield* Effect.ensuring(
           Deferred.await(deferred),
           Effect.sync(() => {
@@ -212,6 +287,23 @@ export namespace Question {
           requestID: existing.info.id,
           answers: input.answers,
         })
+        if (existing.info.tool) {
+          yield* hooks
+            .dispatch({
+              event: {
+                hook_event_name: "PermissionGranted",
+                tool_name: "question",
+                tool_input: {
+                  questions: existing.info.questions,
+                  tool: existing.info.tool,
+                  answers: input.answers,
+                },
+                source: "once",
+              },
+              sessionID: existing.info.sessionID,
+            })
+            .pipe(Effect.ignore)
+        }
         yield* Deferred.succeed(existing.deferred, input.answers)
       })
 
@@ -228,6 +320,19 @@ export namespace Question {
           sessionID: existing.info.sessionID,
           requestID: existing.info.id,
         })
+        if (existing.info.tool) {
+          yield* hooks
+            .dispatch({
+              event: {
+                hook_event_name: "PermissionDenied",
+                tool_name: "question",
+                tool_input: { questions: existing.info.questions, tool: existing.info.tool },
+                source: "reject",
+              },
+              sessionID: existing.info.sessionID,
+            })
+            .pipe(Effect.ignore)
+        }
         yield* Deferred.fail(existing.deferred, new RejectedError())
       })
 
@@ -240,5 +345,5 @@ export namespace Question {
     }),
   )
 
-  export const defaultLayer = layer.pipe(Layer.provide(Bus.layer))
+  export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(Hook.defaultLayer))
 }

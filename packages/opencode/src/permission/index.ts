@@ -2,6 +2,7 @@ import { Bus } from "@/bus"
 import { BusEvent } from "@/bus/bus-event"
 import { ConfigPermission } from "@/config/permission"
 import { InstanceState } from "@/effect"
+import * as Hook from "@/hook"
 import { ProjectID } from "@/project/schema"
 import { MessageID, SessionID } from "@/session/schema"
 import { PermissionTable } from "@/session/session.sql"
@@ -185,6 +186,7 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
+    const hooks = yield* Hook.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
         const row = Database.use((db) =>
@@ -217,6 +219,17 @@ export const layer = Layer.effect(
         const rule = evaluate(request.permission, pattern, ruleset, approved)
         log.info("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
+          yield* hooks
+            .dispatch({
+              event: {
+                hook_event_name: "PermissionDenied",
+                tool_name: request.permission,
+                tool_input: request.metadata,
+                source: "rule",
+              },
+              sessionID: request.sessionID,
+            })
+            .pipe(Effect.ignore)
           return yield* new DeniedError({
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
@@ -225,7 +238,20 @@ export const layer = Layer.effect(
         needsAsk = true
       }
 
-      if (!needsAsk) return
+      if (!needsAsk) {
+        yield* hooks
+          .dispatch({
+            event: {
+              hook_event_name: "PermissionGranted",
+              tool_name: request.permission,
+              tool_input: request.metadata,
+              source: "rule",
+            },
+            sessionID: request.sessionID,
+          })
+          .pipe(Effect.ignore)
+        return
+      }
 
       const id = request.id ?? PermissionID.ascending()
       const info = Schema.decodeUnknownSync(Request)({
@@ -237,6 +263,76 @@ export const layer = Layer.effect(
       const deferred = yield* Deferred.make<void, RejectedError | CorrectedError>()
       pending.set(id, { info, deferred })
       yield* bus.publish(Event.Asked, info)
+
+      // Fire PermissionRequest hook AFTER registering the request so that
+      // callers polling `/list` see the pending entry immediately while a
+      // potentially slow hook dispatch runs. A hook returning
+      // `permissionDecision = allow|deny` short-circuits the interactive
+      // prompt — we remove the pending entry and resolve the Deferred
+      // synthetically in that case.
+      const hookResult = yield* hooks.dispatch({
+        event: {
+          hook_event_name: "PermissionRequest",
+          tool_name: request.permission,
+          tool_input: request.metadata,
+        },
+        sessionID: request.sessionID,
+      })
+
+      if (hookResult && hookResult.outcome === "abort") {
+        pending.delete(id)
+        yield* hooks
+          .dispatch({
+            event: {
+              hook_event_name: "PermissionDenied",
+              tool_name: request.permission,
+              tool_input: request.metadata,
+              source: "hook",
+              reason: hookResult.abortReason,
+            },
+            sessionID: request.sessionID,
+          })
+          .pipe(Effect.ignore)
+        return yield* new DeniedError({
+          ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
+        })
+      }
+
+      if (hookResult && hookResult.decisionBehavior === "allow") {
+        pending.delete(id)
+        yield* hooks
+          .dispatch({
+            event: {
+              hook_event_name: "PermissionGranted",
+              tool_name: request.permission,
+              tool_input: request.metadata,
+              source: "hook",
+            },
+            sessionID: request.sessionID,
+          })
+          .pipe(Effect.ignore)
+        return
+      }
+
+      if (hookResult && hookResult.decisionBehavior === "deny") {
+        pending.delete(id)
+        yield* hooks
+          .dispatch({
+            event: {
+              hook_event_name: "PermissionDenied",
+              tool_name: request.permission,
+              tool_input: request.metadata,
+              source: "hook",
+              reason: hookResult.decisionMessage,
+            },
+            sessionID: request.sessionID,
+          })
+          .pipe(Effect.ignore)
+        return yield* new DeniedError({
+          ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
+        })
+      }
+
       return yield* Effect.ensuring(
         Deferred.await(deferred),
         Effect.sync(() => {
@@ -258,6 +354,19 @@ export const layer = Layer.effect(
       })
 
       if (input.reply === "reject") {
+        yield* hooks
+          .dispatch({
+            event: {
+              hook_event_name: "PermissionDenied",
+              tool_name: existing.info.permission,
+              tool_input: existing.info.metadata,
+              source: "reject",
+              reason: input.message,
+            },
+            sessionID: existing.info.sessionID,
+          })
+          .pipe(Effect.ignore)
+
         yield* Deferred.fail(
           existing.deferred,
           input.message ? new CorrectedError({ feedback: input.message }) : new RejectedError(),
@@ -271,10 +380,33 @@ export const layer = Layer.effect(
             requestID: item.info.id,
             reply: "reject",
           })
+          yield* hooks
+            .dispatch({
+              event: {
+                hook_event_name: "PermissionDenied",
+                tool_name: item.info.permission,
+                tool_input: item.info.metadata,
+                source: "reject",
+              },
+              sessionID: item.info.sessionID,
+            })
+            .pipe(Effect.ignore)
           yield* Deferred.fail(item.deferred, new RejectedError())
         }
         return
       }
+
+      yield* hooks
+        .dispatch({
+          event: {
+            hook_event_name: "PermissionGranted",
+            tool_name: existing.info.permission,
+            tool_input: existing.info.metadata,
+            source: input.reply === "once" ? "once" : "always",
+          },
+          sessionID: existing.info.sessionID,
+        })
+        .pipe(Effect.ignore)
 
       yield* Deferred.succeed(existing.deferred, undefined)
       if (input.reply === "once") return
@@ -299,6 +431,17 @@ export const layer = Layer.effect(
           requestID: item.info.id,
           reply: "always",
         })
+        yield* hooks
+          .dispatch({
+            event: {
+              hook_event_name: "PermissionGranted",
+              tool_name: item.info.permission,
+              tool_input: item.info.metadata,
+              source: "always",
+            },
+            sessionID: item.info.sessionID,
+          })
+          .pipe(Effect.ignore)
         yield* Deferred.succeed(item.deferred, undefined)
       }
     })
@@ -351,6 +494,6 @@ export function disabled(tools: string[], ruleset: Ruleset): Set<string> {
   return result
 }
 
-export const defaultLayer = layer.pipe(Layer.provide(Bus.layer))
+export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(Hook.defaultLayer))
 
 export * as Permission from "."
