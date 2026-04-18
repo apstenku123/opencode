@@ -107,10 +107,7 @@ export const AppLayer = Layer.mergeAll(
   SessionShare.defaultLayer,
 ).pipe(Layer.provideMerge(Observability.layer))
 
-// TODO(unify-R3): MemoryStorage transitively depends on Database.Service which
-// is resolved via InstanceState context, not an explicit layer. Until we
-// express that dependency properly, narrow the AppLayer R-channel to `never`.
-const rt = ManagedRuntime.make(AppLayer as unknown as Layer.Layer<typeof AppLayer extends Layer.Layer<infer A, any, any> ? A : never, never, never>, { memoMap })
+const rt = ManagedRuntime.make(AppLayer, { memoMap })
 type Runtime = Pick<typeof rt, "runSync" | "runPromise" | "runPromiseExit" | "runFork" | "runCallback" | "dispose">
 const wrap = (effect: Parameters<typeof rt.runSync>[0]) => attach(effect as never) as never
 
