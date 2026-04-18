@@ -49,7 +49,7 @@ import { EffectLogger } from "@/effect"
 import { InstanceState } from "@/effect"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
-import { SessionAutobestObserver, shouldContinue as autobestShouldContinue } from "./autobest-observer"
+import { SessionAutobestObserver } from "./autobest-observer"
 import { AdaptiveHooks } from "./adaptive"
 import { SessionMemoryObserver } from "./memory-observer"
 import { dequeueEnrichmentBlock } from "@/memory/turn-hooks"
@@ -78,24 +78,14 @@ export namespace SessionPrompt {
   const elog = EffectLogger.create({ service: "session.prompt" })
 
   /**
-   * Module-level per-session autobest cycle state.
-   * Tracks iteration count and last stepKind to gate the auto-continue loop.
-   * Reset on explicit user prompt via `prompt()` so each user-initiated turn
-   * starts a fresh cycle.
-   *
-   * NB: round-1 uses a Map for simplicity. Round-2 should migrate this into
-   * durable history events (cf. `docs/codex-rs-migration-plan.md` §3.2).
+   * Round-4 consolidation (§3.2 #12) retired the module-level
+   * `autobestCycleState` / `autobestPendingContinuations` maps and the
+   * inline extract-and-continue block in `runLoop`. Cycle state now lives
+   * in durable `autobest.cycle.advance` / `autobest.cycle.reset` history
+   * events managed by the autobest observer. Per-cycle AdaptiveState
+   * reset at user-message boundary is handled by `adaptive.resetCycleFor`
+   * in the `prompt()` entrypoint.
    */
-  export const autobestCycleState = new Map<string, { iteration: number; stepKind: "a" | "b" | "c" | "d" }>()
-  export const DEFAULT_AUTOBEST_MAX_ITERATIONS = 3
-  /**
-   * Session ids with an in-flight autobest continuation.
-   * When `prompt()` sees the sessionID is NOT in this set, the incoming prompt
-   * is treated as user-initiated and resets the cycle counter. When it IS in
-   * the set, we leave the cycle counter alone and remove the entry so the next
-   * `prompt()` call resets again.
-   */
-  export const autobestPendingContinuations = new Set<string>()
 
   /**
    * Default per-hook timeout (ms) for {@link runStopHook} when the config
@@ -1469,16 +1459,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
         function* (input: PromptInput) {
-          // Reset autobest cycle on user-initiated prompts (not autobest continuations).
-          if (autobestPendingContinuations.has(input.sessionID)) {
-            autobestPendingContinuations.delete(input.sessionID)
-          } else {
-            autobestCycleState.delete(input.sessionID)
-            // Fresh user-message boundary — reset per-cycle AdaptiveState
-            // counters. Preserves cross-cycle scratch state such as the
-            // injectCount diagnostic counter.
-            yield* adaptive.resetCycleFor(input.sessionID)
-          }
+          // Fresh user-message boundary — reset per-cycle AdaptiveState
+          // counters. Preserves cross-cycle scratch state such as the
+          // injectCount diagnostic counter. Post round-4 consolidation,
+          // autobest auto-continuations re-enter the loop via the
+          // AdaptiveHooks `Inject` directive (synthetic user message),
+          // which does NOT call `prompt()` — so this reset only fires on
+          // truly user-initiated turns as intended.
+          yield* adaptive.resetCycleFor(input.sessionID)
 
           const session = yield* sessions.get(input.sessionID)
           yield* revert.cleanup(session)
@@ -1522,6 +1510,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           yield* memoryObserver
             .ensureRegistered()
             .pipe(Effect.catchCause(() => Effect.void))
+
+          // Lazy-register the autobest post-iteration observer. Consolidated
+          // in round-4 from the former inline `SessionAutobestObserver.extract`
+          // block that lived here — autobest cycle progression (Step A → D),
+          // grounding dispatch, and candidate persistence now all happen in
+          // the registered observer's `postIteration` callback. Already-
+          // resolved services are provided so the ensureRegistered Effect
+          // is R-clean at this scope. MCP is optional (observer uses
+          // `Effect.serviceOption`), so we don't need to provide it here.
+          yield* SessionAutobestObserver.ensureRegistered().pipe(
+            Effect.provideService(AdaptiveHooks.Service, adaptive),
+            Effect.provideService(Session.Service, sessions),
+            Effect.catchCause(() => Effect.void),
+          )
 
           while (true) {
             yield* status.set(sessionID, { type: "busy" })
@@ -1857,65 +1859,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
           yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
           const out = yield* lastAssistant(sessionID)
-          const autobestEnabled = yield* sessions.getAutobestEnabled(sessionID)
-          if (autobestEnabled && out.info.role === "assistant") {
-            const text = out.parts
-              .filter((part): part is MessageV2.TextPart => part.type === "text")
-              .map((part) => part.text.trim())
-              .filter(Boolean)
-              .join("\n")
-            const picks = SessionAutobestObserver.extract(text)
-            if (picks.length) {
-              const applied = yield* sessions
-                .applyAutobest({ sessionID, candidates: picks, ts: Date.now() })
-                .pipe(Effect.match({ onFailure: () => null, onSuccess: (v) => v }))
-
-              if (applied && applied.decision.changed && applied.decision.active) {
-                // Auto-continue feedback loop — port of
-                // `chatwidget.rs::on_autobest_result::submit_user_message`.
-                // Per-session iteration is tracked in-memory and gated by shouldContinue.
-                const prev = autobestCycleState.get(sessionID) ?? { iteration: 0, stepKind: "a" as const }
-                const decision = autobestShouldContinue({
-                  enabled: autobestEnabled,
-                  changed: true,
-                  activeKey: applied.decision.active.key,
-                  cycle: prev,
-                  maxIterations: DEFAULT_AUTOBEST_MAX_ITERATIONS,
-                })
-                if (decision.shouldContinue) {
-                  autobestCycleState.set(sessionID, {
-                    iteration: prev.iteration + 1,
-                    stepKind: "a",
-                  })
-                  yield* continuePrompt(sessionID, applied.decision.active.key).pipe(
-                    Effect.ignore,
-                    Effect.forkIn(scope),
-                  )
-                } else if (decision.reason === "max-iterations-reached") {
-                  // Reset so the next user-initiated turn starts a fresh cycle.
-                  autobestCycleState.delete(sessionID)
-                }
-              }
-            }
-          }
+          // Autobest extract + cycle advance + auto-continuation are now
+          // owned end-to-end by `SessionAutobestObserver` via the
+          // AdaptiveHooks `postIteration` pipeline (see ensureRegistered
+          // call at the top of `runLoop`). The inline duplicate block
+          // was removed during round-4 consolidation.
           return out
         },
       )
-
-      // Continuation submitter — schedules a synthetic user prompt carrying
-      // the autobest top candidate. Delegates to the public `prompt()` helper
-      // so the full run-loop pipeline (including compaction / autobest) re-runs.
-      const continuePrompt = Effect.fn("SessionPrompt.autobestContinue")(function* (
-        sessionID: SessionID,
-        text: string,
-      ) {
-        yield* elog.info("autobest.continue", { sessionID, text })
-        autobestPendingContinuations.add(sessionID)
-        yield* prompt({
-          sessionID,
-          parts: [{ type: "text" as const, text }],
-        } as PromptInput).pipe(Effect.ignore)
-      })
 
       const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
         "SessionPrompt.loop",

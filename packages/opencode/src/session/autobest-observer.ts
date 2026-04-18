@@ -1,4 +1,4 @@
-import { Effect, Layer, Context, Option } from "effect"
+import { Effect, Option } from "effect"
 import { Session } from "./index"
 import { AdaptiveHooks } from "./adaptive"
 import { MessageV2 } from "./message-v2"
@@ -58,8 +58,6 @@ export function shouldContinue(input: {
 }
 
 export namespace SessionAutobestObserver {
-  export interface Interface {}
-
   /**
    * Legacy deterministic bullet-regex extractor.
    * Kept for callers (and existing tests) that expect a synchronous return.
@@ -219,21 +217,17 @@ export namespace SessionAutobestObserver {
           if (decision.kind === "a" && candidates.length) {
             // Step A: persist the candidate via `applyAutobest` (writes
             // `autobest.result` + `autobest.active` history events) and
-            // record the cycle advance. We deliberately do NOT return an
-            // Inject directive here — Step A's auto-continuation needs to
-            // re-enter the loop carrying the original user turn's
-            // agent/model/provider context, which the bare
-            // `appendUserText({ synthetic: true })` path that AdaptiveHooks
-            // Inject uses does not preserve (it tags the synthetic with
-            // `model = { providerID: "manual", modelID: "manual" }` and
-            // breaks the next iteration's provider lookup). Round-3 will
-            // wire a continuation submitter that calls `prompt()` with the
-            // proper context. See round-3 backlog.
-            //
-            // Step B / C below DO Inject — those branches only ever run
-            // when the loop has already produced an assistant turn this
-            // cycle, so the next iteration's `lastUser` lookup walks back
-            // past the synthetic to the original user message.
+            // record the cycle advance. Returns `Continue` without an
+            // Inject directive — the runLoop ends this turn at the
+            // assistant message boundary. Auto-continuation of Step A
+            // (re-entering the loop carrying the top candidate as the
+            // next user turn) is deferred: the old inline
+            // `continuePrompt` path in `prompt.ts` has been removed as
+            // part of the round-4 consolidation, and the hook-driven
+            // replacement lives in Step B/C/D where an assistant message
+            // has already been produced this iteration (so the next
+            // iteration's `lastUser` lookup walks past the synthetic to
+            // the original user message and preserves agent/model context).
             yield* session
               .applyAutobest({ sessionID: args.sessionID, candidates, ts: Date.now() })
               .pipe(Effect.ignore)
@@ -310,8 +304,6 @@ export namespace SessionAutobestObserver {
     return observer
   })
 
-  export class Service extends Context.Service<Service, Interface>()("@opencode/SessionAutobestObserver") {}
-
   /**
    * Per-instance idempotent registration helper. Safe to call multiple
    * times; subsequent calls are no-ops. Intended to be invoked lazily from
@@ -319,9 +311,11 @@ export namespace SessionAutobestObserver {
    * is necessary because {@link AdaptiveHooks.register} writes through
    * `InstanceState` and cannot run at layer-build time.
    *
-   * Returns the deregister function for the observer; deregister is
-   * optional — production callers leave the observer registered for the
-   * lifetime of the instance.
+   * Round-4 consolidation (migration plan §3.2 #12) removed the legacy
+   * marker `Service` / `layer` / `defaultLayer`; the observer now registers
+   * itself directly via this helper and the AdaptiveHooks pipeline is the
+   * single entrypoint for autobest post-iteration behavior (Step A → D,
+   * grounding, candidate persistence, cycle advance).
    */
   const registeredInstances = new WeakSet<object>()
   export const ensureRegistered = Effect.fn("autobest.observer.ensureRegistered")(function* () {
@@ -331,25 +325,6 @@ export namespace SessionAutobestObserver {
     const observer = yield* buildObserver()
     yield* hooks.register(observer)
   })
-
-  /**
-   * Adaptive-hook layer. The observer is registered lazily by the runLoop's
-   * first iteration (see `prompt.ts`) so we are guaranteed to be inside an
-   * Instance scope when the registration touches `InstanceState`. Round-1's
-   * bus-driven `Idle` listener has been removed (migration plan §3.2 #12).
-   *
-   * The layer itself is a no-op marker so callers can express the dependency
-   * in type signatures; the real work happens in {@link ensureRegistered}.
-   */
-  export const layer = Layer.effect(
-    Service,
-    Effect.gen(function* () {
-      // No I/O at layer-build — registration is deferred to first runLoop call.
-      return Service.of({})
-    }),
-  )
-
-  export const defaultLayer = layer
 }
 
 // MessageV2 referenced for parity with the prior file (kept as transitive type).
