@@ -53,8 +53,12 @@ export async function allAuth() {
     // `github-copilot#edu-<N>` so the existing edu-pool filter gates
     // them out of production routing unless
     // `OPENCODE_ALLOW_TEST_ACCOUNTS=1` is set.
+    // `getGlobal()` skips the instance-scoped overlay (project-level
+    // opencode.json) which isn't set up yet in `providers accounts`, and
+    // resolves against the user's global `~/.config/opencode/*` files —
+    // that's where `[copilot.testAccounts]` lives.
     const resolvedCfg = await AppRuntime.runPromise(
-      Config.Service.use((c) => c.get()),
+      Config.Service.use((c) => c.getGlobal()),
     ).catch(() => undefined as unknown)
     const section = (resolvedCfg as { copilot?: { testAccounts?: unknown } } | undefined)?.copilot
       ?.testAccounts as { tokens?: string[]; labels?: string[]; proxyUrls?: string[] } | undefined
