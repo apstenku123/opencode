@@ -573,33 +573,40 @@ export function renderAccountStatus(
 }
 
 export async function loadAccountStatuses() {
+  const DBG = process.env.OPENCODE_DEBUG_PROVIDERS === "1"
+  const log = (m: string) => DBG && process.stderr.write(`[providers] ${m}\n`)
+  log("start allAuth")
   const credentials = await allAuth()
+  log(`allAuth ok (${Object.keys(credentials).length} creds)`)
   const accounts = quotaAccounts(
     credentials as Record<string, { type: string; refresh?: string; enterpriseUrl?: string }>,
   )
-  const state = await readConnections()
+  log(`accounts filtered: ${accounts.length}`)
+  let state = await readConnections()
+  log(`connections loaded (${Object.keys(state.connections).length})`)
   const items = await Promise.all(
     accounts.map(async ([key, info]) => {
+      const proxy = state.connections[key]?.proxyUrl
+        ? { url: state.connections[key]?.proxyUrl, token: state.connections[key]?.proxyToken }
+        : undefined
       try {
-        const quota = await fetchQuota(
-          info.refresh || "",
-          info.enterpriseUrl,
-          state.connections[key]?.proxyUrl
-            ? {
-                url: state.connections[key]?.proxyUrl,
-                token: state.connections[key]?.proxyToken,
-              }
-            : undefined,
-        )
+        log(`fetchQuota ${key} start`)
+        const quota = await fetchQuota(info.refresh || "", info.enterpriseUrl, proxy)
+        log(`fetchQuota ${key} ok`)
         return {
           info,
+          quota,
+          proxy,
           status: accountStatus({ key, state, quota }),
           premium: quota.premium ? formatQuotaBar(quota.premium, quota.resetDate) : "no quota info available",
           ghe: info.enterpriseUrl ?? null,
         }
       } catch (err) {
+        log(`fetchQuota ${key} err: ${err instanceof Error ? err.message : String(err)}`)
         return {
           info,
+          quota: undefined,
+          proxy,
           status: accountStatus({ key, state, quotaError: err instanceof Error ? err.message : String(err) }),
           premium: undefined,
           ghe: info.enterpriseUrl ?? null,
@@ -607,6 +614,82 @@ export async function loadAccountStatuses() {
       }
     }),
   )
+  log(`items resolved (${items.length})`)
+  // Lazy discovery probe: populate Conn.discovery for accounts that haven't
+  // yet been routed through a real provider dispatch. Default on; disable via
+  // OPENCODE_PROBE_DISCOVERY=0. Hard-capped at 8 s so a hanging upstream can
+  // never block the CLI — the display falls back to "Discovery: unknown".
+  const probeEnabled = process.env.OPENCODE_PROBE_DISCOVERY !== "0"
+  if (probeEnabled) {
+    log("probe: discovery start")
+    const { discover } = await import("../../plugin/github-copilot/connections")
+    const { base, proxyHeaders } = await import("../../plugin/github-copilot/copilot")
+    const updates: Array<[string, string[] | null, string | undefined, string, string | undefined, string | undefined]> = []
+    const probeDeadline = new Promise<void>((resolve) => setTimeout(resolve, 8_000))
+    const probePromise = Promise.all(
+      items.map(async (item) => {
+        const key = item.status.key
+        const conn = state.connections[key]
+        if (conn?.discovery?.at) {
+          log(`probe: ${key} already discovered, skip`)
+          return
+        }
+        if (!item.quota) {
+          log(`probe: ${key} no quota, skip`)
+          return
+        }
+        const refresh = item.info.refresh || ""
+        if (!refresh) {
+          log(`probe: ${key} no refresh token, skip`)
+          return
+        }
+        const apiBase = item.quota.api ?? base(item.info.enterpriseUrl)
+        try {
+          log(`probe: ${key} GET ${apiBase}/models start`)
+          const models = await CopilotModels.get(
+            apiBase,
+            {
+              Authorization: `Bearer ${refresh}`,
+              "User-Agent": `opencode/providers-cli`,
+              ...proxyHeaders(item.proxy?.token),
+            },
+            {},
+            item.proxy?.url,
+            item.quota.plan,
+          )
+          const ids = Object.values(models).map((m) => m.api.id)
+          log(`probe: ${key} ok, ${ids.length} models`)
+          updates.push([key, ids, undefined, apiBase, item.quota.plan, item.quota.login])
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          log(`probe: ${key} err: ${msg}`)
+          updates.push([key, null, msg, apiBase, item.quota.plan, item.quota.login])
+        }
+      }),
+    )
+    await Promise.race([probePromise, probeDeadline])
+    for (const [key, ids, err, apiBase, plan, login] of updates) {
+      state = discover(state, key, { models: ids ?? [], api: apiBase, plan, login, ok: !err, err })
+    }
+    if (updates.length > 0) {
+      try {
+        log("probe: persisting connections.json")
+        await Bun.write(connectionFile, JSON.stringify(state, null, 2))
+        log("probe: persisted")
+      } catch (err) {
+        log(`probe: persist err: ${err instanceof Error ? err.message : String(err)}`)
+      }
+      for (const item of items) {
+        item.status = accountStatus({
+          key: item.status.key,
+          state,
+          quota: item.quota,
+          quotaError: item.status.error && !item.quota ? item.status.error : undefined,
+        })
+      }
+    }
+    log("probe: done")
+  }
   return { accounts, state, items }
 }
 

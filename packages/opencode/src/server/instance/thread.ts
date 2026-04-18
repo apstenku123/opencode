@@ -104,6 +104,30 @@ export const ThreadRoutes = () =>
       },
     )
     .post(
+      "/:threadID/autobest/enabled",
+      validator("param", z.object({ threadID: SessionID.zod })),
+      validator("json", z.object({ enabled: z.boolean(), ts: z.number().optional() })),
+      async (c) => {
+        const param = c.req.valid("param")
+        const body = c.req.valid("json")
+        return c.json({ enabled: await AppRuntime.runPromise(Session.Service.use((svc) => svc.setAutobestEnabled({ sessionID: param.threadID, enabled: body.enabled, ts: body.ts }))) })
+      },
+    )
+    .get(
+      "/:threadID/autobest",
+      validator("param", z.object({ threadID: SessionID.zod })),
+      async (c) => {
+        const threadID = c.req.valid("param").threadID
+        const enabled = await AppRuntime.runPromise(Session.Service.use((svc) => svc.getAutobestEnabled(threadID)))
+        const state = await AppRuntime.runPromise(Session.Service.use((svc) => svc.getAutobest(threadID)))
+        return c.json({
+          enabled,
+          active: state.active ?? null,
+          picks: state.picks,
+        })
+      },
+    )
+    .post(
       "/:threadID/autobest/extract",
       validator("param", z.object({ threadID: SessionID.zod })),
       validator(
