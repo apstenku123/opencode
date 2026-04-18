@@ -322,6 +322,9 @@ export namespace SessionPrompt {
           cancel: (sessionID: SessionID) => run.fork(cancel(sessionID)),
           resolvePromptParts: (template: string) => resolvePromptParts(template),
           prompt: (input: PromptInput) => prompt(input),
+          // `fork` forwards to the EffectBridge top-level fork so effects
+          // survive the tool-execute fiber's scope (see task.ts async path).
+          fork: <A, E>(effect: Effect.Effect<A, E>) => run.fork(effect),
         } satisfies TaskPromptOps
       })
 
