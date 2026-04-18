@@ -6,10 +6,13 @@ import {
   emptyDiscovery,
   jsonMigration,
   jsonStatus,
+  loadAccountHealth,
   ProvidersAccountsCommand,
+  ProvidersListCommand,
   ProvidersQuotaCommand,
   ProvidersRouteDebugCommand,
   renderAccountStatus,
+  renderBestPerVendor,
   applyProxy,
   copilotAliasLabel,
   copilotAliasName,
@@ -811,3 +814,129 @@ test("jsonMigration emits stable nullable schema", () => {
     text: "skipped migration, new auth already existed",
   })
 })
+
+describe("renderBestPerVendor", () => {
+  test("returns one display line per account whose discovery snapshot has models", async () => {
+    await seedState({
+      "github-copilot": {
+        discovery: {
+          at: Date.now(),
+          models: ["gpt-5.4", "claude-opus-4.6", "gemini-3.1-pro-preview"],
+          ok: true,
+        },
+      },
+      "github-copilot#cold": {},
+    })
+    const state = JSON.parse(await readFile(connectionFile, "utf8"))
+    const lines = renderBestPerVendor(state)
+    expect(lines.length).toBe(1)
+    expect(lines[0]).toContain("Primary")
+    expect(lines[0]).toContain("OpenAI=gpt-5.4")
+    expect(lines[0]).toContain("Anthropic=claude-opus-4.6")
+    expect(lines[0]).toContain("Google=gemini-3.1-pro-preview")
+  })
+
+  test("skips accounts with no discovery models", () => {
+    const state = { version: 1 as const, connections: { "github-copilot": {} } }
+    expect(renderBestPerVendor(state)).toEqual([])
+  })
+})
+
+test("loadAccountHealth triages each Copilot account", async () => {
+  const prevFetch = globalThis.fetch
+  let n = 0
+  globalThis.fetch = ((url: string) => {
+    n += 1
+    if (n === 1) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            user_login: "alice",
+            entitlements: { premium_requests: 100 },
+            quota_snapshots: [{ quota_id: "premium_requests", remaining: 25, percent_remaining: 25 }],
+          }),
+          { status: 200 },
+        ),
+      )
+    }
+    return Promise.resolve(new Response("nope", { status: 401 }))
+  }) as unknown as typeof fetch
+  try {
+    await seedState({})
+    await withAuth(
+      {
+        "github-copilot": new Auth.Oauth({ type: "oauth", refresh: "tok-a", access: "", expires: 0 }),
+        "github-copilot#dead": new Auth.Oauth({ type: "oauth", refresh: "tok-b", access: "", expires: 0 }),
+      },
+      async () => {
+        const got = await loadAccountHealth()
+        expect(got).toHaveLength(2)
+        const byKey = Object.fromEntries(got.map((g) => [g.key, g]))
+        expect(byKey["github-copilot"].health).toBe("healthy")
+        expect(byKey["github-copilot"].login).toBe("alice")
+        expect(byKey["github-copilot#dead"].health).toBe("deactivated")
+      },
+    )
+  } finally {
+    globalThis.fetch = prevFetch
+  }
+})
+
+test("ProvidersAccountsCommand --json includes health triage and bestPerVendor", async () => {
+  const prevFetch = globalThis.fetch
+  const prevWrite = process.stdout.write
+  const out: Array<string | Uint8Array> = []
+  globalThis.fetch = ((url: string) => {
+    if (String(url).includes("copilot_internal/user")) {
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            user_login: "alice",
+            access_type_sku: "copilot_free",
+            entitlements: { premium_requests: 100 },
+            quota_snapshots: [{ quota_id: "premium_requests", remaining: 50, percent_remaining: 50 }],
+          }),
+          { status: 200 },
+        ),
+      )
+    }
+    return Promise.resolve(new Response(JSON.stringify({}), { status: 200 }))
+  }) as unknown as typeof fetch
+  process.stdout.write = ((chunk: string | Uint8Array) => {
+    out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
+    return true
+  }) as never
+  try {
+    await seedState({
+      "github-copilot": {
+        discovery: { at: Date.now(), models: ["gpt-5.4", "claude-opus-4.6"], ok: true },
+      },
+    })
+    await withAuth(
+      {
+        "github-copilot": new Auth.Oauth({ type: "oauth", refresh: "tok", access: "", expires: 0 }),
+      },
+      async () => {
+        await ProvidersAccountsCommand.handler({ json: true } as never)
+      },
+    )
+    const raw = out.join("")
+    const body = raw.slice(raw.indexOf("{"))
+    const data = JSON.parse(body)
+    expect(Array.isArray(data.health)).toBe(true)
+    expect(data.health[0].health).toBe("healthy")
+    expect(data.bestPerVendor["github-copilot"]).toEqual([
+      { vendor: "OpenAI", modelId: "gpt-5.4" },
+      { vendor: "Anthropic", modelId: "claude-opus-4.6" },
+    ])
+    expect(data.items[0].triage.health).toBe("healthy")
+  } finally {
+    globalThis.fetch = prevFetch
+    process.stdout.write = prevWrite
+  }
+})
+
+// Integration coverage of ProvidersListCommand requires the AppRuntime
+// + Instance services to be active (ModelsDev.get hits a Service.use).
+// We exercise the new behaviour via `renderBestPerVendor` above.
+void ProvidersListCommand

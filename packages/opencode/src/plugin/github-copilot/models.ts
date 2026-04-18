@@ -10,6 +10,8 @@ export namespace CopilotModels {
         name: z.string(),
         // every version looks like: `{model.id}-YYYY-MM-DD`
         version: z.string(),
+        // Vendor name (e.g. "OpenAI", "Anthropic", "Google", "Azure OpenAI", "xAI").
+        vendor: z.string().optional(),
         supported_endpoints: z.array(z.string()).optional(),
         billing: z
           .object({
@@ -106,6 +108,126 @@ export namespace CopilotModels {
     const canonical = trimmed === "gemini-3-pro-preview" ? "gemini-3.1-pro-preview" : trimmed
     const valid = /^[a-z0-9\-._]+$/.test(canonical)
     return valid ? canonical : undefined
+  }
+
+  /**
+   * Pick the highest-capability model per vendor from a /models catalog.
+   * Mirrors Rust `CopilotModelCatalog::best_per_vendor` in
+   * `github-copilot/src/models.rs:92-161`.
+   *
+   * Ranking within a vendor (highest wins):
+   *   1. reasoning support (true > false)
+   *   2. context window (larger)
+   *   3. max output tokens (larger)
+   *   4. lexical id (later string-sorts wins as a stable tiebreaker, so
+   *      `gpt-5.4 > gpt-5.3`)
+   *
+   * Vendors are bucketed by:
+   *   - "OpenAI" / "Azure OpenAI" → "OpenAI"
+   *   - "Anthropic" → "Anthropic"
+   *   - "Google" → "Google"
+   *   - everything else (xAI etc) → skipped
+   *
+   * Output preserves a stable display order: OpenAI, Anthropic, Google.
+   * Embeddings, legacy `gpt-3.5`, `gpt-4o-mini`, `goldeneye`, and any
+   * `-mini` / `-nano` / `-fast` slug variants are excluded.
+   */
+  export type BestVendor = { vendor: string; modelId: string }
+
+  type Capabilityish = {
+    id: string
+    vendor?: string
+    family?: string
+    capabilities?: { supports?: { reasoning_effort?: string[]; adaptive_thinking?: boolean } }
+    capabilities_reasoning?: boolean
+    limits?: { max_context_window_tokens?: number; max_output_tokens?: number }
+  }
+
+  function vendorBucket(input: Capabilityish): "OpenAI" | "Anthropic" | "Google" | undefined {
+    const text = `${input.vendor ?? ""} ${input.family ?? ""} ${input.id}`.toLowerCase()
+    if (text.includes("anthropic") || text.includes("claude")) return "Anthropic"
+    if (text.includes("google") || text.includes("gemini")) return "Google"
+    if (text.includes("openai") || text.includes("azure") || text.includes("gpt")) return "OpenAI"
+    return undefined
+  }
+
+  function reasoningOrdinal(input: Capabilityish): number {
+    if (input.capabilities_reasoning) return 1
+    const sup = input.capabilities?.supports
+    if (sup?.adaptive_thinking) return 1
+    if (sup?.reasoning_effort && sup.reasoning_effort.length > 0) return 1
+    return 0
+  }
+
+  function isExcluded(id: string): boolean {
+    const lower = id.toLowerCase()
+    return (
+      lower.includes("embedding") ||
+      lower.includes("gpt-3.5") ||
+      lower.includes("gpt-4o-mini") ||
+      lower.includes("goldeneye") ||
+      lower.includes("-mini") ||
+      lower.includes("-nano") ||
+      lower.includes("-fast")
+    )
+  }
+
+  export function bestPerVendor(items: Capabilityish[]): BestVendor[] {
+    const byVendor = new Map<string, Capabilityish>()
+    for (const m of items) {
+      if (isExcluded(m.id)) continue
+      const vendor = vendorBucket(m)
+      if (!vendor) continue
+      const cur = byVendor.get(vendor)
+      if (!cur) {
+        byVendor.set(vendor, m)
+        continue
+      }
+      const mr = reasoningOrdinal(m)
+      const cr = reasoningOrdinal(cur)
+      if (mr !== cr) {
+        if (mr > cr) byVendor.set(vendor, m)
+        continue
+      }
+      const mc = m.limits?.max_context_window_tokens ?? 0
+      const cc = cur.limits?.max_context_window_tokens ?? 0
+      if (mc !== cc) {
+        if (mc > cc) byVendor.set(vendor, m)
+        continue
+      }
+      const mo = m.limits?.max_output_tokens ?? 0
+      const co = cur.limits?.max_output_tokens ?? 0
+      if (mo !== co) {
+        if (mo > co) byVendor.set(vendor, m)
+        continue
+      }
+      // Final tiebreaker: lexical id descending (gpt-5.4 wins over gpt-5.3).
+      if (m.id > cur.id) byVendor.set(vendor, m)
+    }
+    const order = (v: string) => (v === "OpenAI" ? 0 : v === "Anthropic" ? 1 : v === "Google" ? 2 : 3)
+    return [...byVendor.entries()]
+      .sort(([a], [b]) => order(a) - order(b))
+      .map(([vendor, m]) => ({ vendor, modelId: m.id }))
+  }
+
+  /**
+   * Adapter: derive `Capabilityish` records from a `Record<string, Model>`
+   * (the shape produced by `CopilotModels.get`). Lets `bestPerVendor` run
+   * over the same model catalog the runtime/dispatch layer sees.
+   */
+  export function bestPerVendorFromModels(
+    models: Record<string, { api: { id: string }; family?: string; limit?: { context: number; output: number }; capabilities?: { reasoning?: boolean } }>,
+  ): BestVendor[] {
+    const items: Capabilityish[] = Object.values(models).map((m) => ({
+      id: m.api.id,
+      family: m.family,
+      capabilities_reasoning: !!m.capabilities?.reasoning,
+      limits: {
+        max_context_window_tokens: m.limit?.context,
+        max_output_tokens: m.limit?.output,
+      },
+    }))
+    return bestPerVendor(items)
   }
 
   /**

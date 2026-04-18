@@ -277,8 +277,53 @@ export function fix(model: Model, url: string): Model {
   }
 }
 
-export function selectAccount(input: { auths: CopilotAuth[]; state: State; fallback: CopilotAuth; now?: number }) {
-  return next(input.auths, input.state, input.now) ?? input.fallback
+/**
+ * Pseudo-random index in `[0, length)` seeded by a clock value. Mirrors
+ * Rust `select_best_token`'s sub-nanosecond `pseudo_rand` (`lib.rs:308-313`)
+ * — deterministic when callers pin `now` (used by tests) and uniformly
+ * spread otherwise.
+ */
+export function spreadIndex(length: number, now: number): number {
+  if (length <= 0) return 0
+  // Mix high + low bits so adjacent millisecond seeds produce different
+  // residues even for small `length` values.
+  const seed = (Math.trunc(now) ^ (Math.trunc(now) >>> 16)) >>> 0
+  return seed % length
+}
+
+/**
+ * Select an account for dispatch. Mirrors Rust `select_best_token`
+ * (`github-copilot/src/lib.rs:266-344`):
+ *
+ *   1. Sort by health (cooldown / deactivated last) via `next` semantics
+ *      from `connections.ts`.
+ *   2. **Spread startup load** across the healthy tier instead of always
+ *      picking the lexically-first account — otherwise every fresh process
+ *      hammers the same primary on its first turn.
+ *
+ * The randomization is keyed off `now` so tests pin determinism with
+ * `selectAccount({…, now: 100})`. Pass an injected `pick` to override the
+ * spreader entirely (used by the `health.ts`-aware quota-spread test).
+ */
+export function selectAccount(input: {
+  auths: CopilotAuth[]
+  state: State
+  fallback: CopilotAuth
+  now?: number
+  pick?: (length: number, now: number) => number
+}) {
+  if (input.auths.length === 0) return next(input.auths, input.state, input.now) ?? input.fallback
+  const now = input.now ?? Date.now()
+  const ordered = [...input.auths].filter((item) => !isDeactivated(input.state, item.key))
+  const candidates = ordered.length > 0 ? ordered : input.auths
+  const live = candidates.filter((item) => {
+    const until = input.state.connections[item.key]?.exhaustedUntil
+    return !until || until <= now
+  })
+  const tier = live.length > 0 ? live : candidates
+  if (tier.length === 1) return tier[0]
+  const idx = (input.pick ?? spreadIndex)(tier.length, now)
+  return tier[idx % tier.length] ?? next(input.auths, input.state, input.now) ?? input.fallback
 }
 
 export function model(body: unknown) {
@@ -623,11 +668,132 @@ export function routeUrl(url: RequestInfo | URL, cfg?: { url?: string }) {
   return new URL(raw, cfg.url).href
 }
 
+/**
+ * Default timeout (in seconds) advertised in the fetch-envelope. Matches
+ * Rust `http_get_via_proxy` (`models.rs:348`).
+ */
+export const PROXY_FETCH_TIMEOUT_SEC = 120
+
+/**
+ * Detect whether the configured proxy speaks the Rust `POST /fetch`
+ * envelope protocol (`models.rs:305-378`). When `cfg.envelope === true`
+ * we wrap the request as `POST {proxy}/fetch` with `{url, method,
+ * headers, body, timeout_ms}` and `Authorization: Bearer {token}`.
+ *
+ * Set `OPENCODE_COPILOT_PROXY_ENVELOPE=1` to opt in globally; per-account
+ * preference can be encoded by passing `{ envelope: true }` through the
+ * proxy config.  When neither is set, `routedFetch` keeps the legacy
+ * URL-rewrite behaviour for backwards compatibility.
+ */
+export function envelopeEnabled(cfg?: { envelope?: boolean }): boolean {
+  if (cfg?.envelope === true) return true
+  return process.env.OPENCODE_COPILOT_PROXY_ENVELOPE === "1"
+}
+
+/**
+ * Headers whose values would be wrong if forwarded verbatim by the
+ * envelope proxy (e.g. Content-Length set against the inner body, Host
+ * pointing at the proxy). Mirrors the `target_headers` filter used by
+ * the Rust counterpart.
+ */
+const ENVELOPE_STRIP_HEADERS = new Set(["content-length", "host"])
+
+function flattenHeaders(input: HeadersInit | undefined): Record<string, string> {
+  if (!input) return {}
+  if (input instanceof Headers) {
+    const out: Record<string, string> = {}
+    input.forEach((v, k) => {
+      out[k] = v
+    })
+    return out
+  }
+  if (Array.isArray(input)) {
+    return Object.fromEntries(input)
+  }
+  return { ...(input as Record<string, string>) }
+}
+
+async function readEnvelopeBody(input: RequestInit["body"] | undefined): Promise<string | undefined> {
+  if (input === undefined || input === null) return undefined
+  if (typeof input === "string") return input
+  if (input instanceof Uint8Array) return new TextDecoder().decode(input)
+  if (input instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(input))
+  // Node Buffer (Bun) extends Uint8Array; covered above.
+  // Streams / FormData are not supported by the envelope — best-effort stringify.
+  try {
+    return JSON.stringify(input)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * POST `{proxyUrl}/fetch` with the inner request as a JSON envelope.
+ * Mirrors Rust `http_get_via_proxy` extended for arbitrary methods +
+ * bodies (`models.rs:305-378`).
+ */
+export async function envelopeFetch(
+  request: RequestInfo | URL,
+  init: RequestInit | undefined,
+  cfg: { url: string; token?: string },
+): Promise<Response> {
+  const inner = request instanceof URL ? request.href : request.toString()
+  const targetUrl = inner.startsWith("http://") || inner.startsWith("https://") ? inner : new URL(inner, cfg.url).href
+  const method = (init?.method ?? "GET").toUpperCase()
+  const headers = flattenHeaders(init?.headers)
+  const filtered: Record<string, string> = {}
+  for (const [k, v] of Object.entries(headers)) {
+    if (!ENVELOPE_STRIP_HEADERS.has(k.toLowerCase())) filtered[k] = v
+  }
+  const body = await readEnvelopeBody(init?.body)
+  const envelope: Record<string, unknown> = {
+    url: targetUrl,
+    method,
+    headers: filtered,
+    timeout_ms: PROXY_FETCH_TIMEOUT_SEC * 1000,
+  }
+  if (body !== undefined) envelope.body = body
+  const endpoint = `${cfg.url.replace(/\/$/, "")}/fetch`
+  const proxyHeadersInit: Record<string, string> = {
+    "Content-Type": "application/json",
+  }
+  if (cfg.token) proxyHeadersInit["Authorization"] = `Bearer ${cfg.token}`
+  const proxyResp = await fetch(endpoint, {
+    method: "POST",
+    headers: proxyHeadersInit,
+    body: JSON.stringify(envelope),
+  })
+  if (!proxyResp.ok) {
+    // Proxy itself errored — surface the proxy status so callers can
+    // distinguish from inner-API errors.
+    const text = await proxyResp.text().catch(() => "")
+    return new Response(text, { status: proxyResp.status, headers: { "x-copilot-proxy-error": "1" } })
+  }
+  const contentType = proxyResp.headers.get("content-type") ?? ""
+  if (!contentType.includes("application/json")) {
+    // Pass through non-JSON proxy responses unchanged.
+    return proxyResp
+  }
+  const decoded = (await proxyResp.json().catch(() => null)) as
+    | { status_code?: number; headers?: Record<string, string>; body?: string }
+    | null
+  if (!decoded) return new Response("", { status: 502, headers: { "x-copilot-proxy-error": "decode-failed" } })
+  const status = typeof decoded.status_code === "number" ? decoded.status_code : 502
+  const innerHeaders = new Headers()
+  for (const [k, v] of Object.entries(decoded.headers ?? {})) {
+    if (typeof v === "string") innerHeaders.set(k, v)
+  }
+  return new Response(decoded.body ?? "", { status, headers: innerHeaders })
+}
+
 export async function routedFetch(
   request: RequestInfo | URL,
   init: RequestInit | undefined,
-  cfg?: { url?: string; token?: string },
+  cfg?: { url?: string; token?: string; envelope?: boolean },
 ) {
+  if (cfg?.url && envelopeEnabled(cfg)) {
+    return envelopeFetch(request, init, { url: cfg.url, token: cfg.token })
+  }
   const headers = { ...(init?.headers as Record<string, string>), ...proxyHeaders(cfg?.token) }
   return fetch(routeUrl(request, cfg), { ...init, headers })
 }

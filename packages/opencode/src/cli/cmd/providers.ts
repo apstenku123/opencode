@@ -15,6 +15,8 @@ import {
   type RouteDebug,
 } from "../../plugin/github-copilot/copilot"
 import { StateSchema, empty, type State } from "../../plugin/github-copilot/connections"
+import { CopilotModels } from "../../plugin/github-copilot/models"
+import { checkAccountStatuses, type AccountStatusInfo } from "../../plugin/github-copilot/health"
 import { map, pipe, sortBy, values } from "remeda"
 import path from "path"
 import os from "os"
@@ -737,6 +739,27 @@ export const ProvidersCommand = cmd({
   async handler() {},
 })
 
+/**
+ * Render the per-account "best per vendor" pick from cached discovery
+ * state. Mirrors the Rust `CopilotModelCatalog::best_per_vendor` display
+ * (`github-copilot/src/models.rs:92-161`). Pulls model catalogs from the
+ * persisted `connections.json` so we don't trigger live network calls
+ * inside `providers list`.
+ */
+export function renderBestPerVendor(state: State): string[] {
+  const lines: string[] = []
+  for (const [key, conn] of Object.entries(state.connections)) {
+    const catalog = conn.discovery?.models ?? []
+    if (catalog.length === 0) continue
+    const items = catalog.map((id) => ({ id }))
+    const best = CopilotModels.bestPerVendor(items)
+    if (best.length === 0) continue
+    const display = best.map((b) => `${b.vendor}=${b.modelId}`).join(", ")
+    lines.push(`${copilotAliasLabel(key)} ${UI.Style.TEXT_DIM}best ${display}`)
+  }
+  return lines
+}
+
 export const ProvidersListCommand = cmd({
   command: "list",
   aliases: ["ls"],
@@ -753,6 +776,12 @@ export const ProvidersListCommand = cmd({
     for (const [providerID, result] of results) {
       const name = copilotAliasName(providerID, database[providerID]?.name)
       prompts.log.info(`${name} ${UI.Style.TEXT_DIM}${result.type}`)
+    }
+
+    // Per-account best-per-vendor pick from cached Copilot discovery.
+    const state = await readConnections()
+    for (const line of renderBestPerVendor(state)) {
+      prompts.log.info(line)
     }
 
     prompts.outro(`${results.length} credentials`)
@@ -1071,6 +1100,30 @@ export const ProvidersQuotaCommand = cmd({
   },
 })
 
+/**
+ * Probe each Copilot account in parallel and bucket into
+ * healthy / deactivated / rateLimited / networkError. Mirrors the Rust
+ * `check_account_statuses` triage (`lib.rs:212-264`) and powers the
+ * `providers accounts --json` envelope so external tooling can read
+ * account health without scraping human output.
+ */
+export async function loadAccountHealth(): Promise<AccountStatusInfo[]> {
+  const credentials = await allAuth()
+  const accounts = quotaAccounts(
+    credentials as Record<string, { type: string; refresh?: string; enterpriseUrl?: string }>,
+  )
+  const state = await readConnections()
+  const auths = accounts.map(([key, info]) => ({
+    key,
+    label: copilotAliasLabel(key),
+    refresh: info.refresh || "",
+    access: (info as any).access || info.refresh || "",
+    expires: (info as any).expires || 0,
+    enterpriseUrl: info.enterpriseUrl,
+  }))
+  return checkAccountStatuses({ auths, state })
+}
+
 export const ProvidersAccountsCommand = cmd({
   command: "accounts",
   describe: "show GitHub Copilot account overview",
@@ -1078,7 +1131,7 @@ export const ProvidersAccountsCommand = cmd({
   async handler(args) {
     UI.empty()
     prompts.intro("GitHub Copilot Accounts")
-    const { accounts, items } = await loadAccountStatuses()
+    const { accounts, items, state } = await loadAccountStatuses()
     const migration = resolveMigrationSummary(accounts.length > 0)
     if (accounts.length === 0) {
       prompts.log.error("No GitHub Copilot accounts configured. Run: opencode providers login")
@@ -1086,15 +1139,39 @@ export const ProvidersAccountsCommand = cmd({
       return
     }
     if (args.json) {
+      // Augment legacy `items` with the Rust-parity `health` triage.
+      const auths = accounts.map(([key, info]) => ({
+        key,
+        label: copilotAliasLabel(key),
+        refresh: info.refresh || "",
+        access: (info as any).access || info.refresh || "",
+        expires: (info as any).expires || 0,
+        enterpriseUrl: info.enterpriseUrl,
+      }))
+      const triage = await checkAccountStatuses({ auths, state })
+      const healthByKey = new Map(triage.map((h) => [h.key, h] as const))
+      const bestPerVendor = Object.fromEntries(
+        Object.entries(state.connections)
+          .map(([key, conn]) => {
+            const catalog = conn.discovery?.models ?? []
+            if (catalog.length === 0) return [key, null] as const
+            const best = CopilotModels.bestPerVendor(catalog.map((id) => ({ id })))
+            return [key, best.length > 0 ? best : null] as const
+          })
+          .filter(([, v]) => v !== null),
+      )
       process.stdout.write(
         JSON.stringify(
           {
             schemaVersion: ACCOUNT_STATUS_SCHEMA_VERSION,
             migration: jsonMigration(migration),
+            health: triage,
+            bestPerVendor,
             items: items.map((item) => ({
               schemaVersion: ACCOUNT_STATUS_SCHEMA_VERSION,
               ...item,
               status: jsonStatus(item.status),
+              triage: healthByKey.get(item.status.key) ?? null,
             })),
           },
           null,
@@ -1107,6 +1184,10 @@ export const ProvidersAccountsCommand = cmd({
       const text = renderAccountStatus(item.status, { premium: item.premium, enterpriseUrl: item.info.enterpriseUrl })
       if (item.status.error && item.status.health !== "ok") prompts.log.error(text)
       else prompts.log.info(text)
+    }
+    // Render best-per-vendor pick when discovery data is available.
+    for (const line of renderBestPerVendor(state)) {
+      prompts.log.info(line)
     }
     prompts.outro(`${accounts.length} account${accounts.length === 1 ? "" : "s"}`)
   },
