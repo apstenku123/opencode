@@ -22,6 +22,12 @@ from pathlib import Path
 
 from .client import OpencodeClient
 from .events import EventStream, SSEEvent
+from .home import (
+    has_copilot_credentials,
+    isolated_opencode_home,
+    prepare_isolated_home,
+    xdg_env_for,
+)
 from .server import OpencodeServer
 
 DEFAULT_BINARY_PATH = "/Users/dave/.local/bin/opencode-unify"
@@ -52,5 +58,9 @@ __all__ = [
     "OpencodeClient",
     "OpencodeServer",
     "SSEEvent",
+    "has_copilot_credentials",
+    "isolated_opencode_home",
+    "prepare_isolated_home",
     "resolve_opencode_binary",
+    "xdg_env_for",
 ]
