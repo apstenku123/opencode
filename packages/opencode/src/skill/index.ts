@@ -16,6 +16,7 @@ import { ConfigMarkdown } from "../config"
 import { Glob } from "@opencode-ai/shared/util/glob"
 import { Log } from "../util"
 import { Discovery } from "./discovery"
+import { Bm25Index } from "./bm25"
 
 const log = Log.create({ service: "skill" })
 const EXTERNAL_DIRS = [".claude", ".agents"]
@@ -23,11 +24,31 @@ const EXTERNAL_SKILL_PATTERN = "skills/**/SKILL.md"
 const OPENCODE_SKILL_PATTERN = "{skill,skills}/**/SKILL.md"
 const SKILL_PATTERN = "**/SKILL.md"
 
+/**
+ * Optional `dependencies.tools` block for env-var dependency resolution.
+ * Mirrors Rust's `SkillMetadata.dependencies`. Fully optional — skills that
+ * don't declare any deps remain backward-compatible with older parsers.
+ */
+export const Dependencies = z.object({
+  tools: z
+    .array(
+      z.object({
+        type: z.literal("env_var"),
+        value: z.string(),
+        description: z.string().optional(),
+      }),
+    )
+    .optional(),
+})
+export type Dependencies = z.infer<typeof Dependencies>
+
 export const Info = z.object({
   name: z.string(),
   description: z.string(),
   location: z.string(),
   content: z.string(),
+  /** Optional env-var dependencies declared in frontmatter. */
+  dependencies: Dependencies.optional(),
 })
 export type Info = z.infer<typeof Info>
 
@@ -52,6 +73,8 @@ export const NameMismatchError = NamedError.create(
 type State = {
   skills: Record<string, Info>
   dirs: Set<string>
+  /** Lazily-built BM25 index. Invalidated to `null` on hot-insert. */
+  bm25: Bm25Index | null
 }
 
 export interface Interface {
@@ -59,6 +82,13 @@ export interface Interface {
   readonly all: () => Effect.Effect<Info[]>
   readonly dirs: () => Effect.Effect<string[]>
   readonly available: (agent?: Agent.Info) => Effect.Effect<Info[]>
+  /**
+   * BM25 retrieval over the live skill list. Re-uses the cached BM25 index
+   * (rebuilt lazily on first call and on every `notifyHotInserted`). Returns
+   * the top-`topK` skills ranked by score; empty list when query produces no
+   * matches (caller should fall back to substring `recommend()`).
+   */
+  readonly search: (query: string, topK?: number) => Effect.Effect<{ skill: Info; score: number }[]>
   /**
    * Inject a freshly-extracted skill into the live registry without a disk
    * re-scan. Used by the autoskill hot-insert pipeline after it writes the
@@ -91,7 +121,7 @@ const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.I
 
   if (!md) return
 
-  const parsed = Info.pick({ name: true, description: true }).safeParse(md.data)
+  const parsed = Info.pick({ name: true, description: true, dependencies: true }).safeParse(md.data)
   if (!parsed.success) return
 
   if (state.skills[parsed.data.name]) {
@@ -108,6 +138,7 @@ const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.I
     description: parsed.data.description,
     location: match,
     content: md.content,
+    dependencies: parsed.data.dependencies,
   }
 })
 
@@ -206,7 +237,7 @@ export const layer = Layer.effect(
     const fsys = yield* AppFileSystem.Service
     const state = yield* InstanceState.make(
       Effect.fn("Skill.state")(function* (ctx) {
-        const s: State = { skills: {}, dirs: new Set() }
+        const s: State = { skills: {}, dirs: new Set(), bm25: null }
         yield* loadSkills(s, config, discovery, bus, fsys, ctx.directory, ctx.worktree)
         return s
       }),
@@ -243,10 +274,28 @@ export const layer = Layer.effect(
       // with a freshly regenerated one.
       s.skills[skill.name] = skill
       s.dirs.add(path.dirname(skill.location))
+      // Invalidate the BM25 index so the next `search()` rebuilds it with
+      // the new skill in scope. Cheap to defer — most turns never search.
+      s.bm25 = null
       log.info("hot-inserted skill", { name: skill.name, location: skill.location })
     })
 
-    return Service.of({ get, all, dirs, available, notifyHotInserted })
+    const search = Effect.fn("Skill.search")(function* (query: string, topK: number = 5) {
+      const s = yield* InstanceState.get(state)
+      const list = Object.values(s.skills)
+      if (list.length === 0) return []
+      if (!s.bm25) s.bm25 = Bm25Index.build(list)
+      const hits = s.bm25.search(query, topK)
+      const byName = new Map(list.map((sk) => [sk.name, sk]))
+      const result: { skill: Info; score: number }[] = []
+      for (const hit of hits) {
+        const sk = byName.get(hit.skillName)
+        if (sk) result.push({ skill: sk, score: hit.score })
+      }
+      return result
+    })
+
+    return Service.of({ get, all, dirs, available, notifyHotInserted, search })
   }),
 )
 
