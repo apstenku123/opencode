@@ -1,4 +1,5 @@
 import { InstallationVersion } from "@/installation/version"
+import { HttpClient } from "@/http/client"
 
 export type Premium = {
   used: number
@@ -64,7 +65,10 @@ export async function fetchQuota(token: string, enterpriseUrl?: string, proxy?: 
   const target = proxy?.url
     ? new URL("/copilot_internal/user", proxy.url).href
     : "https://api.github.com/copilot_internal/user"
-  const res = await fetch(target, {
+  // Route through the shared HTTP client so corporate CA bundles + the
+  // unified timeout policy apply; keep the caller-facing error surface
+  // (plain `Error("Failed to fetch quota: <status>")`) for existing tests.
+  const res = await HttpClient.request(target, {
     headers: {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
@@ -72,6 +76,9 @@ export async function fetchQuota(token: string, enterpriseUrl?: string, proxy?: 
       ...(enterpriseUrl ? { "X-GitHub-Enterprise-Host": enterpriseUrl } : {}),
       ...(proxy?.token ? { "x-copilot-proxy-token": proxy.token } : {}),
     },
+    retry: false,
+    throwOnError: false,
+    timeoutMs: 10_000,
   })
   if (!res.ok) throw new Error(`Failed to fetch quota: ${res.status}`)
   return parse((await res.json()) as Payload)
