@@ -33,7 +33,7 @@ class OpencodeClient:
         self,
         base_url: str,
         *,
-        timeout_s: float = 30.0,
+        timeout_s: float = 180.0,
         project_directory: Optional[str] = None,
     ) -> None:
         """Construct a client.
