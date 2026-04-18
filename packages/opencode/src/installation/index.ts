@@ -248,8 +248,10 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
           return data.version
         }
 
+        // Fork: check releases from apstenku123/opencode, not upstream.
+        // Auto-updater will only see tags published on our fork, never upstream releases.
         const response = yield* httpOk.execute(
-          HttpClientRequest.get("https://api.github.com/repos/anomalyco/opencode/releases/latest").pipe(
+          HttpClientRequest.get("https://api.github.com/repos/apstenku123/opencode/releases/latest").pipe(
             HttpClientRequest.acceptJson,
           ),
         )
