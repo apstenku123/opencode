@@ -4,7 +4,7 @@ import * as prompts from "@clack/prompts"
 import { UI } from "../ui"
 import { ModelsDev } from "../../provider"
 import { classifyPlan, fetchQuota, formatQuotaBar, type Quota } from "../../plugin/github-copilot/quota"
-import { migrate, proxyImports, summarizeMigration } from "../../plugin/github-copilot/auth"
+import { migrate, proxyImports, summarizeMigration, testAccountsFromConfig } from "../../plugin/github-copilot/auth"
 import { connectionFile } from "../../plugin/github-copilot/paths"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { Effect } from "effect"
@@ -48,6 +48,36 @@ export async function allAuth() {
   if (!migrated) {
     migrated = true
     await AppRuntime.runPromise(migrate()).catch(() => undefined)
+    // Resolve `copilot.testAccounts` from config.toml and inject the
+    // resulting credentials into Auth.Service. Keys look like
+    // `github-copilot#edu-<N>` so the existing edu-pool filter gates
+    // them out of production routing unless
+    // `OPENCODE_ALLOW_TEST_ACCOUNTS=1` is set.
+    const resolvedCfg = await AppRuntime.runPromise(
+      Config.Service.use((c) => c.get()),
+    ).catch(() => undefined as unknown)
+    const section = (resolvedCfg as { copilot?: { testAccounts?: unknown } } | undefined)?.copilot
+      ?.testAccounts as { tokens?: string[]; labels?: string[]; proxyUrls?: string[] } | undefined
+    const synthesised = testAccountsFromConfig(section)
+    if (synthesised.length > 0) {
+      await AppRuntime.runPromise(
+        Effect.gen(function* () {
+          const auth = yield* Auth.Service
+          const existing = yield* auth.all()
+          for (const item of synthesised) {
+            if (existing[item.key]) continue
+            yield* auth.set(item.key, {
+              type: "oauth",
+              refresh: item.refresh,
+              access: item.access,
+              expires: item.expires,
+              accountId: item.key,
+            })
+            if (item.proxyUrl) proxyImports.set(item.key, { url: item.proxyUrl })
+          }
+        }),
+      ).catch(() => undefined)
+    }
     if (proxyImports.size > 0) {
       await AppRuntime.runPromise(
         Effect.gen(function* () {

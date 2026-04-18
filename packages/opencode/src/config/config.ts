@@ -331,6 +331,35 @@ export const Info = z
           .describe(
             "Per-account adaptive semaphore that reacts to 429s over a sliding window. Mirrors Rust `copilot_rate_limiter.rs`.",
           ),
+        testAccounts: z
+          .object({
+            tokens: z
+              .array(z.string())
+              .optional()
+              .describe(
+                "Raw Copilot OAuth tokens (e.g. `ghu_...`). Registered as `github-copilot#edu-N` keys and filtered out of the production pool unless `OPENCODE_ALLOW_TEST_ACCOUNTS=1` is set. Mirrors codex_git `[test_accounts].tokens`.",
+              ),
+            labels: z
+              .array(z.string())
+              .optional()
+              .describe("Index-matched human-readable labels for each test token. Shown in `providers accounts`."),
+            supportedModels: z
+              .array(z.string())
+              .optional()
+              .describe(
+                "Models these test accounts are capability-declared to support (e.g. `['gpt-4.1', 'gpt-5-mini-xhigh']`). Used for test-only routing — the pool will skip test accounts for any other model.",
+              ),
+            proxyUrls: z
+              .array(z.string())
+              .optional()
+              .describe(
+                "Index-matched proxy URLs (e.g. Cloud Run GCP fetch-proxy per account for IP rotation). Each URL enables envelope protocol (`POST {proxy}/fetch`) for its token.",
+              ),
+          })
+          .optional()
+          .describe(
+            "Bulk-injected Copilot test accounts — supplements the production account pool in e2e/test mode. Mirrors codex_git `[test_accounts]` section (codex-rs/core/src/config/types.rs).",
+          ),
       })
       .optional()
       .describe("GitHub Copilot provider configuration"),

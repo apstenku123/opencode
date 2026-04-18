@@ -143,6 +143,11 @@ export function poolForAccount(input: {
     )
     if (explicit) return explicit[0]
   }
+  // Keys following the `github-copilot#edu-*` test-pool convention route
+  // to the edu pool regardless of whether quota discovery has resolved a
+  // `plan`. Mirrors codex_git's `#edu-` filter in `connections.rs:217` —
+  // every edu-prefixed key is a test/supplementary slot in the edu pool.
+  if (/^github-copilot#edu-/.test(key)) return "edu"
   if (!plan) return undefined
   const normalized = plan.toLowerCase()
   if (normalized === "edu" || normalized === "free") return "edu"

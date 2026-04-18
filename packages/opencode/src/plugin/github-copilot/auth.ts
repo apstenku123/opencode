@@ -333,6 +333,38 @@ export function testTokensFromEnv(raw: string | undefined): CopilotAuth[] {
     })
 }
 
+/**
+ * Extract synthetic test-slot credentials from the opencode
+ * `copilot.testAccounts` config section (mirrors codex_git's
+ * `[test_accounts]` TOML section — see
+ * `codex-rs/core/src/config/types.rs::TestAccountsToml`). Labels +
+ * proxy URLs are index-matched with tokens; a missing entry falls back
+ * to the synthetic `edu-N` key/label.
+ */
+export function testAccountsFromConfig(input?: {
+  tokens?: readonly string[]
+  labels?: readonly string[]
+  proxyUrls?: readonly string[]
+}): CopilotAuth[] {
+  if (!input?.tokens || input.tokens.length === 0) return []
+  return input.tokens.map((token, i) => {
+    const customLabel = input.labels?.[i]?.trim()
+    const slug = customLabel
+      ? customLabel.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 24)
+      : `${i + 1}`
+    const key = `github-copilot#edu-${slug}`
+    const proxyUrl = input.proxyUrls?.[i]?.trim()
+    return {
+      key,
+      label: customLabel || label(key),
+      refresh: token,
+      access: token,
+      expires: 0,
+      ...(proxyUrl ? { proxyUrl } : {}),
+    } satisfies CopilotAuth
+  })
+}
+
 export function summarizeMigration(state: MigrationState) {
   return {
     migrated: state.keys.length,
