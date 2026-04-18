@@ -1,5 +1,6 @@
 import { z } from "zod"
 import type { Model } from "@opencode-ai/sdk/v2"
+import { HttpClient } from "@/http/client"
 
 export namespace CopilotModels {
   export const schema = z.object({
@@ -319,15 +320,19 @@ export namespace CopilotModels {
     plan?: string,
   ): Promise<Record<string, Model>> {
     const target = proxyUrl ? new URL("/models", proxyUrl).href : `${baseURL}/models`
-    const data = await fetch(target, {
+    // Shared HTTP client: picks up NODE_EXTRA_CA_CERTS automatically and
+    // applies the unified timeout; we intentionally disable retry here
+    // since the caller (`aliasModels`) already has a fallback catalog.
+    const res = await HttpClient.request(target, {
       headers,
-      signal: AbortSignal.timeout(5_000),
-    }).then(async (res) => {
-      if (!res.ok) {
-        throw new Error(`Failed to fetch models: ${res.status}`)
-      }
-      return schema.parse(await res.json())
+      retry: false,
+      throwOnError: false,
+      timeoutMs: 5_000,
     })
+    if (!res.ok) {
+      throw new Error(`Failed to fetch models: ${res.status}`)
+    }
+    const data = schema.parse(await res.json())
 
     const result = { ...existing }
     const gated = retainForPlan(data.data, plan)
