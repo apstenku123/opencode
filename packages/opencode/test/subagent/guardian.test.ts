@@ -9,6 +9,7 @@ import { SubagentRegistry } from "../../src/subagent/registry"
 import { SessionID } from "../../src/session/schema"
 import { provideTmpdirInstance } from "../fixture/fixture"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
+import * as Hook from "../../src/hook"
 
 const sid = (s: string) => SessionID.make(s)
 
@@ -22,6 +23,7 @@ const harness = Layer.mergeAll(
 ).pipe(
   Layer.provide(Bus.layer),
   Layer.provide(Session.defaultLayer),
+  Layer.provide(Hook.defaultLayer),
   Layer.provide(Question.defaultLayer),
   Layer.provide(SubagentRegistry.defaultLayer),
 )

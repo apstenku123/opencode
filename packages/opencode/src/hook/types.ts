@@ -106,11 +106,19 @@ const EventSessionStart = z.object({
   hook_event_name: z.literal("SessionStart"),
   source: z.string(),
   model: z.string(),
+  /**
+   * Absolute path to the session's rollout JSONL file on disk, when the
+   * session has one (Stream G / rollout subsystem). Scripts that tail or
+   * post-process rollouts can pick this up directly from the payload.
+   */
+  rolloutPath: z.string().optional(),
 })
 
 const EventSessionEnd = z.object({
   hook_event_name: z.literal("SessionEnd"),
   reason: z.string(),
+  /** See `EventSessionStart.rolloutPath`. */
+  rolloutPath: z.string().optional(),
 })
 
 const EventUserPromptSubmit = z.object({
