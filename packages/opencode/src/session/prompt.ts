@@ -21,6 +21,7 @@ import PROMPT_PLAN from "../session/prompt/plan.txt"
 import BUILD_SWITCH from "../session/prompt/build-switch.txt"
 import MAX_STEPS from "../session/prompt/max-steps.txt"
 import { ToolRegistry } from "../tool"
+import { Apps } from "../apps"
 import { MCP } from "../mcp"
 import { LSP } from "../lsp"
 import { FileTime } from "../file/time"
@@ -555,6 +556,49 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           synthetic: true,
         })
         userMessage.parts.push(part)
+        return input.messages
+      })
+
+      /**
+       * Scan the last user message for `[$app](app://id)` mentions and, when
+       * any are found, append a single synthetic text part summarising which
+       * apps resolved against the bundled directory and which did not.
+       *
+       * Port of the user-prompt side of `codex-rs/core/src/apps/render.rs`:
+       * the Rust variant renders a static `## Apps` system section; we keep
+       * the hint scoped to the actual mentions so non-ChatGPT users aren't
+       * polluted with connector boilerplate when they never mention an app.
+       *
+       * Pure + idempotent: skipping the call when `parts` contains no `[$`
+       * sigil keeps the common path free of allocations.
+       */
+      const annotateAppMentions = Effect.fn("SessionPrompt.annotateAppMentions")(function* (input: {
+        messages: MessageV2.WithParts[]
+      }) {
+        const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
+        if (!userMessage) return input.messages
+
+        let combined = ""
+        for (const part of userMessage.parts) {
+          if (part.type !== "text") continue
+          if ("synthetic" in part && part.synthetic) continue
+          combined += (combined ? "\n" : "") + part.text
+        }
+        if (!Apps.hasMention(combined)) return input.messages
+
+        const dir = Apps.bundled()
+        const { known, unknown } = Apps.resolveFromText(dir, combined)
+        const note = Apps.renderSyntheticNote(known, unknown)
+        if (!note) return input.messages
+
+        userMessage.parts.push({
+          id: PartID.ascending(),
+          messageID: userMessage.info.id,
+          sessionID: userMessage.info.sessionID,
+          type: "text",
+          text: note,
+          synthetic: true,
+        })
         return input.messages
       })
 
@@ -1699,6 +1743,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const maxSteps = agent.steps ?? Infinity
             const isLastStep = step >= maxSteps
             msgs = yield* insertReminders({ messages: msgs, agent, session })
+            msgs = yield* annotateAppMentions({ messages: msgs })
 
             const msg: MessageV2.Assistant = {
               id: MessageID.ascending(),
