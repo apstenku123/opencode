@@ -33,6 +33,7 @@ import { SessionSummary } from "@/session/summary"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionAutosteerObserver } from "@/session/autosteer-observer"
 import { AdaptiveHooks } from "@/session/adaptive"
+import * as Hook from "@/hook"
 import { SubagentRegistry } from "@/subagent/registry"
 import { SessionMemoryObserver } from "@/session/memory-observer"
 import { defaultLayer as MemoryDefaultLayer } from "@/memory"
@@ -87,6 +88,7 @@ export const AppLayer = Layer.mergeAll(
   SessionPrompt.defaultLayer,
   SessionAutosteerObserver.defaultLayer,
   SubagentRegistry.defaultLayer,
+  Hook.defaultLayer,
   SessionMemoryObserver.defaultLayer,
   MemoryDefaultLayer,
   Instruction.defaultLayer,

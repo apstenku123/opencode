@@ -55,6 +55,7 @@ import { SessionMemoryObserver } from "./memory-observer"
 import { dequeueEnrichmentBlock } from "@/memory/turn-hooks"
 import { SubagentRegistry } from "@/subagent/registry"
 import { Config } from "@/config"
+import * as Hook from "@/hook"
 import { EffectBridge } from "@/effect"
 import { Skill } from "@/skill"
 import { SkillInjection } from "@/skill/injection"
@@ -196,6 +197,7 @@ export namespace SessionPrompt {
       const memoryObserver = yield* SessionMemoryObserver.Service
       const subagents = yield* SubagentRegistry.Service
       const config = yield* Config.Service
+      const hookService = yield* Hook.Service
 
       // preBreak observer: if the parent turn has any active sub-agent
       // children, wait for them to finish (bounded by
@@ -256,6 +258,54 @@ export namespace SessionPrompt {
             return AdaptiveHooks.Inject({
               text: parts.join("\n\n"),
               source: "stop-hooks",
+            })
+          }),
+      })
+
+      // preBreak observer: dispatch the `Stop` hook event via the new
+      // Hook.Service. This routes any entries configured under
+      // `experimental.hooks.Stop` through the full codex-rs hook
+      // dispatcher (JSON stdin, exit-code semantics, decision/abort
+      // support) and injects their `additional_context` into the next
+      // turn. An `abort` result short-circuits with a synthetic
+      // `<stop-abort>` inject so the user sees why. Legacy plain-text
+      // `stopHooks` entries are still handled by the observer above.
+      yield* adaptive.register({
+        name: "hook:stop",
+        preBreak: (_state, args) =>
+          Effect.gen(function* () {
+            const cfg = yield* config.get()
+            // Only process `experimental.hooks.Stop[]` entries; legacy
+            // `stopHooks` is handled by the observer above and should not
+            // double-dispatch through the new Hook.Service path.
+            const perEvent = cfg.experimental?.hooks as
+              | Record<string, unknown>
+              | undefined
+            const stopList = Array.isArray(perEvent?.["Stop"]) ? perEvent!["Stop"] : []
+            if ((stopList as unknown[]).length === 0) return AdaptiveHooks.Continue
+            const ctx = yield* InstanceState.context
+            const dispatched = yield* hookService.dispatch({
+              event: {
+                hook_event_name: "Stop",
+                stop_hook_active: false,
+                last_assistant_message: null,
+              },
+              sessionID: args.sessionID,
+              cwd: ctx.directory,
+            })
+            if (dispatched.outcome === "abort") {
+              return AdaptiveHooks.Inject({
+                text: `<stop-abort>\n${dispatched.abortReason ?? "hook aborted"}\n</stop-abort>`,
+                source: "hook:stop",
+              })
+            }
+            const ctxText = dispatched.additionalContext
+            if (!ctxText || ctxText.trim().length === 0) {
+              return AdaptiveHooks.Continue
+            }
+            return AdaptiveHooks.Inject({
+              text: ctxText,
+              source: "hook:stop",
             })
           }),
       })
@@ -2039,6 +2089,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           SkillEvolution.defaultLayer,
           SessionMemoryObserver.defaultLayer,
           SubagentRegistry.defaultLayer,
+          Hook.defaultLayer,
           Config.defaultLayer,
         ),
       ),

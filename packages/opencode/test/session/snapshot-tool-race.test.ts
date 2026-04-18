@@ -22,6 +22,7 @@ import { SessionPrompt } from "../../src/session/prompt"
 import { AdaptiveHooks } from "../../src/session/adaptive"
 import { SessionMemoryObserver } from "../../src/session/memory-observer"
 import { SubagentRegistry } from "../../src/subagent/registry"
+import * as Hook from "../../src/hook"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionSummary } from "../../src/session/summary"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -139,6 +140,7 @@ function makeHttp() {
     mcp,
     AppFileSystem.defaultLayer,
     status,
+    Hook.defaultLayer,
   ).pipe(Layer.provideMerge(infra))
   const question = Question.layer.pipe(Layer.provideMerge(deps))
   const todo = Todo.layer.pipe(Layer.provideMerge(deps))

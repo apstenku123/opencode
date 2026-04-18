@@ -539,11 +539,38 @@ export const Info = z
               )
               .optional()
               .describe(
-                "User-defined stop hooks (port of `codex.rs:7227-7261`). Each hook runs sequentially at the parent loop's pre-break point. If ANY hook writes a non-empty string to stdout, the loop injects that text as a synthetic user turn to hold the turn open.",
+                "User-defined stop hooks (port of `codex.rs:7227-7261`). Each hook runs sequentially at the parent loop's pre-break point. If ANY hook writes a non-empty string to stdout, the loop injects that text as a synthetic user turn to hold the turn open. DEPRECATED: prefer `experimental.hooks.Stop` which accepts the same shape plus `matcher`/`group`.",
               ),
           })
+          .catchall(
+            z
+              .array(
+                z.object({
+                  name: z.string(),
+                  command: z
+                    .union([z.string(), z.array(z.string())])
+                    .describe("Shell command (string or argv) run when the hook event fires."),
+                  matcher: z
+                    .string()
+                    .optional()
+                    .describe(
+                      "Regex matched against the event's `match_target` (e.g. `tool_name`). Events with no target always match.",
+                    ),
+                  group: z.string().optional().describe("Optional hook group label."),
+                  timeoutMs: z
+                    .number()
+                    .int()
+                    .positive()
+                    .optional()
+                    .describe("Per-hook timeout. Default 600000ms (10 min), matching codex-rs."),
+                }),
+              )
+              .optional(),
+          )
           .optional()
-          .describe("Experimental loop-level hooks (stop hooks, etc.)."),
+          .describe(
+            "User-defined hooks keyed by event name. Supported events: `SessionStart`, `SessionEnd`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `AfterToolUse`, `AfterAgent`, `Stop`, `SubagentStart`, `SubagentStop`, `PermissionRequest`, `PreCompact`, `Notification`, `ConfigChange`, `InstructionsLoaded`, `TeammateIdle`, `TaskCompleted`, `WorktreeCreate`, `WorktreeRemove`. Ports `codex-rs/hooks` crate.",
+          ),
       })
       .optional(),
   })
