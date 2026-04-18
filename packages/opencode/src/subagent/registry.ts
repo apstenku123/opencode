@@ -46,7 +46,8 @@
 
 import { SessionID } from "@/session/schema"
 import { InstanceState } from "@/effect"
-import { Effect, Layer, Context, Deferred } from "effect"
+import * as Hook from "@/hook"
+import { Effect, Layer, Context, Deferred, Option } from "effect"
 
 export namespace SubagentRegistry {
   export interface ChildSummary {
@@ -63,6 +64,8 @@ export namespace SubagentRegistry {
     readonly parentID: SessionID
     readonly startedAt: number
     readonly done: Deferred.Deferred<ChildSummary>
+    /** Agent type name (e.g. "general", "review") used by the SubagentStop hook event. */
+    readonly agentType: string
     /**
      * Optional cancel callback. Invoked by {@link cancelAll}. Should be
      * idempotent — `cancelAll` will both call it and `close()` the child as
@@ -74,6 +77,12 @@ export namespace SubagentRegistry {
   export interface SpawnOptions {
     /** Cancel callback invoked when the parent's fiber is interrupted. */
     readonly cancel?: () => void
+    /**
+     * Agent type (a.k.a. subagent name, e.g. "general"). Passed through to
+     * the `SubagentStop` hook event's `agent_type` field so user-configured
+     * hook matchers can target specific agent kinds. Defaults to "subagent".
+     */
+    readonly agentType?: string
   }
 
   /**
@@ -193,6 +202,49 @@ export namespace SubagentRegistry {
 
       const getState = InstanceState.get(data)
 
+      // Round 7 Stream 3: `Hook.Service` is a soft dependency. When it's
+      // present in the caller's context, every close() / cancelAll() /
+      // cancelChild() call fires a `SubagentStop` hook with a normalized
+      // reason. When the hook layer isn't provided (e.g. in the registry
+      // unit tests) we silently skip dispatch so existing consumers are
+      // unaffected. The lookup is performed on every invocation (not at
+      // layer construction) so the dispatch follows whatever context the
+      // caller provides at the time of close/cancel.
+      const fireSubagentStop = (
+        summary: ChildSummary,
+        agentType: string,
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          const hookOpt = yield* Effect.serviceOption(Hook.Service)
+          if (Option.isNone(hookOpt)) return
+          const reason: "completed" | "cancelled" | "failed" =
+            summary.status === "completed"
+              ? "completed"
+              : summary.status === "cancelled"
+                ? "cancelled"
+                : "failed"
+          const summaryText =
+            summary.status === "error"
+              ? summary.error ?? ""
+              : summary.result ?? ""
+          yield* hookOpt.value
+            .dispatch({
+              event: {
+                hook_event_name: "SubagentStop",
+                stop_hook_active: false,
+                agent_id: summary.sessionID,
+                agent_type: agentType,
+                parent_session_id: summary.parentID,
+                child_session_id: summary.sessionID,
+                summary: summaryText,
+                reason,
+                last_assistant_message: summaryText.length > 0 ? summaryText : null,
+              },
+              sessionID: summary.parentID,
+            })
+            .pipe(Effect.ignore)
+        })
+
       const spawn: Interface["spawn"] = (parentID, childID, options) =>
         Effect.gen(function* () {
           const state = yield* getState
@@ -201,6 +253,7 @@ export namespace SubagentRegistry {
             parentID,
             startedAt: Date.now(),
             done,
+            agentType: options?.agentType ?? "subagent",
             cancel: options?.cancel,
           })
           state.parentOf.set(childID, parentID)
@@ -234,6 +287,7 @@ export namespace SubagentRegistry {
           state.summaries.set(childID, summary)
           state.children.delete(childID)
           yield* Deferred.succeed(entry.done, summary)
+          yield* fireSubagentStop(summary, entry.agentType)
         })
 
       const cancelAll: Interface["cancelAll"] = (parentID) =>
@@ -260,6 +314,7 @@ export namespace SubagentRegistry {
             state.summaries.set(childID, summary)
             state.children.delete(childID)
             yield* Deferred.succeed(entry.done, summary)
+            yield* fireSubagentStop(summary, entry.agentType)
           }
           return entries.length
         })
@@ -366,6 +421,7 @@ export namespace SubagentRegistry {
           state.summaries.set(childID, summary)
           state.children.delete(childID)
           yield* Deferred.succeed(entry.done, summary)
+          yield* fireSubagentStop(summary, entry.agentType)
           return true
         })
 
