@@ -16,6 +16,12 @@ import {
 } from "../../plugin/github-copilot/copilot"
 import { StateSchema, empty, type State } from "../../plugin/github-copilot/connections"
 import { CopilotModels } from "../../plugin/github-copilot/models"
+import {
+  BUNDLE_VERSION,
+  exportBundle as exportBundleEffect,
+  importBundle as importBundleEffect,
+  parseBundle,
+} from "../../plugin/github-copilot/transfer"
 import { checkAccountStatuses, type AccountStatusInfo } from "../../plugin/github-copilot/health"
 import { map, pipe, sortBy, values } from "remeda"
 import path from "path"
@@ -735,6 +741,8 @@ export const ProvidersCommand = cmd({
       .command(ProvidersAccountsCommand)
       .command(ProvidersRouteDebugCommand)
       .command(ProvidersProxyCommand)
+      .command(ProvidersExportCommand)
+      .command(ProvidersImportCommand)
       .demandCommand(),
   async handler() {},
 })
@@ -1325,5 +1333,147 @@ export const ProvidersProxyCommand = cmd({
         : `Cleared proxy for ${copilotAliasLabel(key)}`,
     )
     prompts.outro("Done")
+  },
+})
+
+/**
+ * Export every configured GitHub Copilot account + connection state
+ * into a portable JSON bundle. See
+ * `packages/opencode/src/plugin/github-copilot/transfer.ts` for the
+ * schema and redaction semantics.
+ */
+export const ProvidersExportCommand = cmd({
+  command: "export",
+  describe: "export GitHub Copilot accounts as a portable JSON bundle",
+  builder: (yargs) =>
+    yargs
+      .option("out", {
+        type: "string",
+        describe: "write bundle to this file (default: stdout)",
+      })
+      .option("redact-tokens", {
+        type: "boolean",
+        describe: "omit refresh tokens and proxy tokens from the bundle",
+      })
+      .option("plain", {
+        type: "boolean",
+        describe: "emit raw JSON (default)",
+      })
+      .option("base64", {
+        type: "boolean",
+        describe: "wrap the JSON in a base64 envelope for clipboard-safe sharing",
+      })
+      .option("exported-by", {
+        type: "string",
+        describe: "free-form label recorded in the bundle (e.g. hostname)",
+      }),
+  async handler(args) {
+    if (args.plain && args.base64) {
+      process.stderr.write("error: --plain and --base64 are mutually exclusive\n")
+      process.exit(1)
+    }
+    const bundle = await AppRuntime.runPromise(
+      exportBundleEffect({
+        redactTokens: !!args.redactTokens,
+        exportedBy: args.exportedBy,
+      }),
+    )
+    const json = JSON.stringify(bundle, null, 2)
+    const payload = args.base64 ? Buffer.from(json, "utf8").toString("base64") + "\n" : json + "\n"
+    if (args.out) {
+      await Bun.write(args.out, payload)
+      process.stderr.write(
+        `wrote ${bundle.accounts.length} account${bundle.accounts.length === 1 ? "" : "s"} to ${args.out}${bundle.redacted ? " (redacted)" : ""}\n`,
+      )
+      return
+    }
+    process.stdout.write(payload)
+  },
+})
+
+/**
+ * Import a Copilot transfer bundle previously produced by
+ * `providers export`. Merges by default; `--replace` wipes existing
+ * `github-copilot*` entries first; `--dry-run` reports what would
+ * change without touching disk.
+ */
+export const ProvidersImportCommand = cmd({
+  command: "import <path>",
+  describe: "import a GitHub Copilot transfer bundle",
+  builder: (yargs) =>
+    yargs
+      .positional("path", {
+        type: "string",
+        describe: "path to bundle JSON (or '-' for stdin)",
+        demandOption: true,
+      })
+      .option("merge", {
+        type: "boolean",
+        describe: "merge into existing accounts (default)",
+      })
+      .option("replace", {
+        type: "boolean",
+        describe: "replace existing Copilot accounts before import",
+      })
+      .option("dry-run", {
+        type: "boolean",
+        describe: "show what would change without writing",
+      })
+      .option("json", {
+        type: "boolean",
+        describe: "emit import result as JSON",
+      }),
+  async handler(args) {
+    if (args.merge && args.replace) {
+      process.stderr.write("error: --merge and --replace are mutually exclusive\n")
+      process.exit(1)
+    }
+    const mode: "merge" | "replace" = args.replace ? "replace" : "merge"
+    let raw: string
+    if (args.path === "-") {
+      raw = await text(process.stdin)
+    } else {
+      raw = await Bun.file(args.path as string).text()
+    }
+    // Permit a base64-wrapped bundle for symmetry with `--base64` export.
+    const trimmed = raw.trim()
+    if (trimmed.length > 0 && trimmed[0] !== "{") {
+      try {
+        raw = Buffer.from(trimmed, "base64").toString("utf8")
+      } catch {
+        // fall through; parseBundle will reject.
+      }
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch (err) {
+      process.stderr.write(`error: invalid JSON in bundle (${(err as Error).message})\n`)
+      process.exit(1)
+    }
+    let bundle
+    try {
+      bundle = parseBundle(parsed)
+    } catch (err) {
+      process.stderr.write(`error: ${(err as Error).message}\n`)
+      process.exit(1)
+    }
+    const result = await AppRuntime.runPromise(
+      importBundleEffect(bundle, { mode, dryRun: !!args.dryRun }),
+    )
+    if (args.json) {
+      process.stdout.write(
+        JSON.stringify({ schemaVersion: BUNDLE_VERSION, ...result }, null, 2) + "\n",
+      )
+      return
+    }
+    UI.empty()
+    prompts.intro(`Import Copilot bundle${result.dryRun ? " (dry run)" : ""}`)
+    prompts.log.info(`mode: ${result.mode}`)
+    if (result.added.length > 0) prompts.log.success(`added: ${result.added.join(", ")}`)
+    if (result.updated.length > 0) prompts.log.info(`updated: ${result.updated.join(", ")}`)
+    if (result.removed.length > 0) prompts.log.info(`removed: ${result.removed.join(", ")}`)
+    if (result.skipped.length > 0) prompts.log.warn(`skipped: ${result.skipped.join(", ")}`)
+    prompts.outro(result.dryRun ? "no changes written" : "Done")
   },
 })

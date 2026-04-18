@@ -712,6 +712,55 @@ completed by `f408471a9`, which restored the extended commands and helpers from
 The corresponding test `test/cli/cmd/providers-quota.test.ts` was un-skipped in
 `9021ae3fc` and realigned with the current implementation in `f8ae678f0`.
 
+### Portable account transfer (`providers export`/`import`)
+
+`packages/opencode/src/plugin/github-copilot/transfer.ts` ports the Rust
+`codex-rs/github-copilot/src/transfer.rs` surface. It produces a portable
+JSON bundle that captures every Copilot OAuth credential plus the
+`copilot-connections.json` metadata we care about (plan label, proxy URL,
+`preferred` flag, etc.) so operators can move accounts between hosts.
+
+Bundle shape (`version: 1`):
+
+```jsonc
+{
+  "version": 1,
+  "accounts": [
+    {
+      "key": "github-copilot",
+      "label": "Primary",
+      "refresh": "<oauth-refresh-token>",
+      "enterpriseUrl": "https://ghe.example.com",
+      "plan": "pro",
+      "proxyUrl": "https://proxy.example",
+      "proxyToken": "<secret>"
+    }
+  ],
+  "connections": {
+    "github-copilot": { "plan": "pro", "proxyUrl": "https://proxy.example" }
+  },
+  "preferred": "github-copilot",
+  "exportedAt": 1700000000000,
+  "exportedBy": "host-a"
+}
+```
+
+- `opencode providers export [--out PATH] [--plain | --base64] [--redact-tokens] [--exported-by STR]`
+  writes the bundle to stdout or a file. `--redact-tokens` strips
+  `refresh`/`proxyToken` values (stable for sharing configs without
+  secrets, and flags `redacted: true` in the envelope).
+- `opencode providers import <PATH | ->` reads JSON (or base64-wrapped
+  JSON) from disk or stdin. `--merge` (default) upserts accounts keyed
+  by `account.key`; `--replace` wipes existing `github-copilot*` entries
+  and connection state first. `--dry-run` reports what would change
+  without touching disk. `--json` emits a machine-readable result.
+
+`parseBundle` rejects any bundle whose `version` differs from
+`BUNDLE_VERSION` so downgrades cannot silently lose fields. Bundles
+produced with `--redact-tokens` skip account restoration on import (no
+refresh token → cannot mint an Oauth entry) but still merge connection
+metadata, which is handy for sharing proxy/plan setups.
+
 ---
 
 ## Configuration and environment variables
