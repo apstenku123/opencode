@@ -1671,6 +1671,32 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             Effect.catchCause(() => Effect.void),
           )
 
+          // Turn lifecycle hooks — `TurnStart` fires before any iteration
+          // runs and `TurnStop` fires at loop exit. `turnId` is a ulid
+          // scoped to this single `runLoop` invocation; it is threaded
+          // through `UserMessage` and `AssistantMessage` payloads so
+          // external hook scripts can correlate a prompt/response pair
+          // with the turn that produced it. A `failed_abort` result from
+          // a TurnStart hook short-circuits the loop before the first
+          // iteration and returns the prior assistant message
+          // unchanged — no `TurnStop` is fired in the aborted case.
+          const turnId = ulid()
+          const turnStart = yield* hookService
+            .dispatch({
+              event: { hook_event_name: "TurnStart", turn_id: turnId },
+              sessionID,
+              cwd: ctx.directory,
+            })
+            .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+          if (turnStart && turnStart.outcome === "abort") {
+            yield* slog.info("TurnStart.abort", {
+              turnId,
+              reason: turnStart.abortReason,
+            })
+            return yield* lastAssistant(sessionID)
+          }
+          let finishReason: string = "unknown"
+
           while (true) {
             yield* status.set(sessionID, { type: "busy" })
             yield* slog.info("loop", { step })
@@ -1915,6 +1941,27 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const adaptiveState = yield* adaptive.stateFor(sessionID)
               const enrichmentBlock = dequeueEnrichmentBlock(adaptiveState)
               if (enrichmentBlock) system.push(enrichmentBlock)
+
+              // `UserMessage` hook — fires for the pending user input
+              // immediately before the iteration's provider call. The
+              // payload carries `turn_id` (scoped to this runLoop
+              // invocation), the user row `message_id`, and the
+              // concatenated non-synthetic/non-ignored text parts. A
+              // `failed_abort` result is logged but does not short-circuit
+              // the iteration — prompt delivery must remain deterministic.
+              yield* hookService
+                .dispatch({
+                  event: {
+                    hook_event_name: "UserMessage",
+                    turn_id: turnId,
+                    message_id: lastUser.id,
+                    text: userText ?? "",
+                  },
+                  sessionID,
+                  cwd: ctx.directory,
+                })
+                .pipe(Effect.catchCause(() => Effect.void))
+
               const result = yield* handle.process({
                 user: lastUser,
                 agent,
@@ -1959,6 +2006,50 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
               return "continue" as const
             }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))
+
+            // Track the most recent assistant finish reason so `TurnStop`
+            // can report it at loop exit. Providers occasionally emit
+            // "tool-calls" mid-turn and the real stop reason arrives on
+            // a later iteration; we keep overwriting so the final value
+            // reflects the last iteration that actually terminated the
+            // loop.
+            if (handle.message?.finish) finishReason = handle.message.finish
+
+            // `AssistantMessage` hook — fires after each iteration's
+            // provider call completes, with the freshly-persisted
+            // assistant message id, concatenated text parts, and the
+            // optional list of tool-call names. Parts are re-read from
+            // session storage (the `msgs` snapshot captured at iteration
+            // start predates `handle.process` and does not include the
+            // new assistant message). Dispatch failures are swallowed —
+            // observer errors must not fail the turn.
+            const freshMsgs = yield* sessions.messages({ sessionID })
+            const freshAssistantMsg = freshMsgs.findLast(
+              (m) => m.info.role === "assistant" && m.info.id === handle.message.id,
+            )
+            const freshAssistantText =
+              freshAssistantMsg?.parts
+                .filter((p): p is MessageV2.TextPart => p.type === "text")
+                .map((p) => p.text)
+                .join("\n") ?? ""
+            const toolCalls =
+              freshAssistantMsg?.parts
+                .filter((p): p is MessageV2.ToolPart => p.type === "tool")
+                .map((p) => p.tool)
+                .filter((name) => typeof name === "string" && name.length > 0) ?? []
+            yield* hookService
+              .dispatch({
+                event: {
+                  hook_event_name: "AssistantMessage",
+                  turn_id: turnId,
+                  message_id: handle.message.id,
+                  text: freshAssistantText,
+                  ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+                },
+                sessionID,
+                cwd: ctx.directory,
+              })
+              .pipe(Effect.catchCause(() => Effect.void))
 
             // [Adaptive Hook B: post-iteration] — behavior-neutral in round 1.
             // Observers may return `break` to force exit, `inject` to emit a
@@ -2006,6 +2097,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
           yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
           const out = yield* lastAssistant(sessionID)
+          // `TurnStop` hook — fires at `runLoop` exit with the final
+          // iteration count (`step`) and the last observed finish
+          // reason. Dispatch errors are swallowed so observer failures
+          // cannot fail a turn after the assistant reply has already
+          // landed. The abort-branch path above returns before this
+          // site, so TurnStop is never paired with a TurnStart that
+          // was itself aborted.
+          yield* hookService
+            .dispatch({
+              event: {
+                hook_event_name: "TurnStop",
+                turn_id: turnId,
+                iterations: step,
+                finish_reason: finishReason,
+              },
+              sessionID,
+              cwd: ctx.directory,
+            })
+            .pipe(Effect.catchCause(() => Effect.void))
           // Autobest extract + cycle advance + auto-continuation are now
           // owned end-to-end by `SessionAutobestObserver` via the
           // AdaptiveHooks `postIteration` pipeline (see ensureRegistered

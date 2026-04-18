@@ -1748,3 +1748,145 @@ it.live(
     ),
   30_000,
 )
+
+// Round-7 Stream 4 — TurnStart/TurnStop + UserMessage/AssistantMessage.
+// Validates ordering, payload fields, and TurnStart short-circuit.
+
+it.live(
+  "runLoop fires TurnStart, UserMessage, AssistantMessage, TurnStop in order with correct payloads",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const hookService = yield* Hook.Service
+        const chat = yield* sessions.create({
+          title: "Turn lifecycle",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        type Recorded = { event: string; payload: Record<string, unknown> }
+        const events: Recorded[] = []
+        const off = yield* hookService.register({
+          name: "test:turn-lifecycle-recorder",
+          run: (payload) =>
+            Effect.sync(() => {
+              const e = payload.hook_event
+              const name = e.hook_event_name
+              if (
+                name === "TurnStart" ||
+                name === "TurnStop" ||
+                name === "UserMessage" ||
+                name === "AssistantMessage"
+              ) {
+                events.push({ event: name, payload: e as unknown as Record<string, unknown> })
+              }
+              return {
+                kind: "success" as const,
+                decision_interrupt: false,
+                suppress_output: false,
+              }
+            }),
+        })
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "hello" }],
+        })
+        yield* llm.text("world")
+
+        const result = yield* prompt.loop({ sessionID: chat.id })
+        expect(result.info.role).toBe("assistant")
+
+        const order = events.map((e) => e.event)
+        expect(order[0]).toBe("TurnStart")
+        expect(order[order.length - 1]).toBe("TurnStop")
+        const userIdx = order.indexOf("UserMessage")
+        const assistantIdx = order.indexOf("AssistantMessage")
+        expect(userIdx).toBeGreaterThan(0)
+        expect(assistantIdx).toBeGreaterThan(userIdx)
+
+        const turnStart = events.find((e) => e.event === "TurnStart")!
+        const turnStop = events.find((e) => e.event === "TurnStop")!
+        const userMsg = events.find((e) => e.event === "UserMessage")!
+        const assistantMsg = events.find((e) => e.event === "AssistantMessage")!
+
+        const turnId = turnStart.payload.turn_id as string
+        expect(typeof turnId).toBe("string")
+        expect(turnId.length).toBeGreaterThan(0)
+        expect(userMsg.payload.turn_id).toBe(turnId)
+        expect(assistantMsg.payload.turn_id).toBe(turnId)
+        expect(turnStop.payload.turn_id).toBe(turnId)
+
+        expect(userMsg.payload.text).toBe("hello")
+        expect(typeof userMsg.payload.message_id).toBe("string")
+
+        expect(assistantMsg.payload.text).toBe("world")
+        expect(assistantMsg.payload.message_id).toBe(result.info.id)
+
+        expect(turnStop.payload.iterations).toBeGreaterThanOrEqual(1)
+        expect(typeof turnStop.payload.finish_reason).toBe("string")
+
+        off()
+      }),
+      { git: true, config: providerCfg },
+    ),
+  30_000,
+)
+
+it.live(
+  "TurnStart hook abort short-circuits the runLoop before the first iteration",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const hookService = yield* Hook.Service
+        const chat = yield* sessions.create({
+          title: "TurnStart abort",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        let turnStopFired = false
+        let turnStartFired = false
+        const off = yield* hookService.register({
+          name: "test:turn-abort",
+          run: (payload) =>
+            Effect.sync(() => {
+              const name = payload.hook_event.hook_event_name
+              if (name === "TurnStart") {
+                turnStartFired = true
+                return {
+                  kind: "failed_abort" as const,
+                  error: "blocked by test hook",
+                }
+              }
+              if (name === "TurnStop") turnStopFired = true
+              return {
+                kind: "success" as const,
+                decision_interrupt: false,
+                suppress_output: false,
+              }
+            }),
+        })
+
+        // Seed a prior assistant message and a pending user follow-up.
+        // If the abort fails to short-circuit, the LLM would drain one
+        // reply and `llm.calls` would be > 0.
+        yield* seed(chat.id, { finish: "stop" })
+        yield* user(chat.id, "follow-up")
+
+        const result = yield* prompt.loop({ sessionID: chat.id })
+        expect(result.info.role).toBe("assistant")
+        expect(turnStartFired).toBe(true)
+        expect(turnStopFired).toBe(false)
+        expect(yield* llm.calls).toBe(0)
+
+        off()
+      }),
+      { git: true, config: providerCfg },
+    ),
+  30_000,
+)

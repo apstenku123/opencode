@@ -6,12 +6,14 @@
  * that external hook scripts written against Claude Code / codex-rs hooks
  * continue to work when targeted at opencode.
  *
- * Event kinds covered (17 total — matches `HookEvent` enum in Rust):
+ * Event kinds covered (21 total — the first 17 match `HookEvent` enum in
+ * Rust; the last four are opencode-native turn lifecycle events wired
+ * into `session/prompt.ts:runLoop`):
  *
  *   - `SessionStart` / `SessionEnd`
- *   - `UserPromptSubmit` (replaces "UserMessage" naming)
+ *   - `UserPromptSubmit` (codex-compatible pre-turn event)
  *   - `PreToolUse` / `PostToolUse` / `PostToolUseFailure` / `AfterToolUse`
- *   - `AfterAgent` (turn-end — analogous to "AssistantMessage")
+ *   - `AfterAgent` (codex-compatible turn-end event)
  *   - `Stop` (existing opencode behaviour — `stopHooks`)
  *   - `SubagentStart` / `SubagentStop`
  *   - `PermissionRequest`
@@ -19,6 +21,10 @@
  *   - `Notification` / `ConfigChange` / `InstructionsLoaded`
  *   - `TeammateIdle` / `TaskCompleted`
  *   - `WorktreeCreate` / `WorktreeRemove`
+ *   - `TurnStart` / `TurnStop` — fired at `runLoop` entry / exit
+ *   - `UserMessage` / `AssistantMessage` — fired per iteration,
+ *     carrying the message id + text (and tool-call names for
+ *     assistant turns)
  *
  * The TS schemas use zod for runtime validation and double as the source of
  * truth for `Hook.dispatch` payloads.
@@ -46,6 +52,10 @@ export const HookEventName = z.enum([
   "TaskCompleted",
   "WorktreeCreate",
   "WorktreeRemove",
+  "TurnStart",
+  "TurnStop",
+  "UserMessage",
+  "AssistantMessage",
 ])
 export type HookEventName = z.infer<typeof HookEventName>
 
@@ -239,6 +249,62 @@ const EventWorktreeRemove = z.object({
   worktree_path: z.string(),
 })
 
+/**
+ * `TurnStart` — fired at the top of `runLoop` before any iteration runs.
+ * `turn_id` is a ulid generated per runLoop invocation. A `failed_abort`
+ * result from a TurnStart hook short-circuits the loop before the first
+ * iteration; no TurnStop is fired in that case.
+ *
+ * `session_id` is already present at the {@link HookPayload} root and is
+ * not duplicated in the event body.
+ */
+const EventTurnStart = z.object({
+  hook_event_name: z.literal("TurnStart"),
+  turn_id: z.string(),
+})
+
+/**
+ * `TurnStop` — fired at `runLoop` exit, after the last assistant message
+ * has been produced (or after an early `break`). `iterations` is the
+ * final value of the loop's `step` counter; `finish_reason` is the final
+ * assistant message's `finish` field (e.g. "stop", "tool-calls",
+ * "length") or "aborted" if the loop exited due to a hook abort.
+ */
+const EventTurnStop = z.object({
+  hook_event_name: z.literal("TurnStop"),
+  turn_id: z.string(),
+  iterations: z.number().int().nonnegative(),
+  finish_reason: z.string(),
+})
+
+/**
+ * `UserMessage` — fired before each iteration's `handle.process` call,
+ * capturing the pending user input that will be sent to the model.
+ * `message_id` is the id of the user message row; `text` is the
+ * concatenated non-synthetic, non-ignored text parts of that message.
+ */
+const EventUserMessage = z.object({
+  hook_event_name: z.literal("UserMessage"),
+  turn_id: z.string(),
+  message_id: z.string(),
+  text: z.string(),
+})
+
+/**
+ * `AssistantMessage` — fired after each iteration completes,
+ * capturing the assistant message produced by the model.
+ * `tool_calls` is the optional list of tool-name strings the assistant
+ * invoked during the iteration (empty/omitted when the assistant only
+ * emitted text).
+ */
+const EventAssistantMessage = z.object({
+  hook_event_name: z.literal("AssistantMessage"),
+  turn_id: z.string(),
+  message_id: z.string(),
+  text: z.string(),
+  tool_calls: z.array(z.string()).optional(),
+})
+
 export const HookEvent = z.discriminatedUnion("hook_event_name", [
   EventStop,
   EventSessionStart,
@@ -260,6 +326,10 @@ export const HookEvent = z.discriminatedUnion("hook_event_name", [
   EventTaskCompleted,
   EventWorktreeCreate,
   EventWorktreeRemove,
+  EventTurnStart,
+  EventTurnStop,
+  EventUserMessage,
+  EventAssistantMessage,
 ])
 export type HookEvent = z.infer<typeof HookEvent>
 
@@ -290,6 +360,8 @@ export function matchTargetFor(event: HookEvent): string | undefined {
       return event.trigger
     case "Stop":
       return event.last_assistant_message ?? undefined
+    case "TurnStop":
+      return event.finish_reason
     default:
       return undefined
   }
