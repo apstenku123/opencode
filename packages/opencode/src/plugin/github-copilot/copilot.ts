@@ -53,8 +53,23 @@ import {
   upsert,
   type State,
 } from "./connections"
+import { gateModel, poolForAccount, type PoolConfig, type PoolId } from "./pool-routing"
 
 const log = Log.create({ service: "plugin.copilot" })
+
+let poolRoutingConfig: PoolConfig | undefined
+
+export function setPoolRoutingConfig(cfg: PoolConfig | undefined): void {
+  poolRoutingConfig = cfg
+}
+
+export function getPoolRoutingConfig(): PoolConfig | undefined {
+  return poolRoutingConfig
+}
+
+export function resolveAccountPool(state: State, key: string): PoolId | undefined {
+  return poolForAccount({ key, plan: byPlan(state, key), cfg: poolRoutingConfig })
+}
 
 async function readState() {
   return Effect.runPromise(
@@ -358,13 +373,20 @@ export function syncAccount(state: State, auths: CopilotAuth[]) {
 
 export function preferPlan(state: State, auths: CopilotAuth[], modelId: string) {
   if (!modelId) return auths
-  const want = modelId.includes("edu") ? "edu" : modelId.includes("free") ? "free" : undefined
+  const pool = gateModel(modelId, poolRoutingConfig).pool
+  if (pool) {
+    const items = auths.filter((item) => resolveAccountPool(state, item.key) === pool)
+    return items.length > 0 ? items : auths
+  }
+  const want = policyPlan(modelId)
   if (!want) return auths
   const items = auths.filter((item) => byPlan(state, item.key) === want)
   return items.length > 0 ? items : auths
 }
 
-export function policyPlan(modelId: string) {
+export function policyPlan(modelId: string): PoolId | "enterprise" | "business" | "team" | "free" | undefined {
+  const pool = gateModel(modelId, poolRoutingConfig).pool
+  if (pool) return pool
   const text = modelId.toLowerCase()
   if (text.includes("edu")) return "edu"
   if (text.includes("enterprise")) return "enterprise"
@@ -464,7 +486,15 @@ export function preferPolicy(state: State, auths: CopilotAuth[], modelId: string
   })
   const pool = live.length > 0 ? live : items
   if (!want) return rotate(state, pool)
-  const lane = pool.filter((item) => byPlan(state, item.key) === want)
+  // `want` may be an explicit pool id (`edu`/`prod`) from the routing
+  // table, or a legacy plan name (`enterprise`/`business`/…). Match
+  // both — pool-id matches delegate to `resolveAccountPool`; plan-name
+  // matches keep the historical `byPlan` lookup so alias-style model
+  // ids (e.g. `gpt-5-enterprise`) continue to narrow correctly.
+  const lane = pool.filter((item) => {
+    if (want === "edu" || want === "prod") return resolveAccountPool(state, item.key) === want
+    return byPlan(state, item.key) === want
+  })
   return rotate(state, lane.length > 0 ? lane : pool)
 }
 
@@ -880,6 +910,20 @@ export async function dispatch(input: {
 }): Promise<Response> {
   const info = await input.getAuth()
   if (info.type !== "oauth") return fetch(input.request, input.init)
+  // Enforce the xhighOnly family gate before any state / pool work so
+  // a rejected model never consumes a lease / rate-limiter slot. The
+  // caller sees a synthetic 400 with `x-copilot-pool-gate: blocked`
+  // plus a JSON body describing the reason, so the outer retry loop
+  // can surface the message verbatim.
+  if (input.modelId) {
+    const gate = gateModel(input.modelId, poolRoutingConfig)
+    if (!gate.allow) {
+      return new Response(
+        JSON.stringify({ error: { code: "model_not_permitted", message: gate.reason } }),
+        { status: 400, headers: { "content-type": "application/json", "x-copilot-pool-gate": "blocked" } },
+      )
+    }
+  }
   const loaded = await input.read()
   const state = syncAccount(loaded, input.auths)
   const fallback: CopilotAuth = {
@@ -1232,6 +1276,11 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   const premium = new Map<string, Set<string>>()
   const { AppRuntime } = await import("@/effect/app-runtime")
   const resolvedCfg = await AppRuntime.runPromise(Config.Service.use((cfg) => cfg.get())).catch(() => undefined)
+  // Seed the module-level pool-routing config so `policyPlan()` /
+  // `preferPlan()` see explicit `edu`/`prod` mapping immediately on
+  // the first dispatch of this process.
+  const { extractPoolConfig } = await import("./pool-routing")
+  setPoolRoutingConfig(extractPoolConfig(resolvedCfg as any))
   const cfg = copilotRuntimeConfig(resolvedCfg)
   const runtime = owner(cfg.limit, cfg.minIntervalMs)
   // Attach the adaptive rate limiter. Driven by `copilot.rateLimiter.*`

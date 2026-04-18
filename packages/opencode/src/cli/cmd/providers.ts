@@ -8,12 +8,14 @@ import { summarizeMigration } from "../../plugin/github-copilot/auth"
 import { connectionFile } from "../../plugin/github-copilot/paths"
 import {
   CopilotRuntimeState,
+  getPoolRoutingConfig,
   recent429,
   recentDiscoveryError,
   routeDebug,
   score,
   type RouteDebug,
 } from "../../plugin/github-copilot/copilot"
+import { poolForAccount, type PoolId } from "../../plugin/github-copilot/pool-routing"
 import { StateSchema, empty, type State } from "../../plugin/github-copilot/connections"
 import { CopilotModels } from "../../plugin/github-copilot/models"
 import {
@@ -390,6 +392,7 @@ export type AccountStatusJSON = {
   label: string
   login: string | null
   plan: string | null
+  pool: PoolId | null
   proxy: boolean
   premium: string | null
   health: string
@@ -401,6 +404,17 @@ export type AccountStatusJSON = {
   discovery: AccountDiscoveryJSON
   penalties: AccountPenaltyJSON
   route: AccountRouteJSON
+}
+
+/**
+ * Resolve the display label for an account's pool assignment. Uses
+ * the module-level pool-routing config (seeded at plugin boot) so
+ * explicit `copilot.poolRouting.pools` overrides win over plan-derived
+ * defaults. Returns `undefined` when neither rule classifies the
+ * account.
+ */
+export function accountPoolLabel(key: string, plan?: string | null): PoolId | undefined {
+  return poolForAccount({ key, plan: plan ?? undefined, cfg: getPoolRoutingConfig() })
 }
 
 export function emptyDiscovery(): AccountDiscoveryJSON {
@@ -448,6 +462,7 @@ export function jsonStatus(
     label: input.label,
     login: input.login ?? null,
     plan: input.plan ?? null,
+    pool: accountPoolLabel(input.key, input.plan) ?? null,
     proxy: input.proxy,
     health: input.health,
     exhausted: input.exhausted,
@@ -553,8 +568,10 @@ export function renderAccountStatus(
   status: ReturnType<typeof accountStatus>,
   input?: { premium?: string; enterpriseUrl?: string },
 ) {
+  const pool = accountPoolLabel(status.key, status.plan)
   const extra = [
     status.proxy ? "proxy on" : "direct",
+    `pool=${pool ?? "<none>"}`,
     status.exhausted ? "cooldown" : undefined,
     input?.enterpriseUrl ? `ghe ${input.enterpriseUrl}` : undefined,
     status.discovery?.stale ? "discovery stale" : status.discovery ? "discovery fresh" : undefined,

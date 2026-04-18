@@ -252,6 +252,37 @@ export const Info = z
       .optional(),
     copilot: z
       .object({
+        poolRouting: z
+          .object({
+            pools: z
+              .object({
+                edu: z.array(z.string()).optional().describe("Account keys pinned to the edu (free/unlimited) pool."),
+                prod: z
+                  .array(z.string())
+                  .optional()
+                  .describe("Account keys pinned to the prod (pro/enterprise) pool."),
+              })
+              .optional()
+              .describe(
+                "Explicit per-pool account membership. Overrides plan-derived defaults (`free`/`edu` → edu; `pro`/`enterprise`/`business`/`team` → prod).",
+              ),
+            models: z
+              .record(z.string(), z.enum(["edu", "prod"]))
+              .optional()
+              .describe(
+                "Per-model pool override. Merges with built-in defaults (`codex-5.3*` → edu, `gpt-5.4*` / `claude-4.7-opus-high` / `claude-sonnet-4.7` → prod).",
+              ),
+            xhighOnly: z
+              .array(z.string())
+              .optional()
+              .describe(
+                "Model family prefixes that only permit their `-xhigh` variant. Non-xhigh requests are rejected with `model_not_permitted`. Default: `[\"gpt-5.4\", \"codex-5.3\"]`.",
+              ),
+          })
+          .optional()
+          .describe(
+            "Explicit pool-routing policy for GitHub Copilot multi-account. Defines edu (free/unlimited) vs prod (pro/enterprise) pools and the per-model family routing table.",
+          ),
         rateLimiter: z
           .object({
             enabled: z

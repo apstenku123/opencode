@@ -251,6 +251,7 @@ test("jsonStatus emits stable nullable schema", () => {
     label: "Primary",
     login: null,
     plan: null,
+    pool: null,
     proxy: false,
     premium: null,
     health: "ok",
