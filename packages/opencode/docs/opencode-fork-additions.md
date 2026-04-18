@@ -1016,3 +1016,118 @@ eagerly. This is a compatibility fix introduced while aligning the R-channel (co
 - A 429 response blocks the account for 11 minutes (wall-clock, not monotonic). A discovery error blocks discovery rank promotion for 30 minutes.
 
 ---
+
+## Rounds 4–7 additions (v`1.4.6-unify.1`)
+
+After the initial merge the fork continued in four additional rounds, each run as 8 parallel feature streams + an integrator. Summary of what each round delivered on top of the baseline in the sections above.
+
+### Round 4 — close R3 residuals
+
+| Area | Change | Commit(s) |
+|---|---|---|
+| `SessionPrompt.runLoop` | `AdaptiveHooks.Inject` directive converts into real synthetic `MessageV2.User{synthetic:true}` + re-enters the loop | `f76766f24`, `b3eed66c7` |
+| `subagent/guardian.ts` | Full guardian routing: `parentOf` + `Question.Event.ForwardedToParent` + auto-approval via parent's permission ruleset | `343f85196` |
+| `SessionPrompt.runStopHook` | ChildProcess-backed runner + preBreak observer walking `experimental.hooks.stopHooks[]` | `2fd2158b9` |
+| `app-runtime.ts` | Removed speculative R-channel cast — `Database.use()` is sync, Memory layer has `R=never` natively | `45cf0b0c4` |
+| `src/embedding/` | Extracted `Embedding.Service` + LocalTfIdf provider + `hybridRank` (0.4×BM25 + 0.6×cosine) | `a4d02f698` |
+| Memory extractor | Lazy LLM bridge resolution inside `ensureRegistered` closure (fixes 38 prompt-effect regressions from eager layer-time resolution) | `cb2bb19a3` |
+| Observer consolidation | `SessionAutobestObserver.Service`/`layer`/`defaultLayer` markers removed; pure helpers + `ensureRegistered` only. autosteer migrated to `AdaptiveHooks.postIteration` | `9e0164573` |
+
+### Round 5 — architectural features
+
+| Area | Change | Commit(s) |
+|---|---|---|
+| **BlackBird client** | `plugin/github-copilot/blackbird.ts` (~490 LOC) — Copilot embeddings / chunks / code-search client | `9c2e60281` |
+| **Account transfer** | `plugin/github-copilot/transfer.ts` + `providers export`/`providers import` CLI | `09cb95730` |
+| **CopilotRateLimiter** | Adaptive semaphore, 10-min sliding 429 window, FIFO waiter queue | `2cfe3f0eb` |
+| **AccountPool RAII** | `acquirePreferSecondary`, primary/backup split, typed `AcquireTimeoutError`, `Symbol.asyncDispose` | `4ad0458bf` |
+| **Parent-UI forwarded modal** | TUI inline prompt on `Question.Event.ForwardedToParent` with FIFO queue + dedupe | `9552e9303` |
+| **Memory hybrid retrieval** | `Bm25MemoryIndex` over sextuples; default `retrieval.mode = hybrid` | `09a09dbd3` |
+
+### Round 6 — residual codex_git features
+
+| Stream | Feature |
+|---|---|
+| **A** | **Hooks system** — 21 event kinds, subprocess dispatcher, config `experimental.hooks.<EventName>[]` |
+| **B** | **multi_agents tool family** — `task-wait`, `task-send-input`, `task-close`, `task-list` + `SubagentRegistry` extensions |
+| **C** | **Exec-policy DSL + Keyring** — YAML/JSONC rule DSL with ReDoS guards + `keytar` + AES-256-GCM fallback |
+| **D** | **Connectors + apps directory** — `[$name](app://id)` parser, 8 bundled apps, MCP adapter |
+| **E** | **ACP server parity** — elicitation, plan-mode, replay capability |
+| **F** | **Shared HTTP stack** — typed errors, retry with jitter, custom-CA |
+| **G** | **Rollout/replay foundation** — JSONL append-only with resume + pure replay |
+| **H** | **Skill router + builtins + memory polish** — RRF/Boltzmann router, 8 builtin skills, `refining-llm.ts` LLM polish |
+
+### Round 7 — hooks integration at call sites
+
+All 10 hook event points are now wired into production code:
+
+| Call site | Hook events | Commit |
+|---|---|---|
+| `tool/registry.ts` execute wrapper | PreToolUse (abort/deny/ask/updatedInput) → PostToolUse (updatedOutput) | `4f573dc3f` |
+| `session/session.ts` | SessionStart / SessionEnd (with `rolloutPath`, `reason`) | `008720706` |
+| `tool/task.ts` + `subagent/registry.ts` | SubagentStart / SubagentStop with `reason: completed\|cancelled\|failed` | `2ebadc926` |
+| `session/prompt.ts` runLoop | TurnStart → UserMessage → AssistantMessage → TurnStop (ULID per turn, with `finish_reason`) | `b79852aea` |
+| `permission/index.ts` + `question/index.ts` | PermissionRequest (short-circuitable) → PermissionGranted/Denied with `source` enum | `c36cbf75b` |
+| `session/compaction.ts` | PreCompact (with metrics) → PostCompact (summary). Deny cancels compaction | `8c0f289be` |
+| `mcp/connectors.ts` | `invokeConnector(app, toolName, args)` via `MCP.Service.tools()` | `5487703ce` |
+| `acp/replay.ts` | Real replay via `Rollout.Replay.replayToEmitter` streaming `session/update` chunks | `5487703ce` |
+
+### Configuration surface added through R4–R7
+
+```yaml
+# opencode.json example
+{
+  "experimental": {
+    "hooks": {
+      "PreToolUse": [{"name": "audit", "command": "/path/to/audit.sh", "matcher": "bash|write", "timeoutMs": 5000}],
+      "PostToolUse": [], "SessionStart": [], "SubagentStart": [], "Stop": [],
+      "stopHooks": []
+    },
+    "subagent": { "maxConcurrent": 8, "depthLimit": 3, "autoWaitTimeoutMs": 300000 }
+  },
+  "memories": {
+    "enabled": false,
+    "retrieval": { "mode": "hybrid", "bm25Weight": 0.4, "embeddingWeight": 0.6 }
+  },
+  "skills": {
+    "autoskill": true, "builtin": true,
+    "router": { "kind": "rrf" }
+  },
+  "autobest": { "enabled": true, "maxIterations": 3 },
+  "autosteering": { "enabled": true },
+  "copilot": {
+    "rateLimiter": { "enabled": true, "maxConcurrent": 7, "threshold": 0.2 }
+  }
+}
+```
+
+### Environment variables added through R4–R7
+
+| Env | Purpose |
+|---|---|
+| `OPENCODE_USE_KEYRING=1` | Route credentials through OS keyring (keytar) with AES-256-GCM fallback |
+| `OPENCODE_KEYRING_DISABLE=1` | Force fallback file store even when keytar available |
+| `OPENCODE_ALLOW_TEST_ACCOUNTS=1` | Include `github-copilot#edu-*` accounts in routing |
+| `OPENCODE_COPILOT_PROXY_ENVELOPE=1` | Use Rust-compatible `POST {proxy}/fetch` envelope |
+| `OPENCODE_COPILOT_RATE_LIMITER_*` | Override `rateLimiter.*` config per-process |
+| `OPENCODE_DISABLE_BUILTIN_SKILLS=1` | Disable 8 bundled builtin skills |
+| `OPENCODE_EMBEDDING_PROVIDER=local\|api\|none` | Force TF-IDF local / API / disabled embedding |
+
+### Upgrade isolation
+
+Auto-updater queries `https://api.github.com/repos/apstenku123/opencode/releases/latest` (not upstream `anomalyco/opencode`). Only tags published to **this fork** trigger upgrade prompts. Upstream releases cannot auto-update over the unify branch.
+
+### Test surface summary
+
+| Milestone | Pass count |
+|---|---|
+| Pre-merge baseline (`dev`) | 1378 |
+| R1–R3 integration | 2785 |
+| R4 (close TODOs) | 2835 |
+| R5 (architectural) | 2941 |
+| R6 (residual codex_git) | 3214 |
+| **R7 (hook integration + connector runtime + replay bridge)** | **3258** |
+
+Pre-push hook (`bun turbo typecheck`) passes across all 13 packages without `--no-verify` at HEAD.
+
+---
