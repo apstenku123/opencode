@@ -292,32 +292,48 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
         try:
             if not _server_supports_instance_routes(server.base_url, str(scratch)):
                 pytest.skip("opencode serve missing instance routes")
-            with OpencodeClient(
-                server.base_url,
-                project_directory=str(scratch),
-                timeout_s=300.0,
-            ) as client:
-                session = client.create_session()
-                client.send_message(
-                    session["id"],
-                    (
-                        "I fixed a bug where parseInt('01') was treating leading "
-                        "zero as octal. Solution: use parseInt(x, 10) with "
-                        "explicit radix."
-                    ),
-                    providerID=copilot_model["providerID"],
-                    modelID=copilot_model["modelID"],
+            try:
+                with OpencodeClient(
+                    server.base_url,
+                    project_directory=str(scratch),
+                    timeout_s=300.0,
+                ) as client:
+                    session = client.create_session()
+                    client.send_message(
+                        session["id"],
+                        (
+                            "I fixed a bug where parseInt('01') was treating leading "
+                            "zero as octal. Solution: use parseInt(x, 10) with "
+                            "explicit radix."
+                        ),
+                        providerID=copilot_model["providerID"],
+                        modelID=copilot_model["modelID"],
+                    )
+                    # Post-turn Phase-1 extraction fires in a forked fiber
+                    # (`Effect.forkDetach` inside the memory turn observer).
+                    # The server must stay alive long enough for the fork
+                    # to finish its LLM round-trip + storage write;
+                    # stop() while the fork is pending cancels it. Poll
+                    # status against the running server so the fork has
+                    # time to complete.
+                    count = _poll_sextuple_count(
+                        root, scratch, deadline_s=180.0
+                    )
+            except Exception:
+                # Surface the server's stderr capture to aid diagnosis
+                # when the server disconnects mid-turn.
+                print(
+                    f"[memory-e2e] server stderr:\n{server.stderr_text()[-4000:]}",
+                    file=sys.stderr,
                 )
-                # Post-turn Phase-1 extraction fires in a forked fiber
-                # (`Effect.forkDetach` inside the memory turn observer).
-                # The server must stay alive long enough for the fork to
-                # finish its LLM round-trip + storage write; stop() while
-                # the fork is pending cancels it. Poll status against the
-                # running server so the fork has time to complete.
-                count = _poll_sextuple_count(
-                    root, scratch, deadline_s=180.0
-                )
+                raise
         finally:
+            if os.environ.get("OPENCODE_E2E_PRINT_LOGS") == "1":
+                print(
+                    f"[memory-e2e] server stderr tail:\n"
+                    f"{server.stderr_text()[-8000:]}",
+                    file=sys.stderr,
+                )
             server.stop()
 
         assert count >= 1, (

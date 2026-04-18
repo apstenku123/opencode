@@ -421,12 +421,18 @@ export const DEFAULT_HOOKS_CONFIG: MemoryHooksConfig = {
  * registration once); callers should store the unregister function and
  * call it on shutdown.
  */
+const MEMORY_DBG = process.env.OPENCODE_MEMORY_OBSERVER_DEBUG === "1"
+const memdbg = (msg: string) => {
+  if (MEMORY_DBG) process.stderr.write(`[memory.observer] ${msg}\n`)
+}
+
 export function registerMemoryTurnObserver(opts: MemoryTurnObserverOptions): AdaptiveHooks.Observer {
   return {
     name: "memories",
     preIteration: (state, args) =>
       Effect.gen(function* () {
         const cfg = yield* opts.config()
+        memdbg(`preIteration: enabled=${cfg.enabled} retrievalEnabled=${cfg.retrievalEnabled} sessionID=${args.sessionID}`)
         if (!cfg.enabled || !cfg.retrievalEnabled) {
           dequeueEnrichmentBlock(state)
           return
@@ -460,8 +466,14 @@ export function registerMemoryTurnObserver(opts: MemoryTurnObserverOptions): Ada
     postIteration: (_state, args) =>
       Effect.gen(function* () {
         const cfg = yield* opts.config()
+        memdbg(
+          `postIteration: enabled=${cfg.enabled} extractionEnabled=${cfg.extractionEnabled} sessionID=${args.sessionID} extractionModel=${!!opts.extractionModel}`,
+        )
         if (!cfg.enabled || !cfg.extractionEnabled) return AdaptiveHooks.Continue
         const turn = yield* opts.resolveTurn(args.sessionID)
+        memdbg(
+          `postIteration: resolveTurn=${turn ? `summary=${turn.turnSummary.length}ch userMsgs=${turn.recentUserMessages.length}` : "null"}`,
+        )
         if (!turn || !turn.turnSummary.trim()) return AdaptiveHooks.Continue
         const source = yield* opts.source(args.sessionID)
         const projectID = opts.projectID ? yield* opts.projectID(args.sessionID) : undefined
@@ -474,12 +486,29 @@ export function registerMemoryTurnObserver(opts: MemoryTurnObserverOptions): Ada
           projectID,
           extractionModel: opts.extractionModel,
           polishModel: opts.polishModel,
-        }).pipe(
-          Effect.catchCause(() => Effect.void),
-          Effect.forkDetach,
-        )
+        })
+          .pipe(
+            Effect.tap((r) =>
+              Effect.sync(() =>
+                memdbg(
+                  `extractAndRefineTurnSextuples: reason=${r?.reason} persisted=${r?.persisted?.length ?? "?"} outputs=${r?.outputs?.length ?? "?"}`,
+                ),
+              ),
+            ),
+            Effect.catchCause((c) =>
+              Effect.sync(() =>
+                memdbg(`extractAndRefineTurnSextuples failed: ${String(c).slice(0, 500)}`),
+              ),
+            ),
+            Effect.forkDetach,
+          )
         return AdaptiveHooks.Continue as AdaptiveHooks.Directive
-      }).pipe(Effect.catchCause(() => Effect.succeed(AdaptiveHooks.Continue as AdaptiveHooks.Directive))),
+      }).pipe(Effect.catchCause((c) =>
+        Effect.sync(() => {
+          memdbg(`postIteration outer fail: ${String(c).slice(0, 500)}`)
+          return AdaptiveHooks.Continue as AdaptiveHooks.Directive
+        }),
+      )),
   }
 }
 

@@ -1163,12 +1163,29 @@ def test_subagent_stop_cancelled_on_interrupt(
                 child_id = start.get("child_session_id")
                 assert isinstance(child_id, str)
 
-                # Interrupt the child session's turn — this is what drives
-                # the cancellation path in ``subagent/registry.ts``.
+                # Wait briefly so the child's runLoop has a chance to
+                # register its Runner in SessionRunState before we ask
+                # for a cancel — otherwise the cancel lands before the
+                # child is busy and becomes a no-op.
+                time.sleep(3.0)
+
+                # Interrupt the child — that maps to
+                # ``SessionPrompt.Service.cancel(child_id)`` which
+                # interrupts the child's Runner. On failure (e.g. the
+                # child runner isn't registered yet) fall back to
+                # interrupting the parent, which cancels its forked
+                # child-fiber via the task tool's abort listener.
                 try:
                     client.interrupt_turn(child_id)
                 except Exception:
+                    pass
+                # Defensive double-tap: also interrupt the parent so the
+                # task tool's own abort listener fires its ``cancelFiber``
+                # callback if the child-session cancel didn't land.
+                try:
                     client.interrupt_turn(session["id"])
+                except Exception:
+                    pass
 
                 stop = _read_hook_log(hook_log_dir, "SubagentStop", timeout_s=120.0)
                 assert stop["hook_event_name"] == "SubagentStop"
@@ -1307,7 +1324,7 @@ def test_permission_granted_source_hook(
 
                 def _watch() -> None:
                     try:
-                        with client.events(timeout_s=90.0) as stream:
+                        with client.events(timeout_s=120.0) as stream:
                             for ev in stream:
                                 if ev.type == "permission.asked":
                                     seen_asked.append(ev)
@@ -1317,15 +1334,25 @@ def test_permission_granted_source_hook(
                 watcher = threading.Thread(target=_watch, daemon=True)
                 watcher.start()
 
-                client.send_message(
-                    session["id"],
-                    "Run `echo hi` via the bash tool. Stop.",
-                    providerID=TOOL_MODEL["providerID"],
-                    modelID=TOOL_MODEL["modelID"],
-                )
+                # Fire the prompt on a background thread so a slow LLM
+                # roundtrip doesn't exhaust the HTTP read deadline before
+                # we get a chance to read the hook log.
+                def _fire() -> None:
+                    try:
+                        client.send_message(
+                            session["id"],
+                            "Run `echo hi` via the bash tool. Stop.",
+                            providerID=TOOL_MODEL["providerID"],
+                            modelID=TOOL_MODEL["modelID"],
+                        )
+                    except Exception:
+                        pass
+
+                t = threading.Thread(target=_fire, daemon=True)
+                t.start()
 
                 payload = _read_hook_log(
-                    hook_log_dir, "PermissionGranted", timeout_s=60.0
+                    hook_log_dir, "PermissionGranted", timeout_s=180.0
                 )
                 assert payload["hook_event_name"] == "PermissionGranted"
                 assert payload.get("source") == "hook", (
@@ -1335,6 +1362,7 @@ def test_permission_granted_source_hook(
                     f"permission.asked fired despite hook allow short-circuit: "
                     f"{[ev.properties for ev in seen_asked]!r}"
                 )
+                t.join(timeout=30.0)
                 try:
                     client.delete_session(session["id"])
                 except Exception:

@@ -245,23 +245,26 @@ export namespace SessionMemoryObserver {
       const session = yield* Session.Service
       const config = yield* Config.Service
       const hooks = yield* AdaptiveHooks.Service
-      const providerOpt = yield* Effect.serviceOption(Provider.Service)
 
       // Bridge resolution is DEFERRED until `ensureRegistered()` fires
-      // (which runs inside an Instance scope) because `config.get()` and
+      // (which runs inside an Instance scope with AppRuntime providing
+      // `Provider.Service`) because `config.get()` and
       // `Provider.getLanguage()` both read `InstanceState`. Eager
       // resolution at layer-build would crash in minimal test stacks and
       // any code path that builds the layer outside an Instance.
       //
-      // When `Provider.Service` is unavailable (e.g. minimal test
-      // stacks) we skip bridge resolution entirely and the observer
-      // degrades to deterministic fallbacks per `makeObserverOptions`.
-      const resolveBridges = (): Effect.Effect<{
-        extraction?: Phase1Model
-        rerank?: RerankModel
-        polish?: RefiningModel
-        querySynth?: SynthesizeModel
-      }> =>
+      // Provider.Service is ALSO fetched lazily (via `Effect.serviceOption`
+      // inside `resolveBridges`, not at layer-build time) — `Layer.effect`
+      // only sees services declared on its own input type, so the layer's
+      // build-effect context does NOT include sibling-layer services like
+      // `Provider.Service` that live next to us in `AppLayer`. Pulling
+      // the provider inside the `ensureRegistered` Effect — which runs in
+      // the caller's AppRuntime — gives us a proper Some(ProviderService).
+      const OBS_DBG = process.env.OPENCODE_MEMORY_OBSERVER_DEBUG === "1"
+      const odbg = (m: string) => {
+        if (OBS_DBG) process.stderr.write(`[memory.observer.layer] ${m}\n`)
+      }
+      const resolveBridges = () =>
         Effect.gen(function* () {
           const bridges: {
             extraction?: Phase1Model
@@ -269,20 +272,34 @@ export namespace SessionMemoryObserver {
             polish?: RefiningModel
             querySynth?: SynthesizeModel
           } = {}
-          if (providerOpt._tag !== "Some") return bridges
+          const providerOpt = yield* Effect.serviceOption(Provider.Service)
+          if (providerOpt._tag !== "Some") {
+            odbg(`resolveBridges: providerOpt is None, returning empty bridges`)
+            return bridges
+          }
           const providerSvc = providerOpt.value
           const cfg = yield* config
             .get()
             .pipe(Effect.catchCause(() => Effect.succeed(undefined as Parameters<typeof resolveModelSpec>[0])))
-          if (!cfg) return bridges
+          if (!cfg) {
+            odbg(`resolveBridges: cfg is undefined, returning empty bridges`)
+            return bridges
+          }
+          odbg(`resolveBridges: cfg.memories.extractionModel=${cfg.memories?.extractionModel ?? "(unset)"} cfg.model=${cfg.model ?? "(unset)"}`)
           const tryResolve = (phase: "extraction" | "rerank" | "polish" | "querySynth") =>
             Effect.gen(function* () {
               const spec = resolveModelSpec(cfg, phase)
+              odbg(`resolveBridges[${phase}]: spec=${spec ?? "(undefined)"}`)
               if (!spec) return undefined
-              return yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+              const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
                 Effect.provideService(Provider.Service, providerSvc),
-                Effect.catchCause(() => Effect.succeed(undefined as Phase1Model | undefined)),
+                Effect.catchCause((c) => {
+                  odbg(`resolveBridges[${phase}] bridge error: ${String(c).slice(0, 200)}`)
+                  return Effect.succeed(undefined as Phase1Model | undefined)
+                }),
               )
+              odbg(`resolveBridges[${phase}]: bridge=${bridge ? "ok" : "undefined"}`)
+              return bridge
             })
           bridges.extraction = yield* tryResolve("extraction")
           bridges.rerank = yield* tryResolve("rerank")
