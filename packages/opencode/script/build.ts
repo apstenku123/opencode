@@ -197,7 +197,7 @@ for (const item of targets) {
     conditions: ["browser"],
     tsconfig: "./tsconfig.json",
     plugins: [plugin],
-    external: ["node-gyp"],
+    external: ["node-gyp", "keytar"],
     format: "esm",
     minify: true,
     splitting: true,
