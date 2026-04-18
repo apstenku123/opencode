@@ -30,6 +30,7 @@ import { Permission } from "@/permission"
 import { Global } from "@/global"
 import * as History from "@/history"
 import * as Autobest from "@/autobest"
+import * as Hook from "@/hook"
 import { RolloutPath } from "@/rollout/path"
 import { Effect, Layer, Option, Context } from "effect"
 
@@ -433,11 +434,12 @@ type Patch = z.infer<typeof Event.Updated.schema>["info"]
 const db = <T>(fn: (d: Parameters<typeof Database.use>[0] extends (trx: infer D) => any ? D : never) => T) =>
   Effect.sync(() => Database.use(fn))
 
-export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> = Layer.effect(
+export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | Hook.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
     const storage = yield* Storage.Service
+    const hooks = yield* Hook.Service
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -476,6 +478,26 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
           title: result.title,
         }),
       )
+
+      // Fire SessionStart lifecycle hook. User-configured
+      // `experimental.hooks.SessionStart` entries will receive the flat
+      // wire payload (session_id, cwd, rolloutPath, …). Failures in
+      // individual hooks collapse into `continue` outcomes and are
+      // ignored here — a broken user hook must never abort session
+      // creation.
+      yield* hooks
+        .dispatch({
+          event: {
+            hook_event_name: "SessionStart",
+            source: "cli",
+            model: "unknown",
+            rolloutPath: result.rolloutPath,
+          },
+          sessionID: result.id,
+          cwd: result.directory,
+          transcriptPath: result.rolloutPath,
+        })
+        .pipe(Effect.ignore)
 
       if (!Flag.OPENCODE_EXPERIMENTAL_WORKSPACES) {
         // This only exist for backwards compatibility. We should not be
@@ -527,6 +549,28 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
           SyncEvent.run(Event.Deleted, { sessionID, info: session }, { publish: hasInstance })
           SyncEvent.remove(sessionID)
         })
+
+        // Fire SessionEnd lifecycle hook. Mirrors the SessionStart
+        // dispatch in createNext — failures are swallowed so a broken
+        // user hook cannot leave the session in an inconsistent state.
+        // Gated on `hasInstance` because the dispatcher reads
+        // `Config.Service.get()` which requires an InstanceState context;
+        // `remove` is also invoked from emergency cleanup paths that run
+        // without one.
+        if (hasInstance) {
+          yield* hooks
+            .dispatch({
+              event: {
+                hook_event_name: "SessionEnd",
+                reason: "removed",
+                rolloutPath: session.rolloutPath,
+              },
+              sessionID,
+              cwd: session.directory,
+              transcriptPath: session.rolloutPath,
+            })
+            .pipe(Effect.ignore)
+        }
       } catch (e) {
         log.error(e)
       }
@@ -948,7 +992,11 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service> =
   }),
 )
 
-export const defaultLayer = layer.pipe(Layer.provide(Bus.layer), Layer.provide(Storage.defaultLayer))
+export const defaultLayer = layer.pipe(
+  Layer.provide(Bus.layer),
+  Layer.provide(Storage.defaultLayer),
+  Layer.provide(Hook.defaultLayer),
+)
 
 export function* list(input?: {
   directory?: string
