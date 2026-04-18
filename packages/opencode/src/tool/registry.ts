@@ -53,6 +53,7 @@ import { Skill } from "../skill"
 import { SkillEvolution } from "@/skill/evolution"
 import { Permission } from "@/permission"
 import { SubagentRegistry } from "@/subagent/registry"
+import * as Hook from "@/hook"
 
 const log = Log.create({ service: "tool.registry" })
 
@@ -98,6 +99,7 @@ export const layer: Layer.Layer<
   | Format.Service
   | Truncate.Service
   | SubagentRegistry.Service
+  | Hook.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -107,6 +109,7 @@ export const layer: Layer.Layer<
     const skill = yield* Skill.Service
     const evolution = yield* SkillEvolution.Service
     const truncate = yield* Truncate.Service
+    const hooks = yield* Hook.Service
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
@@ -316,9 +319,64 @@ export const layer: Layer.Layer<
           // Decorate the underlying execute to fan tool outcomes into the
           // skill evolution engine. Fire-and-forget — never let a bookkeeping
           // failure abort the user-facing tool call.
+          //
+          // Additionally dispatches `PreToolUse` / `PostToolUse` hook events
+          // around every tool invocation. Mirrors `codex-rs/hooks/src/command_hook.rs`
+          // decision semantics — a PreToolUse `FailedAbort` or
+          // `permissionDecision: "deny"` short-circuits execute with an
+          // `AbortError`; `permissionDecision: "ask"` forwards to
+          // `Permission.Service` via `ctx.ask`; `permissionDecision: "allow"`
+          // (or unset) proceeds. A PreToolUse `updatedInput` replaces the
+          // forwarded args. A PostToolUse `updatedMCPToolOutput` replaces the
+          // captured output string.
           const wrappedExecute: Tool.Def["execute"] = (args, ctx) =>
             Effect.gen(function* () {
-              const result = yield* tool.execute(args, ctx).pipe(
+              // ---- PreToolUse ----------------------------------------------
+              const pre = yield* hooks
+                .dispatch({
+                  event: {
+                    hook_event_name: "PreToolUse",
+                    tool_name: tool.id,
+                    tool_input: args,
+                    tool_use_id: ctx.callID,
+                  },
+                  sessionID: ctx.sessionID,
+                })
+                .pipe(
+                  Effect.catchCause(() =>
+                    Effect.succeed<Hook.HookDispatchResult>({
+                      outcome: "continue",
+                      responses: [],
+                    }),
+                  ),
+                )
+
+              if (pre.outcome === "abort") {
+                const err = new Error(pre.abortReason ?? `PreToolUse hook aborted '${tool.id}'`)
+                err.name = "AbortError"
+                return yield* Effect.die(err)
+              }
+
+              if (pre.decisionBehavior === "deny") {
+                const err = new Error(pre.decisionMessage ?? `PreToolUse hook denied '${tool.id}'`)
+                err.name = "AbortError"
+                return yield* Effect.die(err)
+              }
+
+              if (pre.decisionBehavior === "ask") {
+                yield* ctx.ask({
+                  permission: tool.id,
+                  patterns: ["*"],
+                  always: ["*"],
+                  metadata: { hookReason: pre.decisionMessage ?? "hook requests user approval" },
+                })
+              }
+
+              // PreToolUse may replace the tool input.
+              const effectiveArgs = pre.updatedInput !== undefined ? (pre.updatedInput as typeof args) : args
+
+              // ---- execute -------------------------------------------------
+              const result = yield* tool.execute(effectiveArgs, ctx).pipe(
                 Effect.tapDefect((cause) =>
                   evolution
                     .onToolComplete({
@@ -332,6 +390,33 @@ export const layer: Layer.Layer<
               yield* evolution
                 .onToolComplete({ toolName: tool.id, success: true })
                 .pipe(Effect.ignore)
+
+              // ---- PostToolUse ---------------------------------------------
+              const callID = ctx.callID ?? ""
+              const post = yield* hooks
+                .dispatch({
+                  event: {
+                    hook_event_name: "PostToolUse",
+                    tool_name: tool.id,
+                    tool_input: effectiveArgs,
+                    tool_response: result.output,
+                    tool_use_id: callID,
+                  },
+                  sessionID: ctx.sessionID,
+                })
+                .pipe(
+                  Effect.catchCause(() =>
+                    Effect.succeed<Hook.HookDispatchResult>({
+                      outcome: "continue",
+                      responses: [],
+                    }),
+                  ),
+                )
+
+              if (post.updatedOutput !== undefined && typeof post.updatedOutput === "string") {
+                return { ...result, output: post.updatedOutput }
+              }
+
               return result
             })
           return {
@@ -383,5 +468,5 @@ export const defaultLayer = Layer.suspend(() =>
     Layer.provide(Ripgrep.defaultLayer),
     Layer.provide(Truncate.defaultLayer),
     Layer.provide(SubagentRegistry.defaultLayer),
-  ),
+  ).pipe(Layer.provideMerge(Hook.defaultLayer)),
 )
