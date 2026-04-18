@@ -52,6 +52,9 @@ import { SessionRunState } from "./run-state"
 import { SessionAutobestObserver, shouldContinue as autobestShouldContinue } from "./autobest-observer"
 import { AdaptiveHooks } from "./adaptive"
 import { EffectBridge } from "@/effect"
+import { Skill } from "@/skill"
+import { SkillInjection } from "@/skill/injection"
+import { SkillEvolution } from "@/skill/evolution"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -108,6 +111,8 @@ export namespace SessionPrompt {
       const status = yield* SessionStatus.Service
       const sessions = yield* Session.Service
       const agents = yield* Agent.Service
+      const skill = yield* Skill.Service
+      const skillEvolution = yield* SkillEvolution.Service
       const provider = yield* Provider.Service
       const processor = yield* SessionProcessor.Service
       const compaction = yield* SessionCompaction.Service
@@ -1545,8 +1550,40 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
               yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
+              // Collect the user text for this turn so the skill system can
+              // (a) run BM25 autoskill hints, (b) parse `$skill-name`
+              // mentions for invocation telemetry, and (c) resolve any env
+              // deps declared by the hinted/mentioned skills.
+              const userText = lastUserMsg?.parts
+                .filter((p): p is MessageV2.TextPart => p.type === "text")
+                .filter((p) => !p.synthetic && !p.ignored)
+                .map((p) => p.text)
+                .join("\n")
+
+              // Mention-driven invocation telemetry. Explicit `$skill-name`
+              // sigils in the user prompt flag that skill as invoked and
+              // bump the evolution counter as a success. Fire-and-forget —
+              // bookkeeping must never fail a turn.
+              if (userText && userText.length > 0) {
+                const availableSkills = yield* skill
+                  .available(agent)
+                  .pipe(Effect.catch(() => Effect.succeed([] as Skill.Info[])))
+                if (availableSkills.length > 0) {
+                  yield* SkillInjection.handleUserPromptMentions({
+                    text: userText,
+                    skills: availableSkills,
+                    taskQuery: userText.slice(0, 200),
+                  })
+                    .pipe(
+                      Effect.provideService(SkillEvolution.Service, skillEvolution),
+                      Effect.ignore,
+                      Effect.forkIn(scope),
+                    )
+                }
+              }
+
               const [skills, env, instructions, modelMsgs] = yield* Effect.all([
-                sys.skills(agent),
+                sys.skills(agent, userText, sessionID),
                 Effect.sync(() => sys.environment(model)),
                 instruction.system().pipe(Effect.orDie),
                 MessageV2.toModelMessagesEffect(msgs, model),
@@ -1855,6 +1892,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           LLM.defaultLayer,
           Bus.layer,
           CrossSpawnSpawner.defaultLayer,
+          Skill.defaultLayer,
+          SkillEvolution.defaultLayer,
         ),
       ),
     ),

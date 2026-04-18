@@ -182,7 +182,11 @@ Use this skill.
           expect(requests[0].patterns).toContain("tool-skill")
           expect(requests[0].always).toContain("tool-skill")
           expect(result.metadata.dir).toBe(skill)
+          expect(result.metadata.scope).toBe("project")
           expect(result.output).toContain(`<skill_content name="tool-skill">`)
+          // Rust-parity header: `# Skill: <name> (scope: <scope>)` + `**Path:** <loc>`.
+          expect(result.output).toContain(`# Skill: tool-skill (scope: project)`)
+          expect(result.output).toContain(`**Path:** ${path.join(skill, "SKILL.md")}`)
           expect(result.output).toContain(`Base directory for this skill: ${pathToFileURL(skill).href}`)
           expect(result.output).toContain(`<file>${file}</file>`)
         }),

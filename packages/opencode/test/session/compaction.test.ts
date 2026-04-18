@@ -23,6 +23,7 @@ import { ModelID, ProviderID } from "../../src/provider/schema"
 import type { Provider } from "../../src/provider"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { Skill } from "../../src/skill"
+import { SkillEvolution } from "../../src/skill/evolution"
 import { Snapshot } from "../../src/snapshot"
 import { ProviderTest } from "../fake/provider"
 import { testEffect } from "../lib/effect"
@@ -236,6 +237,7 @@ function liveRuntime(layer: Layer.Layer<LLM.Service>, provider = ProviderTest.fa
       Layer.provide(Agent.defaultLayer),
       Layer.provide(Plugin.defaultLayer),
       Layer.provide(Skill.defaultLayer),
+      Layer.provide(SkillEvolution.defaultLayer),
       Layer.provide(status),
       Layer.provide(bus),
       Layer.provide(Config.defaultLayer),

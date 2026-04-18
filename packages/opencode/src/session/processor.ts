@@ -17,6 +17,8 @@ import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import { Skill } from "@/skill"
 import { maybeAutoExtractSkill } from "@/skill/hook"
+import { SkillEvolution } from "@/skill/evolution"
+import { detectImplicitInvocation, recordInvocations } from "@/skill/injection"
 import type { Provider } from "@/provider"
 import { Question } from "@/question"
 import { errorMessage } from "@/util/error"
@@ -94,6 +96,7 @@ export namespace SessionProcessor {
     | SessionSummary.Service
     | SessionStatus.Service
     | Skill.Service
+    | SkillEvolution.Service
   > = Layer.effect(
     Service,
     Effect.gen(function* () {
@@ -109,6 +112,7 @@ export namespace SessionProcessor {
       const scope = yield* Scope.Scope
       const status = yield* SessionStatus.Service
       const skill = yield* Skill.Service
+      const skillEvolution = yield* SkillEvolution.Service
 
       const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
         // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -337,6 +341,38 @@ export namespace SessionProcessor {
 
             case "tool-result": {
               yield* completeToolCall(value.toolCallId, value.output)
+
+              // Implicit invocation telemetry: when a tool call's
+              // arguments line up with a known skill's scripts/, doc, or
+              // trigger phrase, flag it as invoked. This runs *after* the
+              // tool result is applied so the detection matches the final
+              // arguments the model actually sent. Fire-and-forget — a
+              // bookkeeping failure must never abort the turn.
+              yield* Effect.gen(function* () {
+                const match = yield* readToolCall(value.toolCallId)
+                if (!match) return
+                const part = match.part
+                if (part.state.status !== "completed") return
+                const input = part.state.input ?? {}
+                const list = yield* skill
+                  .all()
+                  .pipe(Effect.catch(() => Effect.succeed([] as Skill.Info[])))
+                if (list.length === 0) return
+                const hits = detectImplicitInvocation(
+                  [{ toolName: part.tool, input: input as Record<string, unknown> }],
+                  list,
+                )
+                if (hits.length === 0) return
+                yield* recordInvocations({
+                  skills: hits.map((h) => h.skill),
+                  source: "implicit",
+                  executionTrace: [part.tool],
+                })
+              })
+                .pipe(
+                  Effect.provideService(SkillEvolution.Service, skillEvolution),
+                  Effect.ignore,
+                )
               return
             }
 
@@ -679,6 +715,7 @@ export namespace SessionProcessor {
       Layer.provide(SessionSummary.defaultLayer),
       Layer.provide(SessionStatus.defaultLayer),
       Layer.provide(Skill.defaultLayer),
+      Layer.provide(SkillEvolution.defaultLayer),
       Layer.provide(Bus.layer),
       Layer.provide(Config.defaultLayer),
     ),

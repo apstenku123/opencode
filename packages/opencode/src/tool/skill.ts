@@ -4,9 +4,36 @@ import z from "zod"
 import { Effect } from "effect"
 import * as Stream from "effect/Stream"
 import { EffectLogger } from "@/effect"
+import { Global } from "@/global"
 import { Ripgrep } from "../file/ripgrep"
 import { Skill } from "../skill"
 import * as Tool from "./tool"
+
+/**
+ * Derive the best-effort scope label for a skill, matching the Rust
+ * `handler.rs` output header (`(scope: <scope>)`):
+ *
+ *   - `global`    — lives under the user's global config home (`~/.claude`,
+ *     `~/.agents`, or `Global.Path.data/skills`)
+ *   - `auto`      — lives under the autoskill hot-insert directory
+ *   - `project`   — any other path
+ *
+ * The Rust reference uses richer metadata (source enums) that we don't track
+ * in TS yet; until the schema catches up, these three buckets match the
+ * Rust user-facing strings for the vast majority of in-the-wild skills.
+ */
+export function skillScope(location: string): "global" | "auto" | "project" {
+  const normalized = path.resolve(location)
+  const autoRoot = path.join(Global.Path.data, "skills", "auto") + path.sep
+  if (normalized.startsWith(autoRoot)) return "auto"
+  const homeRoots = [
+    path.join(Global.Path.home, ".claude") + path.sep,
+    path.join(Global.Path.home, ".agents") + path.sep,
+    path.join(Global.Path.data) + path.sep,
+  ]
+  if (homeRoots.some((root) => normalized.startsWith(root))) return "global"
+  return "project"
+}
 
 const Parameters = z.object({
   name: z.string().describe("The name of the skill from available_skills"),
@@ -70,11 +97,13 @@ export const SkillTool = Tool.define(
                 Effect.map((chunk) => [...chunk].map((file) => `<file>${file}</file>`).join("\n")),
               )
 
+              const scope = skillScope(info.location)
               return {
                 title: `Loaded skill: ${info.name}`,
                 output: [
                   `<skill_content name="${info.name}">`,
-                  `# Skill: ${info.name}`,
+                  `# Skill: ${info.name} (scope: ${scope})`,
+                  `**Path:** ${info.location}`,
                   "",
                   info.content.trim(),
                   "",
@@ -90,6 +119,7 @@ export const SkillTool = Tool.define(
                 metadata: {
                   name: info.name,
                   dir,
+                  scope,
                 },
               }
             }).pipe(Effect.orDie),
