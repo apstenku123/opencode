@@ -295,20 +295,47 @@ export const migrate = Effect.fn("CopilotAuth.migrate")(function* (src?: Migrati
   // via `opencodeNative` (keyed `{"github-copilot#edu-N": {type,refresh,
   // access,proxy_url}}` format) and wins for those namespaced keys.
   const envTests = testTokensFromEnv(process.env.OPENCODE_TEST_COPILOT_TOKENS)
-  const allFound = [
+  // Primary sources — always imported. Mirrors codex_git's
+  // `CopilotAuth::load()` cascade (`~/Library/Application Support/opencode/auth.json`
+  // on macOS → `~/.copilot/auth/credential.json`).
+  const primary = [
     ...opencodeNative(rawMacAS),
     ...legacy(raw),
-    ...apps(rawApps),
-    ...oauth(rawOauth),
-    ...forge(rawForge),
-    ...codedash(rawCodedash),
-    ...envTests,
   ]
-  const seen = new Set<string>()
+  // Secondary IDE/tool stores — opt-in via
+  // `OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1`. These mine tokens from
+  // every plausible on-disk location (VS Code apps.json, Neovim
+  // oauth.json, Forge credentials, Codedash profile); when the user's
+  // canonical auth.json is already complete, they cause spurious dup
+  // slots, so we keep them behind a flag.
+  const extras = process.env.OPENCODE_IMPORT_ALL_COPILOT_TOKENS === "1"
+    ? [
+        ...apps(rawApps),
+        ...oauth(rawOauth),
+        ...forge(rawForge),
+        ...codedash(rawCodedash),
+      ]
+    : []
+  const allFound = [...primary, ...extras, ...envTests]
+  // Dedup on two axes:
+  //   1. By final `key` (keeping the first-seen source — so macOS
+  //      Application Support wins over `~/.copilot/auth/credential.json`
+  //      for the same key since it's listed first in `allFound`).
+  //   2. By raw `refresh` token — if the same OAuth token is present
+  //      under a different key in a later source (e.g. the
+  //      `~/.copilot/auth/credential.json` flat form maps to
+  //      `github-copilot#cli`, but the same token already landed as
+  //      `github-copilot` via macOS auth.json), skip the duplicate so
+  //      `providers accounts` doesn't render the same physical account
+  //      under two different slot names.
+  const seenKeys = new Set<string>()
+  const seenTokens = new Set<string>()
   const uniq: CopilotAuth[] = []
   for (const item of allFound) {
-    if (seen.has(item.key)) continue
-    seen.add(item.key)
+    if (seenKeys.has(item.key)) continue
+    if (seenTokens.has(item.refresh)) continue
+    seenKeys.add(item.key)
+    seenTokens.add(item.refresh)
     uniq.push(item)
   }
   const items = uniq.filter((item) => !existingKeys.has(item.key))
