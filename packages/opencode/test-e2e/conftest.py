@@ -31,9 +31,19 @@ test sessions:
     - Audit file: ``/tmp/opencode-e2e.lock.meta`` — JSON ``{pid, started_at,
       suite_names}`` written immediately after acquisition. Consumers can
       inspect this to detect stale locks.
-    - Watchdog: a daemon thread fires after 900s of hold time, logs to
-      stderr, and ``os.kill(self, SIGTERM)``s the owning process so the
-      finally: branch runs and the lock is released.
+    - Stale-lock sweep (pre-acquire): before ``lock.acquire()``, the
+      fixture reads the meta file. If ``pid`` is dead OR ``started_at``
+      is older than ``E2E_LOCK_TIMEOUT_S``, both files are unlinked so
+      the next acquire returns immediately. Covers zombie/SIGKILL holders
+      whose ``finally:`` branch never ran.
+    - Watchdog (in-process, layer 1): a daemon thread fires at 900s of
+      hold time, logs to stderr, sends SIGTERM to the owning process,
+      and escalates to SIGKILL after a 30s grace window if SIGTERM was
+      swallowed by pytest-timeout / a blocking C extension.
+    - Watchdog (kernel, layer 2): ``signal.alarm(1200)`` installs an
+      OS-delivered SIGALRM at 20 minutes wall-clock. Survives Python GIL
+      stalls, daemon-thread death, and signal masking by subprocesses —
+      SIGKILLs the process and relies on kernel fcntl release.
     - Release: ``finally:`` on fixture teardown unlinks both files.
 
 Because the fixture is ``autouse=True``, every pytest invocation under
@@ -77,6 +87,7 @@ from harness import (  # noqa: E402
 E2E_LOCK_PATH = "/tmp/opencode-e2e.lock"
 E2E_LOCK_META_PATH = "/tmp/opencode-e2e.lock.meta"
 E2E_LOCK_TIMEOUT_S = 900  # 15 minutes — hard cap for acquisition AND hold-time.
+E2E_LOCK_HARD_CEILING_S = 1200  # 20 minutes — last-resort SIGALRM ceiling.
 
 
 def _write_lock_meta(suite_names: list[str]) -> None:
@@ -96,6 +107,101 @@ def _write_lock_meta(suite_names: list[str]) -> None:
         Path(E2E_LOCK_META_PATH).write_text(json.dumps(meta, indent=2))
     except OSError:
         # Best-effort — the lock itself holds the mutex, meta is informational.
+        pass
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Return True iff ``pid`` corresponds to a live process.
+
+    ``os.kill(pid, 0)`` raises ``ProcessLookupError`` when the pid is
+    dead, ``PermissionError`` when it exists but we can't signal (owned
+    by another user — in which case it IS alive), and returns cleanly
+    when the pid is alive and signalable.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but we can't signal — still alive.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _break_stale_lock_if_present() -> None:
+    """Detect and forcibly break a stale ``/tmp/opencode-e2e.lock``.
+
+    Reads ``E2E_LOCK_META_PATH``; if it exists and either:
+
+      - ``pid`` no longer points to a live process, or
+      - ``started_at`` is more than ``E2E_LOCK_TIMEOUT_S`` old
+
+    the lock+meta files are unlinked so the next ``lock.acquire()``
+    succeeds immediately. Covers the case where a prior pytest session
+    died (SIGKILL, power loss, zombie state) without running its
+    ``finally:`` branch to release the lock.
+
+    Safe to call unconditionally: if the meta file is absent or the
+    holder is healthy, this is a no-op.
+    """
+    meta_path = Path(E2E_LOCK_META_PATH)
+    if not meta_path.exists():
+        return
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        # Corrupt meta — treat as stale and break.
+        meta = None
+
+    holder_pid = None
+    started_at = None
+    if isinstance(meta, dict):
+        if isinstance(meta.get("pid"), int):
+            holder_pid = meta["pid"]
+        if isinstance(meta.get("started_at"), (int, float)):
+            started_at = float(meta["started_at"])
+
+    # Our own pid? Don't break — we hold it.
+    if holder_pid == os.getpid():
+        return
+
+    now = time.time()
+    stale = False
+    reason = ""
+
+    if holder_pid is None:
+        stale = True
+        reason = "missing/corrupt pid in meta"
+    elif not _pid_is_alive(holder_pid):
+        stale = True
+        reason = f"holder pid {holder_pid} is dead"
+    elif started_at is not None and (now - started_at) > E2E_LOCK_TIMEOUT_S:
+        age_s = now - started_at
+        stale = True
+        reason = (
+            f"holder pid {holder_pid} has held for {age_s:.0f}s "
+            f"(> {E2E_LOCK_TIMEOUT_S}s cap)"
+        )
+
+    if not stale:
+        return
+
+    print(
+        f"[e2e-lock] STALE: breaking {E2E_LOCK_PATH} — {reason}",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        Path(E2E_LOCK_PATH).unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        meta_path.unlink(missing_ok=True)
+    except OSError:
         pass
 
 
@@ -125,6 +231,13 @@ def _e2e_session_lock(request) -> Iterator[None]:
         suite_names = [str(a) for a in request.config.args]
     except Exception:
         pass
+
+    # Pre-acquire stale-lock sweep: if a prior session died holding the
+    # lock (SIGKILL, zombie, 6h+ runaway), its meta file points at a dead
+    # pid or an over-aged started_at — in which case we unlink both files
+    # so lock.acquire() below returns immediately instead of blocking on
+    # a ghost.
+    _break_stale_lock_if_present()
 
     lock = FileLock(E2E_LOCK_PATH, timeout=E2E_LOCK_TIMEOUT_S)
     acquire_start = time.monotonic()
@@ -157,19 +270,19 @@ def _e2e_session_lock(request) -> Iterator[None]:
     _write_lock_meta(suite_names)
     hold_start = time.monotonic()
 
-    # Watchdog: if hold time exceeds the hard cap, log + SIGTERM self so
-    # the finally: branch releases the lock. A pure RuntimeError raised
-    # from the thread would never reach the main thread; SIGTERM hooks
-    # into pytest's shutdown path.
+    # ---- Watchdog layer 1: polling daemon thread ------------------------
+    # Fires SIGTERM at hold_start + E2E_LOCK_TIMEOUT_S. Uses a 1s poll so
+    # normal teardown exits quickly via watchdog_stop.
     watchdog_stop = threading.Event()
 
     def _watchdog() -> None:
-        # Poll in 1-second slices so we can exit quickly on normal teardown.
         while not watchdog_stop.is_set():
-            if time.monotonic() - hold_start > E2E_LOCK_TIMEOUT_S:
+            elapsed = time.monotonic() - hold_start
+            if elapsed > E2E_LOCK_TIMEOUT_S:
                 print(
-                    f"[e2e-lock] WATCHDOG: hold time exceeded "
-                    f"{E2E_LOCK_TIMEOUT_S}s — aborting session (pid={os.getpid()})",
+                    f"[e2e-lock] WATCHDOG: hold time {elapsed:.0f}s exceeded "
+                    f"{E2E_LOCK_TIMEOUT_S}s — aborting session "
+                    f"(pid={os.getpid()})",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -177,16 +290,85 @@ def _e2e_session_lock(request) -> Iterator[None]:
                     os.kill(os.getpid(), signal.SIGTERM)
                 except OSError:
                     pass
+                # Keep polling — if SIGTERM got swallowed, escalate to
+                # SIGKILL after a grace period (covers the case where a
+                # pytest-timeout handler or C extension eats the signal).
+                grace_deadline = time.monotonic() + 30.0
+                while not watchdog_stop.is_set() and time.monotonic() < grace_deadline:
+                    watchdog_stop.wait(1.0)
+                if not watchdog_stop.is_set():
+                    print(
+                        f"[e2e-lock] WATCHDOG: SIGTERM swallowed — "
+                        f"SIGKILL pid={os.getpid()}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    try:
+                        os.kill(os.getpid(), signal.SIGKILL)
+                    except OSError:
+                        pass
                 return
             watchdog_stop.wait(1.0)
 
-    watchdog = threading.Thread(target=_watchdog, name="e2e-lock-watchdog", daemon=True)
+    watchdog = threading.Thread(
+        target=_watchdog, name="e2e-lock-watchdog", daemon=True
+    )
     watchdog.start()
+
+    # ---- Watchdog layer 2: OS-backed SIGALRM ceiling ---------------------
+    # signal.alarm() is kernel-delivered — survives daemon-thread death,
+    # Python GIL stalls, and C-extension blocking calls. If the polling
+    # watchdog above is killed/swallowed, the kernel still fires SIGALRM
+    # at E2E_LOCK_HARD_CEILING_S wall-clock seconds and pytest unwinds
+    # via the default SIGALRM handler (raises KeyboardInterrupt-like
+    # exit). Only valid in the main thread of the main interpreter.
+    prev_alarm_handler = None
+    prev_alarm_remaining = 0
+    alarm_installed = False
+    try:
+        def _sigalrm_ceiling(_signo: int, _frame: object) -> None:
+            print(
+                f"[e2e-lock] SIGALRM CEILING: {E2E_LOCK_HARD_CEILING_S}s "
+                f"wall-clock exceeded — SIGKILL pid={os.getpid()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            # No finally-release path can be trusted at this depth; just
+            # unlink meta and die. The kernel releases fcntl locks on
+            # process exit, so the lock file itself is freed.
+            try:
+                Path(E2E_LOCK_META_PATH).unlink(missing_ok=True)
+            except OSError:
+                pass
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        prev_alarm_handler = signal.signal(signal.SIGALRM, _sigalrm_ceiling)
+        prev_alarm_remaining = signal.alarm(E2E_LOCK_HARD_CEILING_S)
+        alarm_installed = True
+    except (ValueError, OSError):
+        # Not the main thread, or platform without SIGALRM. The polling
+        # watchdog above is still in play — degrade gracefully.
+        pass
 
     try:
         yield
     finally:
         watchdog_stop.set()
+        if alarm_installed:
+            try:
+                signal.alarm(0)
+            except OSError:
+                pass
+            if prev_alarm_handler is not None:
+                try:
+                    signal.signal(signal.SIGALRM, prev_alarm_handler)
+                except (ValueError, OSError):
+                    pass
+            if prev_alarm_remaining > 0:
+                try:
+                    signal.alarm(prev_alarm_remaining)
+                except OSError:
+                    pass
         held_s = time.monotonic() - hold_start
         try:
             lock.release()
