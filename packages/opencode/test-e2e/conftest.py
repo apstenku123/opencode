@@ -367,9 +367,17 @@ def live_copilot_model(isolated_copilot_home: Path) -> dict[str, str]:
 
     Precedence:
         1. Explicit ``OPENCODE_E2E_PROVIDER`` + ``OPENCODE_E2E_MODEL`` env.
-        2. First model listed under any ``github-copilot*`` account's
-           ``discovery.models`` in ``copilot-connections.json``.
-        3. Fallback to ``github-copilot / gpt-4.1``.
+        2. ``gpt-4.1`` when it's advertised under any ``github-copilot*``
+           account's ``discovery.models`` in ``copilot-connections.json`` —
+           this is the verified-present model on the ``#edu`` provider and
+           is far more widely routed than ``gpt-4o`` on enterprise plans.
+        3. Otherwise the first non-``gpt-4o`` model in discovery.models.
+        4. Fallback to ``github-copilot / gpt-4.1`` regardless.
+
+    Rationale: ``gpt-4o`` is rejected by the ``#edu`` provider endpoint on
+    some enterprise plans (``APIError: The requested model is not
+    supported``). ``gpt-4.1`` is verified-present across all accounts in
+    the test workstation's ``copilot-connections.json`` discovery output.
     """
     env_provider = os.environ.get("OPENCODE_E2E_PROVIDER")
     env_model = os.environ.get("OPENCODE_E2E_MODEL")
@@ -383,7 +391,7 @@ def live_copilot_model(isolated_copilot_home: Path) -> dict[str, str]:
     except (OSError, json.JSONDecodeError):
         data = None
 
-    model_id = "gpt-4.1"
+    discovered: list[str] = []
     if isinstance(data, dict):
         connections = data.get("connections") or {}
         for conn in connections.values():
@@ -391,13 +399,19 @@ def live_copilot_model(isolated_copilot_home: Path) -> dict[str, str]:
                 continue
             discovery = conn.get("discovery") or {}
             models = discovery.get("models") if isinstance(discovery, dict) else None
-            if isinstance(models, list) and models:
+            if isinstance(models, list):
                 for candidate in models:
-                    if isinstance(candidate, str) and candidate:
-                        model_id = candidate
-                        break
-                if model_id != "gpt-4.1":
-                    break
+                    if isinstance(candidate, str) and candidate and candidate not in discovered:
+                        discovered.append(candidate)
+
+    # Prefer gpt-4.1 (verified present on #edu) over the first-discovered
+    # model, which on this workstation is often gpt-4o → provider rejects.
+    if "gpt-4.1" in discovered:
+        model_id = "gpt-4.1"
+    else:
+        non_4o = [m for m in discovered if m != "gpt-4o"]
+        model_id = non_4o[0] if non_4o else "gpt-4.1"
+
     return {"providerID": "github-copilot", "modelID": model_id}
 
 
