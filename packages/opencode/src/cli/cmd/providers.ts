@@ -1786,6 +1786,7 @@ export const ProvidersCommand = cmd({
       .command(ProvidersExportCommand)
       .command(ProvidersImportCommand)
       .command(ProvidersStatsCommand)
+      .command(ProvidersTelemetryCommand)
       .command(ProvidersEnvCommand)
       .command(ProvidersDeactivateCommand)
       .command(ProvidersActivateCommand)

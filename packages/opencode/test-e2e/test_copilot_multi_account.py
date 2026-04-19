@@ -507,3 +507,41 @@ def test_routing_consistency_between_cli_and_server(
         assert r.status_code not in (502, 503, 504), (
             f"/turn/start returned upstream gateway error {r.status_code}: {r.text[:200]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# providers telemetry — OTEL ring-buffer CLI surface
+# ---------------------------------------------------------------------------
+
+
+def test_providers_telemetry_json_empty_buffer_contract() -> None:
+    """Smoke: ``providers telemetry --json`` returns a well-formed payload.
+
+    Exercises the ring-buffer dump path without requiring a running daemon
+    or a real OTLP collector. The CLI singleton starts empty; we only
+    assert the response schema + the config echo back. Real dispatch
+    recording is covered by the unit test
+    ``test/plugin/github-copilot-telemetry.test.ts``.
+    """
+    rc, stdout, _ = _run_cli("providers", "telemetry", "--json")
+    assert rc == 0, f"providers telemetry --json failed rc={rc}\n{stdout}"
+    data = _parse_cli_json(stdout)
+    assert isinstance(data, dict)
+    assert "generatedAt" in data
+    assert "config" in data
+    assert "count" in data
+    assert "records" in data
+    assert isinstance(data["records"], list)
+    assert "enabled" in data["config"]
+
+
+def test_providers_telemetry_env_flags_reported() -> None:
+    """``providers env`` surfaces the OTEL env vars so ops can discover them."""
+    rc, stdout, _ = _run_cli("providers", "env", "--json")
+    assert rc == 0, f"providers env --json failed rc={rc}\n{stdout}"
+    data = _parse_cli_json(stdout)
+    names = {row["name"] for row in data}
+    assert "OPENCODE_COPILOT_TELEMETRY_ENABLED" in names
+    assert "OPENCODE_COPILOT_TELEMETRY_ENDPOINT" in names
+    assert "OPENCODE_COPILOT_TELEMETRY_BUFFER" in names
+    assert "OPENCODE_COPILOT_TELEMETRY_EXPORT_INTERVAL_MS" in names

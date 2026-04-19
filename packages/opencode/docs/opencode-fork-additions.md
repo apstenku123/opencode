@@ -1649,3 +1649,238 @@ opencode providers import copilot-config.json --merge
 ```
 
 ---
+
+## HTTP retry-race (p99 latency lever)
+
+Ported from codex_git's `codex-rs/core/src/client_retry_race.rs` in
+commit `4893e9e1b`. The orchestrator spawns *duplicate* HTTP attempts
+against different accounts/proxies after a stagger delay; first-to-
+respond wins, siblings are aborted via `AbortController`. This
+sidesteps the class of hangs where a POST is accepted but no SSE byte
+ever arrives.
+
+See `packages/opencode/src/plugin/github-copilot/retry-race.ts` for the
+`raceFetch` generic + `HttpAttemptBus` observation surface, and
+`copilot.ts::dispatchWithRace` for the Copilot-specific wiring.
+
+### Default behaviour in this fork (enabled out of the box)
+
+Unlike the Rust reference — which ships with `enabled: false` so
+consumers opt in — the opencode fork ships `enabled: true` with tuned
+defaults that trade a modest quota burn for real p99 reduction:
+
+| Field              | Default        | Rationale                                                                                                         |
+| ------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `enabled`          | `true`         | Fork's headline latency lever. Quota burn on the happy path is near zero because healthy turns finish before the stagger. |
+| `staggerMs`        | `45_000` (45s) | Most healthy Copilot turns complete under 30s; 45s before firing a duplicate keeps the p50/p95 curve essentially unchanged. |
+| `concurrentLimit`  | `2`            | 1 original + 1 backup. Worst-case quota burn ≤2× vs the Rust default's 3×.                                        |
+| `maxAttempts`      | `3`            | Original + up to two staggered retries before surfacing `RetryRaceExhaustedError`.                                |
+| `totalDeadlineMs`  | `180_000` (3 min) | Wall-clock upper bound. Accommodates slow SGR reasoning turns while still capping pathological hangs.           |
+| `eventBusCapacity` | `64`           | Matches Rust `tokio::broadcast` capacity; sized to replay the most recent events for late-subscribed debug consumers. |
+
+### Semantics in one paragraph
+
+Attempt 1 fires at `t=0`. If no winner arrives inside `staggerMs`, attempt 2
+fires — attempt 1 is **not** cancelled, it may still win. Further attempts
+layer up to `concurrentLimit` in-flight and `maxAttempts` total. A single
+attempt rejecting does **not** fail the race; siblings keep running. The
+race surfaces a rejection only when every attempt has failed and the budget
+is exhausted, or when `totalDeadlineMs` elapses without a winner —
+producing `RetryRaceExhaustedError`. Observers subscribe via
+`HttpAttemptBus` for `sent` / `firstByte` / `succeeded` / `failed` /
+`canceled` / `exhausted` events.
+
+### Disabling the race (rollback safety)
+
+Users who want strict single-account budgets (e.g. strict quota
+accounting, single-tenancy proxies) can flip the switch three ways:
+
+1. **Environment variable** — highest precedence, no config file edit:
+
+   ```bash
+   export OPENCODE_COPILOT_HTTP_RETRY_RACE_ENABLED=false
+   ```
+
+2. **User config** — persists across shells:
+
+   ```jsonc
+   // ~/.config/opencode/opencode.json
+   {
+     "copilot": {
+       "httpRetryRace": { "enabled": false }
+     }
+   }
+   ```
+
+3. **Field-level tuning** — reduce concurrency/deadline without
+   disabling:
+
+   ```jsonc
+   {
+     "copilot": {
+       "httpRetryRace": {
+         "staggerMs":       60000,
+         "concurrentLimit": 1,
+         "maxAttempts":     1
+       }
+     }
+   }
+   ```
+
+Every field also has a matching `OPENCODE_COPILOT_HTTP_RETRY_RACE_*`
+env override (e.g. `OPENCODE_COPILOT_HTTP_RETRY_RACE_STAGGER_MS=60000`);
+env beats config which beats defaults. See `httpRetryRaceConfig()` in
+`retry-race.ts` for the resolution order.
+
+### Benchmark
+
+`packages/opencode/test-e2e/bench_retry_race.py` fires N sequential
+SGR turns with `format={type: "json_schema", schema: …}` and measures
+wall-clock latency per turn with the race ON vs OFF. It reports p50 /
+p95 / p99 for each configuration and asserts `p99_on < p99_off` so a
+regression in the race's effectiveness is caught immediately. Run it
+against the live `github-copilot` provider via:
+
+```bash
+cd packages/opencode/test-e2e
+.venv/bin/python bench_retry_race.py
+```
+
+### Regression guard
+
+`packages/opencode/test/plugin/github-copilot-retry-race-defaults.test.ts`
+asserts every field of `DEFAULT_HTTP_RETRY_RACE_CONFIG` so an accidental
+flip back to `enabled: false` (or a merge that resets the stagger to the
+Rust default of 40s) surfaces as a unit-test failure.
+
+---
+
+## Copilot OTEL Telemetry (`copilot.telemetry`)
+
+Port of the Rust `codex-otel` crate's `SessionTelemetry`,
+`RequestTelemetry`, and `SseTelemetry` to TypeScript. Implemented in
+`packages/opencode/src/plugin/github-copilot/telemetry.ts` and wired
+into `dispatchOnce` + the 429 branch of `copilot.ts` so every HTTP
+dispatch emits an OTEL counter + duration histogram when the exporter
+is enabled.
+
+### What it records
+
+All metrics live under the `opencode.copilot.*` namespace with common
+tags: `account_key`, `model`, `pool`, `status_code`, `success`,
+`kind`, `tool`.
+
+| Metric                                        | Type      | Tags                                   |
+| --------------------------------------------- | --------- | -------------------------------------- |
+| `opencode.copilot.api_request`                | counter   | account_key, model, pool, status_code  |
+| `opencode.copilot.api_request.duration`       | histogram | account_key, model, pool, status_code  |
+| `opencode.copilot.sse_event`                  | counter   | account_key, model, pool, kind, success |
+| `opencode.copilot.sse_event.duration`         | histogram | account_key, model, pool, kind, success |
+| `opencode.copilot.retries.429`                | counter   | account_key, model, pool               |
+| `opencode.copilot.session.turns`              | counter   | model                                  |
+| `opencode.copilot.session.tools`              | counter   | tool, model, success                   |
+| `opencode.copilot.session.tokens.input`       | counter   | account_key, model                     |
+| `opencode.copilot.session.tokens.output`      | counter   | account_key, model                     |
+| `opencode.copilot.session.cost`               | histogram | model                                  |
+
+### Configuration
+
+```jsonc
+// opencode.json
+{
+  "copilot": {
+    "telemetry": {
+      "enabled": true,
+      "endpoint": "http://localhost:4318/v1/metrics",
+      "headers": { "X-Honeycomb-Team": "xxx" },
+      "bufferCap": 2048,
+      "exportIntervalMs": 15000
+    }
+  }
+}
+```
+
+Env-var overrides (precedence: env > config > defaults):
+
+| Env var                                           | Effect                                             |
+| ------------------------------------------------- | -------------------------------------------------- |
+| `OPENCODE_COPILOT_TELEMETRY_ENABLED`              | `true`/`false` — force on or off                   |
+| `OPENCODE_COPILOT_TELEMETRY_ENDPOINT`             | OTLP/HTTP collector URL                            |
+| `OPENCODE_COPILOT_TELEMETRY_BUFFER`               | Ring-buffer capacity (default 2048)                |
+| `OPENCODE_COPILOT_TELEMETRY_EXPORT_INTERVAL_MS`   | PeriodicExportingMetricReader interval             |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`             | Fallback endpoint (standard OTEL env)              |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`                     | Fallback endpoint (standard OTEL env)              |
+
+When `enabled` is unset it auto-enables iff an endpoint resolves;
+otherwise the in-memory ring buffer still collects records so the
+`providers telemetry` CLI works without any collector.
+
+### CLI inspection
+
+```bash
+# Live-follow the last 50 telemetry records:
+opencode providers telemetry --tail 50
+
+# Dump the current buffer as JSON:
+opencode providers telemetry --json
+
+# Last 10 minutes only:
+opencode providers telemetry --since 10m --json
+```
+
+Example `--tail` output:
+
+```
+| GitHub Copilot telemetry
+| exporter=disabled endpoint=none buffered=3
+| 2026-04-19 18:32:10.112 request key=github-copilot#work model=gpt-5.4-xhigh pool=prod status=200 dur=834ms ok=true (2s ago)
+| 2026-04-19 18:32:12.487 retry_429 key=github-copilot#edu-3 model=gpt-4.1 pool=edu (0ms ago)
+| 2026-04-19 18:32:13.010 request key=github-copilot#edu-7 model=gpt-4.1 pool=edu status=200 dur=1123ms ok=true (0ms ago)
+```
+
+### Dashboard recipe (Grafana / OTEL Collector)
+
+Minimal collector config to funnel opencode metrics into Prometheus:
+
+```yaml
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      exporters: [prometheus]
+```
+
+Then:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/metrics \
+  opencode run "your prompt here"
+```
+
+Suggested Grafana panels (PromQL):
+
+- p95 Copilot request latency per pool:
+  `histogram_quantile(0.95, sum(rate(opencode_copilot_api_request_duration_bucket[5m])) by (le, pool))`
+- 429 density per account:
+  `sum(rate(opencode_copilot_retries_429[5m])) by (account_key)`
+- Token burn per model:
+  `sum(rate(opencode_copilot_session_tokens_output[5m])) by (model)`
+
+### Tests
+
+`packages/opencode/test/plugin/github-copilot-telemetry.test.ts`
+covers env/config merging, ring-buffer bounds + prune semantics, every
+`record*` helper's metric shape with a `MockMeter`, no-op behavior
+when the exporter is disabled, and the singleton swap path
+(`installCopilotMeter`).
+
+---
