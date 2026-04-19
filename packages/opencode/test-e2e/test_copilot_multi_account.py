@@ -37,7 +37,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from harness import resolve_opencode_binary  # noqa: E402
+from harness import OpencodeClient, OpencodeServer, resolve_opencode_binary  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -133,80 +133,20 @@ def accounts() -> dict[str, dict[str, Any]]:
     return _require_copilot_accounts()
 
 
-def _spawn_server_manually(binary: str, ready_timeout_s: float = 30.0):
-    """Spawn ``opencode serve`` and wait for ``/global/health``.
-
-    The harness ``OpencodeServer`` polls ``/health`` directly, but that
-    path is owned by the SPA UI router, which returns ``index.html`` for
-    any unknown route. The Copilot health endpoint lives under the
-    control plane at ``/global/health``.
-    """
-    import os as _os
-    import signal as _signal
-    import socket as _socket
-    import subprocess as _sp
-    import time as _time
-    from contextlib import closing as _closing
-    import httpx as _httpx
-
-    with _closing(_socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-
-    proc = _sp.Popen(
-        [binary, "serve", "--port", str(port), "--hostname", "127.0.0.1"],
-        stdout=_sp.DEVNULL,
-        stderr=_sp.DEVNULL,
-        start_new_session=True,
-    )
-
-    base_url = f"http://127.0.0.1:{port}"
-    deadline = _time.monotonic() + ready_timeout_s
-    with _httpx.Client(timeout=1.0) as http:
-        while _time.monotonic() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError(
-                    f"opencode serve exited early with code {proc.returncode}"
-                )
-            try:
-                r = http.get(f"{base_url}/global/health")
-                if r.status_code == 200 and r.json().get("healthy") is True:
-                    break
-            except _httpx.HTTPError:
-                pass
-            _time.sleep(0.1)
-        else:
-            try:
-                _os.killpg(_os.getpgid(proc.pid), _signal.SIGTERM)
-            except Exception:
-                proc.terminate()
-            raise TimeoutError(
-                f"opencode serve not ready at {base_url}/global/health within {ready_timeout_s}s"
-            )
-    return proc, base_url
-
-
 @pytest.fixture(scope="module")
-def server_base_url() -> str:
-    """Shared ``opencode serve`` base URL. Uses ``/global/health`` for readiness."""
-    import os as _os
-    import signal as _signal
+def server_base_url(
+    long_lived_server: tuple[OpencodeServer, OpencodeClient],
+) -> str:
+    """Shared ``opencode serve`` base URL, reused across the whole session.
 
-    binary = resolve_opencode_binary()
-    if not Path(binary).exists():
-        pytest.skip(f"opencode binary not found at {binary}")
-    proc, base_url = _spawn_server_manually(binary)
-    try:
-        yield base_url
-    finally:
-        try:
-            _os.killpg(_os.getpgid(proc.pid), _signal.SIGTERM)
-        except Exception:
-            proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except Exception:
-            proc.kill()
+    Thin wrapper around the session-scoped ``long_lived_server`` fixture
+    from ``conftest.py`` — it already spawns one ``opencode serve`` with
+    the isolated Copilot home, waits for ``/global/health`` readiness,
+    and tears it down on session exit. Surfacing just the base URL keeps
+    existing test signatures (``server_base_url: str``) untouched.
+    """
+    server, _client = long_lived_server
+    return server.base_url
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,17 @@ from __future__ import annotations
 import httpx
 import pytest
 
-pytestmark = pytest.mark.timeout(30)
+# Per-test timeout must accommodate the session-scoped ``_e2e_session_lock``
+# fixture in ``conftest.py``. That autouse fixture acquires
+# ``/tmp/opencode-e2e.lock`` with a 900s (15 min) cap — when pytest's
+# session-setup lazily runs the fixture on the FIRST test item, the
+# per-test timeout clock includes the lock-acquire wait. A 30s cap would
+# fire before a contested lock could be acquired.
+#
+# Ceiling rationale: ``E2E_LOCK_TIMEOUT_S`` (900s) + a generous budget for
+# the test body itself, which normally completes in < 5s but could stall
+# waiting on ``opencode_server`` readiness on a cold cache.
+pytestmark = pytest.mark.timeout(960)
 
 
 def test_server_starts_and_health(http_client, opencode_server):
