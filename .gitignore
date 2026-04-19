@@ -29,3 +29,6 @@ UPCOMING_CHANGELOG.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+
+# Benchmark artifacts (regenerated on every run)
+packages/opencode/test-e2e/bench_retry_race_report.json

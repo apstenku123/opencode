@@ -56,29 +56,41 @@ export type HttpRetryRaceConfig = {
   /**
    * Master switch.  When `false`, `raceFetch` behaves as a straight
    * single-shot (`attempts[0]()`) — no stagger, no cancellation, no bus
-   * events.  Defaults to `false`.
+   * events.  Defaults to `true` — the race is the opencode fork's p99
+   * latency lever; operators opt out via
+   * `OPENCODE_COPILOT_HTTP_RETRY_RACE_ENABLED=false` or
+   * `copilot.httpRetryRace.enabled: false` when they need a strict
+   * single-account budget.
    */
   enabled: boolean
   /**
    * Delay before spawning the second parallel attempt.  Further attempts
    * follow at the same cadence.  Mirrors Rust `first_retry_after_ms`.
-   * Default: 40_000 ms.
+   * Default: 45_000 ms — most healthy Copilot turns complete in under
+   * 30s, so waiting 45s before firing a duplicate keeps the quota-burn
+   * cost near zero on the happy path while still cutting tail latency
+   * on stalls.
    */
   staggerMs: number
   /**
    * Maximum number of concurrent in-flight attempts.  Clamped to
-   * `[1, maxAttempts]`.  Mirrors Rust `max_parallel`.  Default: 3.
+   * `[1, maxAttempts]`.  Mirrors Rust `max_parallel`.  Default: 2
+   * (1 original + 1 backup) — trades 2× worst-case quota burn for a
+   * meaningful p99 improvement without the 3× burn of the Rust default.
    */
   concurrentLimit: number
   /**
    * Absolute cap on the total number of attempts fired during one race.
-   * Mirrors Rust `max_parallel * max_cycles`.  Default: 6 (3 × 2).
+   * Mirrors Rust `max_parallel * max_cycles`.  Default: 3 — one original
+   * plus up to two staggered retries before giving up.
    */
   maxAttempts: number
   /**
    * Hard wall-clock after which the whole race fails with
    * `RetryRaceExhaustedError`.  Mirrors Rust
-   * `abort_after_ms * max_cycles`.  Default: 120_000 ms (60s × 2).
+   * `abort_after_ms * max_cycles`.  Default: 180_000 ms (3 min) —
+   * accommodates slow SGR reasoning turns while still capping pathological
+   * hangs.
    */
   totalDeadlineMs: number
   /**
@@ -90,13 +102,20 @@ export type HttpRetryRaceConfig = {
   eventBusCapacity: number
 }
 
-/** Default config — values identical to Rust `HttpRetryRaceConfig::default()`. */
+/**
+ * Default config.  Opencode-fork defaults — `enabled: true` with a
+ * 45s stagger + 2-way concurrency + 3 max attempts + 3-minute deadline.
+ * See field-level JSDoc on `HttpRetryRaceConfig` for the rationale behind
+ * each value.  Users who want to disable the race entirely can set
+ * `OPENCODE_COPILOT_HTTP_RETRY_RACE_ENABLED=false` or
+ * `copilot.httpRetryRace.enabled: false` in their config.
+ */
 export const DEFAULT_HTTP_RETRY_RACE_CONFIG: HttpRetryRaceConfig = {
-  enabled: false,
-  staggerMs: 40_000,
-  concurrentLimit: 3,
-  maxAttempts: 6,
-  totalDeadlineMs: 120_000,
+  enabled: true,
+  staggerMs: 45_000,
+  concurrentLimit: 2,
+  maxAttempts: 3,
+  totalDeadlineMs: 180_000,
   eventBusCapacity: 64,
 }
 

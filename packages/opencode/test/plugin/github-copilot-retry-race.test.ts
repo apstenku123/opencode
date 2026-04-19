@@ -48,12 +48,15 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 describe("HttpRetryRaceConfig defaults", () => {
-  test("matches codex_git Rust defaults", () => {
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.enabled).toBe(false)
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.staggerMs).toBe(40_000)
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.concurrentLimit).toBe(3)
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.maxAttempts).toBe(6)
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.totalDeadlineMs).toBe(120_000)
+  test("opencode-fork tuned defaults", () => {
+    // See `retry-race.ts` — these defaults diverge from the Rust
+    // `HttpRetryRaceConfig::default()` to trade a lower quota burn for
+    // still-meaningful p99 tail latency reduction.
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.enabled).toBe(true)
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.staggerMs).toBe(45_000)
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.concurrentLimit).toBe(2)
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.maxAttempts).toBe(3)
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.totalDeadlineMs).toBe(180_000)
     expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.eventBusCapacity).toBe(64)
   })
 })
