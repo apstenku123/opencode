@@ -774,17 +774,12 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const body = c.req.valid("json") ?? {}
-        const { configOverlay, ...createBody } = body as typeof body & {
-          configOverlay?: Record<string, unknown>
-        }
+        // `configOverlay` is threaded through `Session.createNext` so the
+        // overlay is registered BEFORE `SessionStart` fires — otherwise
+        // the first hook dispatch for this session would miss it.
         const session = await AppRuntime.runPromise(
-          SessionShare.Service.use((svc) => svc.create(createBody)),
+          SessionShare.Service.use((svc) => svc.create(body)),
         )
-        // Attach the overlay IMMEDIATELY after the session id is minted so
-        // any downstream event (e.g. `SessionStart` hook dispatch that fires
-        // inside the prompt loop, or memory extractor that reads config
-        // mid-turn) sees the overlay view.
-        if (configOverlay) ConfigOverlay.set(session.id, configOverlay)
         return c.json(session)
       },
     )

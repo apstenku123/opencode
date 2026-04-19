@@ -482,4 +482,109 @@ describe("tool.task", () => {
       }),
     ),
   )
+
+  // Regression: SGR auto-dispatch must thread ``promptOps`` through the
+  // dispatch ctx so ``task.execute`` can run the child prompt loop.
+  //
+  // Before the fix, ``SessionPrompt.runLoop``'s SGR dispatch block built a
+  // ``dispatchCtx.extra = { model, bypassAgentCheck: true }`` — missing
+  // ``promptOps`` — so ``task.execute`` landed the child session (visible
+  // via ``GET /session/:id/children``) and then died at the
+  // ``ctx.extra?.promptOps as TaskPromptOps`` check, leaving the assistant
+  // tool part stuck in ``state.status = "error"`` with the exact message
+  // ``"TaskTool requires promptOps in ctx.extra"``.
+  //
+  // This test shape mirrors the SGR dispatch call site: it builds the same
+  // ``{ model, bypassAgentCheck: true, promptOps }`` extra shape the server
+  // now constructs in ``prompt.ts::runLoop``. With the fix, execute must
+  // complete with a real result (``output`` containing ``task_id`` + the
+  // child's assistant text) — NOT fail with the promptOps error.
+  it.live("execute succeeds under SGR auto-dispatch ctx shape", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+        const promptOps = stubOps({ text: "sgr-dispatched done", onPrompt: (i) => (seen = i) })
+
+        const result = yield* def.execute(
+          {
+            description: "sgr plan",
+            prompt: "work via SGR",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            // Shape of ctx.extra matches prompt.ts's SGR dispatchCtx:
+            // { model, bypassAgentCheck: true, promptOps }.
+            extra: { model: ref, bypassAgentCheck: true, promptOps },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        // Child session should be registered and reachable.
+        const kids = yield* sessions.children(chat.id)
+        expect(kids).toHaveLength(1)
+        expect(kids[0]?.id).toBe(result.metadata.sessionId)
+
+        // Child prompt loop fired (via TaskPromptOps.prompt on the stub).
+        expect(seen?.sessionID).toBe(result.metadata.sessionId)
+
+        // Tool returned a real result, not a promptOps-missing error.
+        expect(result.output).toContain(`task_id: ${result.metadata.sessionId}`)
+        expect(result.output).toContain("sgr-dispatched done")
+      }),
+    ),
+  )
+
+  // Regression: if someone re-introduces the original bug (e.g. a refactor
+  // drops ``promptOps`` from the SGR dispatch ctx), the tool must fail
+  // fast with a recognisable error — not silently succeed with half a
+  // spawn. This pins the exact message the e2e regression guard looks for
+  // (``test_task_tool_sync_spawns_child_sgr``).
+  it.live("execute fails fast when ctx.extra.promptOps is missing", () =>
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const exit = yield* def
+          .execute(
+            {
+              description: "missing ops",
+              prompt: "should fail",
+              subagent_type: "general",
+            },
+            {
+              sessionID: chat.id,
+              messageID: assistant.id,
+              agent: "build",
+              abort: new AbortController().signal,
+              // No promptOps here — this is the pre-fix SGR dispatch shape.
+              extra: { model: ref, bypassAgentCheck: true },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.void,
+            },
+          )
+          .pipe(Effect.exit)
+
+        // The tool wraps execute in Effect.orDie so the Error becomes a
+        // defect — Effect.exit surfaces it as a Failure.
+        expect(exit._tag).toBe("Failure")
+        if (exit._tag === "Failure") {
+          const pretty = String(exit.cause)
+          expect(pretty).toContain("TaskTool requires promptOps in ctx.extra")
+        }
+      }),
+    ),
+  )
 })

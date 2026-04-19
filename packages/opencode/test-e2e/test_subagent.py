@@ -1367,8 +1367,9 @@ def _spawn_child_via_sgr(
         1. Build the task-dispatch schema with ``async`` pinned.
         2. Run SGR (``run_sgr_or_skip``) - the server validates the
            payload, fires ``task`` via ``dispatchByName``, which
-           ``sessions.create``s a child and then errors on promptOps
-           (see module docstring).
+           ``sessions.create``s a child and runs the child prompt loop
+           (requires ``promptOps`` on ``ctx.extra``; wired in
+           ``src/session/prompt.ts`` runLoop SGR auto-dispatch block).
         3. Poll ``/session/:id/children`` for the new child row.
 
     Skips the test if no child landed within the poll window - that
@@ -1393,6 +1394,39 @@ def _spawn_child_via_sgr(
             "plumbing (commit 3830bf2ef or later)."
         )
     return children[0]["id"], plan, thread_id_out
+
+
+def _assert_sgr_task_dispatch_not_prompt_ops_error(
+    client: OpencodeClient,
+    thread_id: str,
+) -> None:
+    """Assert the SGR-auto-dispatched `task` tool part did NOT fail with the
+    historical `"TaskTool requires promptOps in ctx.extra"` error.
+
+    Before the fix, `SessionPrompt.runLoop`'s SGR dispatch block built a
+    `dispatchCtx.extra = { model, bypassAgentCheck: true }` — missing
+    `promptOps` — so `task.execute` landed the child session (visible via
+    `GET /session/:id/children`) and then died at the
+    `ctx.extra?.promptOps as TaskPromptOps` check, leaving the assistant
+    tool part stuck in `state.status = "error"` with that exact message.
+
+    With the fix threaded (`promptOps: dispatchPromptOps` on the dispatch
+    ctx), the tool must either `state.status == "completed"` or still be
+    `running`. An `error` part whose `state.error` mentions promptOps is
+    the regression signal.
+    """
+    for m in client.get_messages(thread_id):
+        info = m.get("info") or {}
+        if info.get("role") != "assistant":
+            continue
+        for tp in _tool_parts(m, "task"):
+            state = tp.get("state") or {}
+            if state.get("status") != "error":
+                continue
+            err = state.get("error") or ""
+            assert "promptOps" not in err, (
+                f"SGR task auto-dispatch failed with promptOps error: {err!r}"
+            )
 
 
 @pytest.mark.live
@@ -1420,6 +1454,11 @@ def test_task_tool_sync_spawns_child_sgr(
     child = subagent_sgr_client.get_session(child_id)
     assert child["id"] == child_id
     assert child.get("parentID") == thread_id
+    # Regression guard: the SGR auto-dispatch path must thread ``promptOps``
+    # through the dispatch ctx so ``task.execute`` can run the child prompt
+    # loop. If the fix regresses, the tool part lands in ``state.error``
+    # with the exact ``"TaskTool requires promptOps in ctx.extra"`` message.
+    _assert_sgr_task_dispatch_not_prompt_ops_error(subagent_sgr_client, thread_id)
 
 
 @pytest.mark.live

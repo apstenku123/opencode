@@ -31,6 +31,7 @@ import { Global } from "@/global"
 import * as History from "@/history"
 import * as Autobest from "@/autobest"
 import * as Hook from "@/hook"
+import * as ConfigOverlay from "@/session/config-overlay"
 import { RolloutPath } from "@/rollout/path"
 import { Effect, Layer, Option, Context } from "effect"
 
@@ -201,6 +202,11 @@ export const CreateInput = z
     title: z.string().optional(),
     permission: Info.shape.permission,
     workspaceID: WorkspaceID.zod.optional(),
+    // Optional per-session config overlay — deep-merged over the global
+    // config for this session only. Registered in `ConfigOverlay` the
+    // moment the session ID is minted (before SessionStart dispatch) so
+    // the hook and subsequent config reads see the overlay view.
+    configOverlay: z.record(z.string(), z.any()).optional(),
   })
   .optional()
 export type CreateInput = z.output<typeof CreateInput>
@@ -352,6 +358,7 @@ export interface Interface {
     title?: string
     permission?: Permission.Ruleset
     workspaceID?: WorkspaceID
+    configOverlay?: Record<string, unknown>
   }) => Effect.Effect<Info>
   readonly fork: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Info>
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
@@ -448,9 +455,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
       workspaceID?: WorkspaceID
       directory: string
       permission?: Permission.Ruleset
+      configOverlay?: Record<string, unknown>
     }) {
       const ctx = yield* InstanceState.context
       const sessionID = SessionID.descending(input.id)
+      // Register the per-session config overlay BEFORE we fire
+      // SessionStart below — the hook dispatcher applies the overlay
+      // keyed on `sessionID`, so the overlay MUST be visible by the
+      // time the hook fires. Also honours subsequent hook / memory /
+      // skill reads on this session.
+      if (input.configOverlay) {
+        ConfigOverlay.set(sessionID, input.configOverlay)
+      }
       const result: Info = {
         id: sessionID,
         slug: Slug.create(),
@@ -648,6 +664,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
       title?: string
       permission?: Permission.Ruleset
       workspaceID?: WorkspaceID
+      configOverlay?: Record<string, unknown>
     }) {
       const directory = yield* InstanceState.directory
       const workspace = yield* InstanceState.workspaceID
@@ -657,6 +674,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
         title: input?.title,
         permission: input?.permission,
         workspaceID: workspace,
+        configOverlay: input?.configOverlay,
       })
     })
 
