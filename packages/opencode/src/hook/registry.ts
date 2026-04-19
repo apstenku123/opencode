@@ -24,6 +24,7 @@ import { ChildProcessSpawner } from "effect/unstable/process"
 import { Config } from "@/config"
 import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
 import { InstanceState } from "@/effect"
+import * as ConfigOverlay from "@/session/config-overlay"
 import { type HookCommandEntry, runCommandHook } from "./command"
 import {
   type HookEvent,
@@ -197,7 +198,11 @@ export const layer = Layer.effect(
 
     const dispatch: Interface["dispatch"] = (input) =>
       Effect.gen(function* () {
-        const cfg = yield* config.get()
+        const rawCfg = yield* config.get()
+        // Apply per-session overlay so tests (and future runtime tweaks) can
+        // register event handlers for a single session without mutating the
+        // shared on-disk config. No-op when no overlay is registered.
+        const cfg = ConfigOverlay.applyOverlay(rawCfg, input.sessionID)
         const eventName = input.event.hook_event_name
         const cwd = input.cwd ?? process.cwd()
         const payload = buildPayload(input, cwd)

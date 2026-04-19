@@ -58,6 +58,7 @@ import { dequeueEnrichmentBlock } from "@/memory/turn-hooks"
 import { SubagentRegistry } from "@/subagent/registry"
 import { Config } from "@/config"
 import * as Hook from "@/hook"
+import * as ConfigOverlay from "@/session/config-overlay"
 import { EffectBridge } from "@/effect"
 import { Skill } from "@/skill"
 import { SkillInjection } from "@/skill/injection"
@@ -236,9 +237,10 @@ export namespace SessionPrompt {
       // as "no-op" regardless of exit status.
       yield* adaptive.register({
         name: "stop-hooks",
-        preBreak: (_state, _args) =>
+        preBreak: (_state, args) =>
           Effect.gen(function* () {
-            const cfg = yield* config.get()
+            const rawCfg = yield* config.get()
+            const cfg = ConfigOverlay.applyOverlay(rawCfg, args.sessionID)
             const hooks = cfg.experimental?.hooks?.stopHooks
             if (!hooks || hooks.length === 0) return AdaptiveHooks.Continue
             const ctx = yield* InstanceState.context
@@ -278,7 +280,8 @@ export namespace SessionPrompt {
         name: "hook:stop",
         preBreak: (_state, args) =>
           Effect.gen(function* () {
-            const cfg = yield* config.get()
+            const rawCfg = yield* config.get()
+            const cfg = ConfigOverlay.applyOverlay(rawCfg, args.sessionID)
             // Only process `experimental.hooks.Stop[]` entries; legacy
             // `stopHooks` is handled by the observer above and should not
             // double-dispatch through the new Hook.Service path.
@@ -2109,6 +2112,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     // so hook observers (PreToolUse + PostToolUse) see each
                     // call in order, just as a provider-driven multi-tool
                     // turn would emit them.
+                    //
+                    // Resolve the `TaskPromptOps` handle up front so the
+                    // SGR-dispatched `task` tool can run the child prompt
+                    // loop. Without this, `task.ts` fails fast with
+                    // `"TaskTool requires promptOps in ctx.extra"` after
+                    // landing the child session, leaving the part stuck in
+                    // `state = error`. Mirror the normal `resolveTools` path
+                    // at line 637 / 644 + `handleSubtask` at line 806.
+                    const dispatchPromptOps = yield* ops()
                     for (const dispatchArgs of argsSeq) {
                       const callID = ulid()
                       let part: MessageV2.ToolPart = yield* sessions.updatePart({
@@ -2131,7 +2143,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                         agent: agent.name,
                         abort: dispatchAbort.signal,
                         callID,
-                        extra: { model, bypassAgentCheck: true },
+                        extra: { model, bypassAgentCheck: true, promptOps: dispatchPromptOps },
                         messages: yield* sessions.messages({ sessionID }),
                         metadata: (val) =>
                           Effect.gen(function* () {

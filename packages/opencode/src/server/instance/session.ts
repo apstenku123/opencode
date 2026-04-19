@@ -29,6 +29,9 @@ import { NamedError } from "@opencode-ai/shared/util/error"
 import { jsonRequest } from "./trace"
 import { TimerSvc } from "./timer"
 import * as History from "@/history"
+import * as ConfigOverlay from "@/session/config-overlay"
+import { Config } from "../../config"
+import { mergeDeep } from "remeda"
 
 const log = Log.create({ service: "server" })
 
@@ -695,6 +698,41 @@ export const SessionRoutes = lazy(() =>
         })
       },
     )
+    .get(
+      "/:sessionID/config",
+      describeRoute({
+        summary: "Get session config",
+        description:
+          "Retrieve the effective config for a session — global config deep-merged with any per-session `configOverlay` supplied at create time.",
+        operationId: "session.config",
+        responses: {
+          200: {
+            description: "Effective session config",
+            content: {
+              "application/json": {
+                schema: resolver(Config.Info),
+              },
+            },
+          },
+          ...errors(400),
+        },
+      }),
+      validator(
+        "param",
+        z.object({
+          sessionID: SessionID.zod,
+        }),
+      ),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const cfg = await AppRuntime.runPromise(Config.Service.use((svc) => svc.get()))
+        const overlay = ConfigOverlay.get(sessionID)
+        const merged = overlay
+          ? (mergeDeep(cfg as unknown as Record<string, unknown>, overlay) as unknown as typeof cfg)
+          : cfg
+        return c.json(merged)
+      },
+    )
     .post(
       "/",
       describeRoute({
@@ -713,10 +751,40 @@ export const SessionRoutes = lazy(() =>
           },
         },
       }),
-      validator("json", Session.CreateInput),
+      validator(
+        "json",
+        z
+          .object({
+            parentID: SessionID.zod.optional(),
+            title: z.string().optional(),
+            permission: Permission.Ruleset.zod.optional(),
+            // Per-session config overlay — deep-merged over the global
+            // config when config-dependent code paths resolve effective
+            // settings for this session. Lets tests set per-session
+            // hooks/memories/skills config without respawning the server.
+            configOverlay: z
+              .record(z.string(), z.any())
+              .optional()
+              .meta({
+                description:
+                  "Per-session config overlay (deep-merged over global config for hooks/memories/skills).",
+              }),
+          })
+          .optional(),
+      ),
       async (c) => {
         const body = c.req.valid("json") ?? {}
-        const session = await AppRuntime.runPromise(SessionShare.Service.use((svc) => svc.create(body)))
+        const { configOverlay, ...createBody } = body as typeof body & {
+          configOverlay?: Record<string, unknown>
+        }
+        const session = await AppRuntime.runPromise(
+          SessionShare.Service.use((svc) => svc.create(createBody)),
+        )
+        // Attach the overlay IMMEDIATELY after the session id is minted so
+        // any downstream event (e.g. `SessionStart` hook dispatch that fires
+        // inside the prompt loop, or memory extractor that reads config
+        // mid-turn) sees the overlay view.
+        if (configOverlay) ConfigOverlay.set(session.id, configOverlay)
         return c.json(session)
       },
     )
@@ -747,6 +815,7 @@ export const SessionRoutes = lazy(() =>
       async (c) => {
         const sessionID = c.req.valid("param").sessionID
         await AppRuntime.runPromise(Session.Service.use((svc) => svc.remove(sessionID)))
+        ConfigOverlay.clear(sessionID)
         return c.json(true)
       },
     )
