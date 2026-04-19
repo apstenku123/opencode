@@ -982,13 +982,30 @@ export const ProvidersCommand = cmd({
 export function renderBestPerVendor(state: State): string[] {
   const lines: string[] = []
   for (const [key, conn] of Object.entries(state.connections)) {
+    const pool = accountPoolLabel(key, conn.plan)
+    const unsupported = new Set(conn.unsupportedModels ?? [])
+    // "best" now reflects the POOL ROUTING default, not the raw cached
+    // /models probe. For a prod account we'd prefer gpt-5.4-xhigh;
+    // claude-4.7-opus-high is the secondary prod option. For an edu
+    // account we route codex-5.3-xhigh. Test-only models are shown
+    // separately via `Allowed (test-only): …`.
+    if (pool) {
+      const prodAllowed = poolAllowedProdModels(pool).filter((id) => !unsupported.has(id))
+      if (prodAllowed.length === 0) {
+        lines.push(`${copilotAliasLabel(key)} ${UI.Style.TEXT_DIM}best (none — pool defaults all marked unsupported)`)
+        continue
+      }
+      const best = prodAllowed[0]
+      const option = prodAllowed.slice(1).join(", ")
+      const tail = option ? ` (option: ${option})` : ""
+      lines.push(`${copilotAliasLabel(key)} ${UI.Style.TEXT_DIM}best ${best}${tail}`)
+      continue
+    }
+    // Unpooled account — fall back to the legacy "best per vendor from
+    // cached /models discovery" behaviour so unclassified accounts still
+    // render something sensible.
     const catalog = conn.discovery?.models ?? []
     if (catalog.length === 0) continue
-    const unsupported = new Set(conn.unsupportedModels ?? [])
-    // Exclude models that have been marked unsupported by a live dispatch so
-    // the displayed "best per vendor" reflects what the account can actually
-    // route today. Otherwise "best OpenAI=gpt-4o" contradicts
-    // "Unsupported: gpt-4o" on the same account.
     const usable = catalog.filter((id) => !unsupported.has(id))
     if (usable.length === 0) {
       lines.push(`${copilotAliasLabel(key)} ${UI.Style.TEXT_DIM}best (none — all discovered models unsupported)`)
