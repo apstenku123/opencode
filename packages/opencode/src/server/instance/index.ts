@@ -33,6 +33,7 @@ import { MessageV2 } from "../../session/message-v2"
 import { SyncRoutes } from "./sync"
 import { MemoryRoutes } from "./memory"
 import { RolloutRoutes } from "./rollout"
+import { CopilotRoutes } from "./copilot"
 import { AppRuntime } from "@/effect/app-runtime"
 import { Effect } from "effect"
 import { TimerSvc } from "./timer"
@@ -64,6 +65,7 @@ export const InstanceRoutes = (_upgrade: UpgradeWebSocket) =>
     .route("/permission", PermissionRoutes())
     .route("/question", QuestionRoutes())
     .route("/provider", ProviderRoutes())
+    .route("/copilot", CopilotRoutes())
     .route("/", FileRoutes())
     .route("/", EventRoutes())
     .route("/mcp", McpRoutes())
