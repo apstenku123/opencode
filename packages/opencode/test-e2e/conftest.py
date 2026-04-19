@@ -696,17 +696,11 @@ def live_copilot_model(isolated_copilot_home: Path) -> dict[str, str]:
                     if isinstance(candidate, str) and candidate and candidate not in discovered:
                         discovered.append(candidate)
 
-    # Prefer gpt-4.1 when actually advertised; otherwise fall back to any
-    # discovered model (usually gpt-4o). Using a model not in discovery
-    # triggers `ProviderModelNotFoundError` at dispatch time.
-    if "gpt-4.1" in discovered:
-        model_id = "gpt-4.1"
-    elif discovered:
-        model_id = discovered[0]
-    else:
-        model_id = "gpt-4o"
-
-    return {"providerID": "github-copilot", "modelID": model_id}
+    # gpt-4.1 is the user-designated "free test" model and is stub-injected
+    # into every provider.models dict by `copilot.ts::models()` — so even
+    # when discovery doesn't advertise it, dispatch routes it through the
+    # pool-router. Default to gpt-4.1 unless env forces something else.
+    return {"providerID": "github-copilot", "modelID": "gpt-4.1"}
 
 
 # ---------------------------------------------------------------------------
