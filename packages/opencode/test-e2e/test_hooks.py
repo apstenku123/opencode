@@ -540,14 +540,20 @@ def test_precompact_postcompact_hooks_fire_on_summarize(
 
 
 @pytest.mark.live
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 @_skip_if_live_disabled
 def test_pretooluse_deny_short_circuits_tool(
     hook_log_dir: Path,
-    isolated_copilot_home: Path,
 ) -> None:
     """PreToolUse hook with permissionDecision=deny causes the tool call
-    to NOT execute — assistant either reports an error or skips."""
+    to NOT execute — via SGR auto-dispatch.
+
+    SGR rewrite: the LLM is constrained to emit a ``BashDispatchPlan``
+    whose ``x-opencode-dispatch`` extension auto-invokes ``bash`` in the
+    server runLoop. The deny hook fires BEFORE execute (see
+    ``tool/registry.ts``) so its log is written, and the bash
+    executor short-circuits — no ``hi\\n`` appears anywhere.
+    """
     deny_stdout = json.dumps(
         {
             "hookSpecificOutput": {
@@ -562,84 +568,45 @@ def test_pretooluse_deny_short_circuits_tool(
             _hook_entry("PreToolUse", hook_log_dir, stdout_json=deny_stdout),
         ],
     }
-    server = _live_hooks_spawn_server(hook_log_dir, hooks)
-    with server:
+    server = _spawn_sgr_hooks_server(hook_log_dir, hooks)
+    try:
         _skip_if_no_instance_routes(server)
-        try:
-            with OpencodeClient(
-                server.base_url,
-                project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
-                timeout_s=300.0,
-            ) as client:
-                session = client.create_session()
-                client.send_message(
-                    session["id"],
-                    "Use the bash tool to run `echo hi`. If blocked, say BLOCKED.",
-                    providerID=TOOL_MODEL["providerID"],
-                    modelID=TOOL_MODEL["modelID"],
-                )
-                # PreToolUse only fires after the model commits to a tool
-                # call. When Copilot's ``/responses`` API rejects the
-                # specific model outright, the turn short-circuits before
-                # any tool call — we detect that and skip rather than
-                # failing (the TS unit tests cover the deny path against
-                # a controlled fake provider; this live test only
-                # asserts end-to-end wiring when the upstream cooperates).
-                log_path = hook_log_dir / "opencode-hook-PreToolUse.log"
-                start = time.monotonic()
-                while time.monotonic() - start < 60.0:
-                    if log_path.exists():
-                        break
-                    time.sleep(0.5)
 
-                if not log_path.exists():
-                    msgs = client.get_messages(session["id"])
-                    flat = json.dumps(msgs)
-                    if (
-                        "githubcopilot.com" in flat
-                        and "model_not_supported" in flat
-                    ):
-                        pytest.skip(
-                            "upstream Copilot endpoint rejected the model "
-                            "via /responses; tool dispatch never happened. "
-                            "The deny-hook path is covered by TS unit tests."
-                        )
-                    # Model may have simply responded textually ("BLOCKED"
-                    # or similar) without ever calling the bash tool. The
-                    # deny-hook wiring is only observable when the model
-                    # actually commits to a tool call — skip rather than
-                    # fail on model-behaviour variance.
-                    pytest.skip(
-                        "PreToolUse hook never fired — Copilot model chose "
-                        "not to invoke bash. TS unit tests cover the deny-hook "
-                        "path deterministically."
-                    )
+        _instance, session_id, _ = _dispatch_bash_via_sgr(
+            server,
+            command_hint="echo hi",
+            description_hint="Echo hi for deny-hook test",
+        )
 
-                payload = _read_hook_log(hook_log_dir, "PreToolUse", timeout_s=5.0)
-                assert payload["hook_event_name"] == "PreToolUse"
-                assert "tool_name" in payload
-                # Strong assertion: the tool must NOT have executed. If it
-                # had, bash would echo ``hi\n`` into some tool-result frame.
-                # The deny hook runs BEFORE execute, so ``hi\n`` must be
-                # absent — and the deny reason must surface in the error
-                # chain so the assistant knows why the tool failed.
-                msgs = client.get_messages(session["id"])
-                flat = json.dumps(msgs)
-                if '"hi\\n"' in flat:
-                    raise AssertionError(
-                        "bash echo stdout appeared despite PreToolUse deny"
-                    )
-                assert (
-                    "blocked by e2e test hook" in flat
-                    or "denied" in flat.lower()
-                    or "BLOCKED" in flat
-                ), "deny reason did not propagate into any message frame"
-                try:
-                    client.delete_session(session["id"])
-                except Exception:
-                    pass
-        finally:
-            _cleanup_live_server(server)
+        payload = _read_hook_log(hook_log_dir, "PreToolUse", timeout_s=10.0)
+        assert payload["hook_event_name"] == "PreToolUse"
+        assert payload["tool_name"] == "bash"
+
+        # The deny hook runs BEFORE bash execute, so ``hi\n`` must be
+        # absent from the tool output — and the deny reason must
+        # surface in the tool part's error/state.
+        with OpencodeClient(
+            server.base_url,
+            project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
+            timeout_s=30.0,
+        ) as client:
+            msgs = client.get_messages(session_id)
+            flat = json.dumps(msgs)
+            assert '"hi\\n"' not in flat, (
+                f"bash echo stdout appeared despite PreToolUse deny: {flat[:400]!r}"
+            )
+            assert (
+                "blocked by e2e test hook" in flat
+                or "denied" in flat.lower()
+                or "deny" in flat.lower()
+            ), f"deny reason did not propagate into any message frame: {flat[:400]!r}"
+            try:
+                client.delete_session(session_id)
+            except Exception:
+                pass
+    finally:
+        server.stop()
+        _cleanup_live_server(server)
 
 
 # --------------------------------------------------------------------------
@@ -707,25 +674,248 @@ def _spawn_live_with_permission_overrides(
     return server
 
 
+# --------------------------------------------------------------------------
+# SGR auto-dispatch — deterministic tool triggering for hook tests
+# --------------------------------------------------------------------------
+#
+# Background: tests below need PreToolUse / PostToolUse hooks to fire which
+# requires the model to commit to a ``bash`` tool call. Plain Copilot
+# turns are flaky for this — models routinely respond textually instead
+# of invoking the tool. SGR auto-dispatch (landed in commit 3830bf2ef)
+# solves this deterministically: we describe the bash call via a pydantic
+# schema, attach an ``x-opencode-dispatch`` extension field, and the
+# server synthetically invokes the named tool through the normal
+# PreToolUse + PostToolUse hook chain after the structured payload lands.
+# No LLM creativity required for the "did the model call bash?" question.
+#
+# See ``packages/opencode/src/session/message-v2.ts`` (``readDispatchHint``)
+# and ``packages/opencode/src/session/prompt.ts`` (the
+# ``// ---- SGR auto-dispatch ----`` block inside ``runLoop``).
+
+
+def _sgr_binary_hooks_dispatch() -> str:
+    """Binary symlink insulated from sibling pkill harnesses.
+
+    Same pattern as ``_hooks_sgr_binary`` but with a distinct link name
+    so the auto-dispatch tests don't collide with the plain SGR
+    determinism tests when run in parallel.
+    """
+    src = os.environ.get("OPENCODE_BINARY") or "/Users/dave/.local/bin/opencode-unify"
+    dst = "/tmp/opencode-sgr-hooks-dispatch"
+    try:
+        real_src = os.path.realpath(src)
+    except OSError:
+        return src
+    try:
+        current = os.readlink(dst)
+    except (OSError, FileNotFoundError):
+        current = None
+    if current != real_src:
+        tmp = dst + f".{os.getpid()}"
+        try:
+            os.symlink(real_src, tmp)
+        except FileExistsError:
+            os.unlink(tmp)
+            os.symlink(real_src, tmp)
+        os.replace(tmp, dst)
+    return dst
+
+
+def _spawn_sgr_hooks_server(
+    hook_log_dir: Path,
+    hooks: dict[str, list[dict[str, Any]]],
+    *,
+    permission: Optional[dict[str, Any]] = None,
+) -> OpencodeServer:
+    """Spawn an SGR-capable server (isolated home + Copilot creds) with
+    a hooks config written out under ``$XDG_CONFIG_HOME``.
+
+    Differs from ``_live_hooks_spawn_server`` only in that the caller-
+    supplied ``permission`` block (when provided) is merged into the
+    config so the PermissionGranted/PermissionDenied tests can force
+    ``{"bash": "ask"}`` through ``Permission.Service``.
+    """
+    from harness import prepare_isolated_home
+
+    isolated_home = prepare_isolated_home(preserve_tokens=True)
+    cfg_dir = isolated_home / "config" / "opencode"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    cfg = _build_config(hooks)
+    if permission is not None:
+        cfg["permission"] = permission
+    (cfg_dir / "config.json").write_text(json.dumps(cfg))
+
+    scratch_cwd = Path(tempfile.mkdtemp(prefix="opencode-e2e-cwd-"))
+    server = OpencodeServer(
+        binary=_sgr_binary_hooks_dispatch(),
+        data_dir=isolated_home,
+        cwd=scratch_cwd,
+        ready_timeout_s=30.0,
+        capture_stderr=True,
+        env={"OPENCODE_DEBUG_PROVIDERS": "1"},
+    )
+    server._e2e_home = isolated_home  # type: ignore[attr-defined]
+    server._e2e_cwd = scratch_cwd  # type: ignore[attr-defined]
+    server.start()
+    return server
+
+
+# SGR dispatch model — ``gpt-4.1`` on ``github-copilot#personal`` is the
+# verified pair that honours ``format={"type":"json_schema"}`` + the
+# ``StructuredOutput`` tool choice (see
+# ``test_sgr_determinism.py``). Overridable for CI.
+_SGR_DISPATCH_MODEL = {
+    "providerID": os.environ.get("OPENCODE_E2E_SGR_PROVIDER", "github-copilot#personal"),
+    "modelID": os.environ.get("OPENCODE_E2E_SGR_MODEL", "gpt-4.1"),
+}
+
+
+def _bash_dispatch_schema(
+    *,
+    command_hint: str = "echo hi",
+    description_hint: str = "Echo a short test token",
+) -> tuple[type, dict[str, Any]]:
+    """Build a pydantic model + JSON schema with ``x-opencode-dispatch``
+    that auto-fires the bash tool after the structured payload lands.
+
+    Returns ``(BashDispatchPlan, schema_with_dispatch_hint)``. The
+    caller passes ``schema_with_dispatch_hint`` into
+    ``run_sgr_or_skip(schema_overrides=...)``.
+
+    ``command_hint`` / ``description_hint`` are prompt-level hints that
+    steer the model toward the desired command. SGR constrains the
+    payload shape; these hints constrain its content.
+    """
+    # Defined inline so each test gets a fresh class — pydantic
+    # ``model_json_schema`` is otherwise cached across classes.
+    from pydantic import BaseModel as _BM, Field as _F
+
+    class BashDispatchPlan(_BM):
+        command: str = _F(
+            description=f"The exact shell command to run (e.g. `{command_hint}`).",
+            min_length=1,
+        )
+        description: str = _F(
+            description=f"Short human-readable description (e.g. `{description_hint}`).",
+            min_length=1,
+        )
+
+    schema = BashDispatchPlan.model_json_schema()
+    # Auto-dispatch hint: server reads the structured payload,
+    # validates it against bash's parameter schema, and dispatches
+    # through the normal PreToolUse + PostToolUse hook chain.
+    # Omitting ``args_from`` spreads the full payload into tool args —
+    # our schema fields are already named to match bash's params
+    # (``command`` + ``description``).
+    schema["x-opencode-dispatch"] = {"tool": "bash"}
+    return BashDispatchPlan, schema
+
+
+def _dispatch_bash_via_sgr(
+    server: OpencodeServer,
+    *,
+    command_hint: str,
+    description_hint: str,
+    session_id: Optional[str] = None,
+    timeout_s: float = 300.0,
+    retries: int = 2,
+) -> tuple[Any, str, str]:
+    """Fire one SGR auto-dispatch turn that invokes ``bash`` deterministically.
+
+    Returns ``(BashDispatchPlan instance, session_id, message_id)``.
+    Creates a fresh session when ``session_id`` is None.
+
+    After this call returns, the server has:
+
+        1. captured the structured bash plan on ``info.structured``;
+        2. auto-dispatched the bash tool via the PreToolUse +
+           PostToolUse hook chain (hook logs are written);
+        3. written a ``ToolPart`` onto the assistant message carrying
+           the bash output.
+
+    ``retries`` is the number of times we retry on upstream stalls
+    (Copilot's ``/chat/completions`` occasionally takes > 180s on
+    back-to-back SGR turns — a fresh session usually unsticks it).
+    Set to 0 to disable retries.
+    """
+    if not has_copilot_credentials():
+        pytest.skip("No github-copilot OAuth token — SGR hook tests need Copilot creds")
+
+    BashDispatchPlan, schema = _bash_dispatch_schema(
+        command_hint=command_hint,
+        description_hint=description_hint,
+    )
+
+    last_skip_reason: Optional[str] = None
+
+    for attempt in range(retries + 1):
+        client = OpencodeClient(
+            server.base_url,
+            project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
+            timeout_s=max(timeout_s + 60.0, 300.0),
+        )
+        try:
+            # Fresh session per attempt so a stuck session doesn't
+            # poison the retry. The new one has no hooks-dir collision
+            # because the log-file names are event-keyed not session-keyed.
+            if session_id is None or attempt > 0:
+                session = client.create_session()
+                session_id = session["id"]
+
+            try:
+                instance, _message, _thread_id = run_sgr_or_skip(
+                    client,
+                    model=_SGR_DISPATCH_MODEL,
+                    prompt=(
+                        f"Build a plan to run `{command_hint}` via the bash tool. "
+                        f"Set `command` to `{command_hint}` and `description` to "
+                        f"`{description_hint}`. Return as a JSON object."
+                    ),
+                    pydantic_model=BashDispatchPlan,
+                    schema_overrides=schema,
+                    thread_id=session_id,
+                    poll_timeout_s=timeout_s,
+                )
+                return instance, session_id, ""
+            except pytest.skip.Exception as skip_err:  # type: ignore[attr-defined]
+                last_skip_reason = str(skip_err)
+                # Last attempt: re-raise as skip (honours existing
+                # upstream-flake contract).
+                if attempt == retries:
+                    raise
+                # Transient — reset session on next attempt and try again.
+                session_id = None
+                continue
+        finally:
+            client.close()
+
+    # Unreachable; either returns or re-raises skip above. This exists
+    # to satisfy mypy/pylance flow analysis.
+    pytest.skip(f"SGR dispatch exhausted retries: {last_skip_reason!r}")
+
+
 # ---- 1. PreToolUse updatedInput — bash command is rewritten -------------
 
 
 @pytest.mark.live
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 @_skip_if_live_disabled
 def test_pretooluse_updated_input_rewrites_bash_command(
     hook_log_dir: Path,
 ) -> None:
-    """Hook returns updatedInput that replaces the model's bash command.
+    """PreToolUse hook's ``updatedInput`` replaces the dispatched bash
+    command — via SGR auto-dispatch.
 
-    The original prompt asks for ``echo original``; the hook must force
-    ``echo hooked``. We assert the tool's captured stdout contains
-    ``hooked`` rather than ``original``.
+    SGR rewrite: the server dispatches bash with ``command=echo original``
+    (per the structured payload). The PreToolUse hook responds with
+    ``updatedInput: {command: "echo hooked", ...}`` which is applied
+    verbatim (see ``src/tool/registry.ts`` line ~376). We assert the
+    bash tool's captured stdout contains ``hooked`` — proving the
+    rewrite took effect.
     """
     # `updatedInput` is a full replacement of the tool's args — not a
-    # partial merge (see ``src/tool/registry.ts`` line 376). The bash
-    # tool's zod schema requires ``command`` + ``description``, so we
-    # include both verbatim so downstream validation passes cleanly.
+    # partial merge. The bash tool's zod schema requires ``command`` +
+    # ``description``, so we include both verbatim.
     hook_stdout = json.dumps(
         {
             "hookSpecificOutput": {
@@ -747,82 +937,74 @@ def test_pretooluse_updated_input_rewrites_bash_command(
             )
         ],
     }
-    server = _live_hooks_spawn_server(hook_log_dir, hooks)
-    with server:
+    server = _spawn_sgr_hooks_server(hook_log_dir, hooks)
+    try:
         _skip_if_no_instance_routes(server)
-        try:
-            with _live_client(server) as client:
-                session = client.create_session()
-                # Use the non-blocking start_turn + poll pattern so a long
-                # model round-trip doesn't time out the HTTP connection
-                # itself (the sync ``send_message`` blocks the wire until
-                # the turn settles, which for an updatedInput roundtrip
-                # can exceed 60s when the model loops back after the
-                # tool result).
-                client.start_turn(
-                    session["id"],
-                    "Run `echo original` via the bash tool. Then stop.",
-                    model={
-                        "providerID": TOOL_MODEL["providerID"],
-                        "modelID": TOOL_MODEL["modelID"],
-                    },
-                )
-                # Wait for the hook to fire — that proves bash was
-                # invoked and the PreToolUse path ran with the rewritten
-                # input (tool_input on the log was the original, the
-                # effective input is what the executor received).
-                try:
-                    payload = _read_hook_log(hook_log_dir, "PreToolUse", timeout_s=180.0)
-                except TimeoutError:
-                    pytest.skip(
-                        "PreToolUse hook never fired — Copilot model chose "
-                        "not to invoke bash. TS unit tests cover the "
-                        "rewrite path deterministically."
-                    )
-                assert payload["hook_event_name"] == "PreToolUse"
-                assert payload["tool_name"] == "bash"
 
-                # Wait for the bash tool's output to surface on a message.
-                # The turn may still be running when our poll starts — we
-                # keep polling until a bash tool part shows a ``state.output``
-                # or a deadline elapses.
-                deadline = time.monotonic() + 180.0
-                bash_outs: list[str] = []
-                while time.monotonic() < deadline:
-                    msgs = client.get_messages(session["id"])
-                    bash_outs = _tool_outputs(msgs, "bash")
-                    if bash_outs and any(bo.strip() for bo in bash_outs):
-                        break
-                    time.sleep(1.0)
-                if not bash_outs:
-                    pytest.skip(
-                        "model did not invoke bash — cannot assert "
-                        "updatedInput took effect"
-                    )
-                joined = "\n".join(bash_outs)
-                assert "hooked" in joined, (
-                    "PreToolUse updatedInput did not rewrite bash command; "
-                    f"captured bash output: {joined!r}"
-                )
-                try:
-                    client.delete_session(session["id"])
-                except Exception:
-                    pass
-        finally:
-            _cleanup_live_server(server)
+        # SGR plan tells the server to dispatch ``echo original``.
+        # The PreToolUse hook rewrites it to ``echo hooked`` before
+        # bash.execute runs.
+        _instance, session_id, _ = _dispatch_bash_via_sgr(
+            server,
+            command_hint="echo original",
+            description_hint="Print the word original",
+        )
+
+        # Hook log proves the PreToolUse path ran (with the original
+        # input — the ``updatedInput`` replaces args at the executor
+        # boundary, not on the hook payload).
+        payload = _read_hook_log(hook_log_dir, "PreToolUse", timeout_s=10.0)
+        assert payload["hook_event_name"] == "PreToolUse"
+        assert payload["tool_name"] == "bash"
+
+        # The bash tool's captured output should show ``hooked`` —
+        # proving the ``updatedInput`` rewrite replaced the original
+        # command before execute.
+        with OpencodeClient(
+            server.base_url,
+            project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
+            timeout_s=30.0,
+        ) as client:
+            deadline = time.monotonic() + 60.0
+            bash_outs: list[str] = []
+            while time.monotonic() < deadline:
+                msgs = client.get_messages(session_id)
+                bash_outs = _tool_outputs(msgs, "bash")
+                if bash_outs and any(bo.strip() for bo in bash_outs):
+                    break
+                time.sleep(1.0)
+            assert bash_outs, "no bash tool output — auto-dispatch did not run"
+            joined = "\n".join(bash_outs)
+            assert "hooked" in joined, (
+                f"PreToolUse updatedInput did not rewrite bash command; "
+                f"captured bash output: {joined!r}"
+            )
+            try:
+                client.delete_session(session_id)
+            except Exception:
+                pass
+    finally:
+        server.stop()
+        _cleanup_live_server(server)
 
 
 # ---- 2. PostToolUse updatedMCPToolOutput — tool output replaced ---------
 
 
 @pytest.mark.live
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 @_skip_if_live_disabled
 def test_posttooluse_updated_output_replaces_tool_result(
     hook_log_dir: Path,
 ) -> None:
-    """PostToolUse hook returns ``updatedMCPToolOutput: "REPLACED"`` —
-    the captured tool output string is overwritten."""
+    """PostToolUse hook returns ``updatedMCPToolOutput`` — the captured
+    tool output string is overwritten — via SGR auto-dispatch.
+
+    SGR rewrite: the server dispatches bash from the structured
+    payload; PostToolUse fires after execute; the hook's
+    ``updatedMCPToolOutput`` replaces the captured output before the
+    tool part is finalised on the message.
+    """
     hook_stdout = json.dumps(
         {
             "hookSpecificOutput": {
@@ -841,44 +1023,46 @@ def test_posttooluse_updated_output_replaces_tool_result(
             )
         ],
     }
-    server = _live_hooks_spawn_server(hook_log_dir, hooks)
-    with server:
+    server = _spawn_sgr_hooks_server(hook_log_dir, hooks)
+    try:
         _skip_if_no_instance_routes(server)
-        try:
-            with _live_client(server) as client:
-                session = client.create_session()
-                client.send_message(
-                    session["id"],
-                    "Run `echo marker42` via the bash tool. Stop.",
-                    providerID=TOOL_MODEL["providerID"],
-                    modelID=TOOL_MODEL["modelID"],
-                )
-                try:
-                    payload = _read_hook_log(hook_log_dir, "PostToolUse", timeout_s=60.0)
-                except TimeoutError:
-                    pytest.skip(
-                        "PostToolUse hook never fired — model declined to "
-                        "invoke bash. TS unit tests cover this path."
-                    )
-                assert payload["hook_event_name"] == "PostToolUse"
-                assert payload["tool_name"] == "bash"
-                assert "tool_response" in payload
 
-                msgs = client.get_messages(session["id"])
+        _instance, session_id, _ = _dispatch_bash_via_sgr(
+            server,
+            command_hint="echo marker42",
+            description_hint="Print marker42 for PostToolUse test",
+        )
+
+        payload = _read_hook_log(hook_log_dir, "PostToolUse", timeout_s=10.0)
+        assert payload["hook_event_name"] == "PostToolUse"
+        assert payload["tool_name"] == "bash"
+        assert "tool_response" in payload
+
+        with OpencodeClient(
+            server.base_url,
+            project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
+            timeout_s=30.0,
+        ) as client:
+            deadline = time.monotonic() + 60.0
+            bash_outs: list[str] = []
+            while time.monotonic() < deadline:
+                msgs = client.get_messages(session_id)
                 bash_outs = _tool_outputs(msgs, "bash")
-                if not bash_outs:
-                    pytest.skip("model did not invoke bash tool")
-                joined = "\n".join(bash_outs)
-                assert "REPLACED" in joined, (
-                    f"PostToolUse updatedMCPToolOutput was not applied: "
-                    f"{joined!r}"
-                )
-                try:
-                    client.delete_session(session["id"])
-                except Exception:
-                    pass
-        finally:
-            _cleanup_live_server(server)
+                if bash_outs and any(bo.strip() for bo in bash_outs):
+                    break
+                time.sleep(1.0)
+            assert bash_outs, "no bash tool output — auto-dispatch did not run"
+            joined = "\n".join(bash_outs)
+            assert "REPLACED" in joined, (
+                f"PostToolUse updatedMCPToolOutput was not applied: {joined!r}"
+            )
+            try:
+                client.delete_session(session_id)
+            except Exception:
+                pass
+    finally:
+        server.stop()
+        _cleanup_live_server(server)
 
 
 # ---- 4. PreToolUse ask — forwards to Permission.Service ------------------
