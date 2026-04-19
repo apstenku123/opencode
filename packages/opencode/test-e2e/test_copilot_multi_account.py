@@ -421,7 +421,9 @@ def test_export_import_roundtrip_redacted(accounts: dict[str, dict[str, Any]]) -
         assert bundle_path.exists(), "export did not write bundle file"
 
         body = json.loads(bundle_path.read_text())
-        assert body["version"] == 1, f"unexpected bundle version {body['version']}"
+        # Bundle schema is versioned; v2 is current. Accept current + one back for
+        # forward/backward compat. (See BUNDLE_VERSION / MIN_SUPPORTED_BUNDLE_VERSION.)
+        assert body["version"] in (1, 2), f"unexpected bundle version {body['version']}"
         assert body.get("redacted") is True
         assert isinstance(body["accounts"], list) and len(body["accounts"]) >= 2
         keys = {a["key"] for a in body["accounts"]}

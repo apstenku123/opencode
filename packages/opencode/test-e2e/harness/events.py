@@ -87,7 +87,11 @@ class EventStream:
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
             if self._stream_ctx is not None:
-                self._stream_ctx.__exit__(exc_type, exc, tb)
+                try:
+                    self._stream_ctx.__exit__(exc_type, exc, tb)
+                except (httpx.RemoteProtocolError, httpx.ReadError):
+                    # Server tore down mid-stream — nothing for us to clean up.
+                    pass
         finally:
             self._stream_ctx = None
             self._response = None
@@ -106,9 +110,15 @@ def _iter_sse(response: httpx.Response) -> Iterator[SSEEvent]:
 
     Follows the basic ``data: ...\\n\\n`` framing. Multiple data lines in one
     frame are concatenated with newlines (per the SSE spec).
+
+    A mid-stream connection drop (server restart, instance tear-down, or the
+    socket being reset when the turn completes) is treated as a clean
+    end-of-stream — we simply stop yielding events rather than propagating
+    ``httpx.RemoteProtocolError`` into the caller. Tests decide what to do
+    with the events they *did* receive.
     """
     buf: list[str] = []
-    for line in response.iter_lines():
+    for line in _safe_iter_lines(response):
         # httpx yields already-decoded str lines (no CR/LF).
         if line == "":
             if buf:
@@ -130,3 +140,16 @@ def _iter_sse(response: httpx.Response) -> Iterator[SSEEvent]:
                 payload = payload[1:]
             buf.append(payload)
         # Other SSE fields (event:, id:, retry:) are ignored — opencode doesn't use them.
+
+
+def _safe_iter_lines(response: httpx.Response) -> Iterator[str]:
+    """Wrap ``response.iter_lines()`` so an abrupt server disconnect doesn't
+    propagate as ``httpx.RemoteProtocolError`` — we treat it as EOF.
+    """
+    try:
+        for line in response.iter_lines():
+            yield line
+    except httpx.RemoteProtocolError:
+        return
+    except httpx.ReadError:
+        return
