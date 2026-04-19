@@ -42,8 +42,136 @@ from typing import Any
 
 import httpx
 import pytest
+from pydantic import BaseModel, Field
+
+from harness import OpencodeClient, OpencodeServer, run_sgr_or_skip
 
 pytestmark = pytest.mark.timeout(600)
+
+
+# ---------------------------------------------------------------------------
+# SGR fixtures (reuse the session-scoped sgr_server from test_sgr_determinism.py
+# via a local copy — we can't import across test modules cleanly).
+# ---------------------------------------------------------------------------
+
+
+import os as _os
+import tempfile as _tempfile
+from pathlib import Path as _Path
+
+
+def _sgr_binary() -> str:
+    """Return the symlinked opencode binary (same insulation as test_sgr_determinism.py)."""
+    src = _os.environ.get("OPENCODE_BINARY") or "/Users/dave/.local/bin/opencode-unify"
+    dst = "/tmp/opencode-sgr-autobest"
+    try:
+        real_src = _os.path.realpath(src)
+    except OSError:
+        return src
+    try:
+        current = _os.readlink(dst)
+    except (OSError, FileNotFoundError):
+        current = None
+    if current != real_src:
+        tmp = dst + f".{_os.getpid()}"
+        try:
+            _os.symlink(real_src, tmp)
+        except FileExistsError:
+            _os.unlink(tmp)
+            _os.symlink(real_src, tmp)
+        _os.replace(tmp, dst)
+    return dst
+
+
+@pytest.fixture()
+def autobest_sgr_server(tmp_path_factory):
+    """Per-test SGR server for autobest SGR tests.
+
+    Function-scoped (not module-scoped) because live Copilot turns
+    under a session-scoped server occasionally stalled at the provider
+    dispatch layer once the first SGR turn had settled — spawning a
+    fresh server per test keeps each SGR roundtrip isolated without
+    adding a lot of wall-clock (server boot + /health is ~2s).
+
+    Uses a separate binary symlink so sibling harnesses' ``pkill -f
+    opencode-unify`` calls leave us alone (same pattern as
+    ``test_sgr_determinism.py::_resolve_sgr_binary``). Also seeds the
+    isolated-home Copilot creds so SGR turns can route to the
+    ``github-copilot`` provider (faster and more reliable in this
+    build than ``opencode/gpt-5-nano`` whose Zen endpoint has been
+    stalling on structured-output turns).
+    """
+    from harness import prepare_isolated_home, has_copilot_credentials
+
+    if not has_copilot_credentials():
+        pytest.skip(
+            "No github-copilot OAuth token — SGR autobest tests need Copilot creds"
+        )
+
+    root = tmp_path_factory.mktemp("sgr-autobest")
+    isolated_home = prepare_isolated_home(preserve_tokens=True)
+    server = OpencodeServer(
+        binary=_sgr_binary(),
+        ready_timeout_s=30.0,
+        data_dir=isolated_home,
+        cwd=root,
+        capture_stderr=True,
+    )
+    server.start()
+    try:
+        yield server, str(root)
+    finally:
+        server.stop()
+        import shutil
+        shutil.rmtree(isolated_home, ignore_errors=True)
+
+
+@pytest.fixture()
+def autobest_sgr_client(autobest_sgr_server):
+    server, project_dir = autobest_sgr_server
+    client = OpencodeClient(
+        server.base_url,
+        project_directory=project_dir,
+        timeout_s=180.0,
+    )
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+@pytest.fixture(scope="session")
+def autobest_sgr_model() -> dict[str, str]:
+    """Provider/model pair for SGR autobest tests.
+
+    Defaults to ``github-copilot#personal / gpt-5-mini``. This combo
+    was verified in this build to honour ``format={"type":"json_schema"}``,
+    call the injected ``StructuredOutput`` tool, and land a validated
+    payload on ``info.structured`` in ~15-30s. Attempted
+    ``opencode/gpt-5-nano`` earlier but its Zen endpoint stalled past
+    4 min on the SGR turn path (even though it worked for simple
+    arithmetic in earlier sessions). Overridable via
+    ``OPENCODE_E2E_SGR_PROVIDER`` / ``OPENCODE_E2E_SGR_MODEL``.
+    """
+    return {
+        "providerID": _os.environ.get("OPENCODE_E2E_SGR_PROVIDER", "github-copilot#personal"),
+        "modelID": _os.environ.get("OPENCODE_E2E_SGR_MODEL", "gpt-5-mini"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# SGR schemas
+# ---------------------------------------------------------------------------
+
+
+class ThreeBullets(BaseModel):
+    """Exactly three bullet strings — the SGR guide that kills the "sometimes 2 bullets" flake."""
+
+    bullets: list[str] = Field(
+        description="Exactly three next-step bullets, one short sentence each.",
+        min_length=3,
+        max_length=3,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,3 +530,110 @@ def test_autobest_fork_resets_cycle_state(
     http_client.set_autobest_enabled(forked_id, True)
     got = http_client.get_autobest_by_thread(forked_id)
     assert got.get("enabled") is True
+
+
+# ---------------------------------------------------------------------------
+# SGR (Schema-Guided Reasoning) autobest tests — deterministic 3-bullet output
+# ---------------------------------------------------------------------------
+#
+# Problem being solved: the legacy
+# ``test_autobest_first_bullet_becomes_active`` frequently skipped because
+# the upstream model ignored the "exactly three bullets" instruction and
+# returned 2 (or 4, or a paragraph). The autobest observer's regex
+# extractor then picked a different "first bullet" than the test expected,
+# or no bullet at all.
+#
+# These SGR tests force the model to emit a schema-conforming JSON payload
+# with exactly three strings. The opencode server's ``StructuredOutput``
+# tool (see ``packages/opencode/src/session/prompt.ts``) validates the
+# payload against the supplied JSON Schema before writing it to
+# ``info.structured``. Pydantic then re-validates via ``min_length=3,
+# max_length=3`` — if the model returns fewer or more, the schema
+# validator rejects and (with ``retryCount > 0``) the server
+# auto-requests a correction before surfacing to us.
+#
+# These tests do NOT exercise the autobest *observer* (which reads free-form
+# assistant text); they exercise the SGR pipe that enables deterministic
+# "first bullet" content upstream of the observer. The observer's own
+# regex + ranking logic is already covered by
+# ``test/session/autobest-observer.test.ts``.
+
+
+@pytest.mark.live
+@pytest.mark.timeout(300)
+def test_autobest_sgr_three_bullets_schema_enforced(
+    autobest_sgr_client: OpencodeClient,
+    autobest_sgr_model: dict[str, str],
+) -> None:
+    """SGR forces exactly three bullets — kills the "sometimes returns 2" flake.
+
+    Deterministic assertions:
+
+        1. ``ThreeBullets.model_validate`` succeeds (implicit — if the
+           model returned fewer/more than 3 the schema validator
+           rejected it server-side).
+        2. ``len(instance.bullets) == 3`` (re-asserted via pydantic).
+        3. Every bullet is a non-empty stripped string.
+    """
+    # 3-min poll window on gpt-5-mini + github-copilot: verified in
+    # local bench to complete in 15-30s when the endpoint is healthy;
+    # the headroom covers tail latency + occasional retry.
+    instance, _msg, _thread_id = run_sgr_or_skip(
+        autobest_sgr_client,
+        model=autobest_sgr_model,
+        prompt=(
+            "Return a JSON object with one field `bullets` whose value is "
+            "an array of exactly these three strings: 'alpha', 'beta', 'gamma'."
+        ),
+        pydantic_model=ThreeBullets,
+        poll_timeout_s=240.0,
+    )
+    assert isinstance(instance, ThreeBullets)
+    assert len(instance.bullets) == 3, instance.bullets
+    for b in instance.bullets:
+        assert isinstance(b, str) and b.strip(), (
+            f"empty or non-string bullet: {b!r}"
+        )
+
+
+@pytest.mark.live
+@pytest.mark.timeout(300)
+def test_autobest_sgr_first_bullet_is_stable_across_reparse(
+    autobest_sgr_client: OpencodeClient,
+    autobest_sgr_model: dict[str, str],
+) -> None:
+    """SGR → pydantic roundtrip preserves ``bullets[0]`` byte-for-byte.
+
+    Deterministic assertions:
+
+        1. SGR produced a valid ``ThreeBullets`` instance.
+        2. ``bullets[0]`` is non-empty and stripped.
+        3. ``model_dump_json`` → ``model_validate`` roundtrip preserves
+           the exact first-bullet content (no silent coercion).
+    """
+    import json as _json
+
+    # Different literal content than the ``three_bullets_schema_enforced``
+    # test so this test covers a second, independently-validated SGR
+    # path. Both tests share the ``ThreeBullets`` schema but use
+    # different canned string sets — if either one flakes we know
+    # which payload is to blame.
+    instance, _msg, _thread_id = run_sgr_or_skip(
+        autobest_sgr_client,
+        model=autobest_sgr_model,
+        prompt=(
+            "Return a JSON object with one field `bullets` whose value is "
+            "an array of exactly these three strings: 'red', 'green', 'blue'."
+        ),
+        pydantic_model=ThreeBullets,
+        poll_timeout_s=240.0,
+    )
+    assert isinstance(instance, ThreeBullets)
+    assert len(instance.bullets) == 3
+    first = instance.bullets[0]
+    assert first.strip(), f"first bullet is empty: {first!r}"
+    roundtrip = ThreeBullets.model_validate(_json.loads(instance.model_dump_json()))
+    assert roundtrip.bullets[0] == first, (
+        f"roundtrip mutated first bullet: {first!r} -> {roundtrip.bullets[0]!r}"
+    )
+    assert roundtrip.bullets == instance.bullets

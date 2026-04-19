@@ -29,6 +29,11 @@ from .home import (
     xdg_env_for,
 )
 from .server import OpencodeServer
+from .sgr import (
+    SGR_DEFAULT_MODEL,
+    run_sgr_or_skip,
+    run_sgr_turn,
+)
 
 DEFAULT_BINARY_PATH = "/Users/dave/.local/bin/opencode-unify"
 OPENCODE_BINARY_ENV_VAR = "OPENCODE_BINARY"
@@ -57,10 +62,13 @@ __all__ = [
     "EventStream",
     "OpencodeClient",
     "OpencodeServer",
+    "SGR_DEFAULT_MODEL",
     "SSEEvent",
     "has_copilot_credentials",
     "isolated_opencode_home",
     "prepare_isolated_home",
     "resolve_opencode_binary",
+    "run_sgr_or_skip",
+    "run_sgr_turn",
     "xdg_env_for",
 ]
