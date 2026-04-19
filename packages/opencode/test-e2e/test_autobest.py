@@ -83,15 +83,20 @@ def _sgr_binary() -> str:
     return dst
 
 
-@pytest.fixture()
+@pytest.fixture(scope="session")
 def autobest_sgr_server(tmp_path_factory):
-    """Per-test SGR server for autobest SGR tests.
+    """Session-scoped SGR server for autobest SGR tests.
 
-    Function-scoped (not module-scoped) because live Copilot turns
-    under a session-scoped server occasionally stalled at the provider
-    dispatch layer once the first SGR turn had settled — spawning a
-    fresh server per test keeps each SGR roundtrip isolated without
-    adding a lot of wall-clock (server boot + /health is ~2s).
+    Migrated from function-scoped (fresh server per test) to session-scoped
+    to save ~3s/test spawn cost across the 6 SGR variants. Per-test state
+    isolation is achieved by each test creating a new opencode session via
+    ``create_thread()`` — session lifecycle (messages, autobest state,
+    bullet selection) is already scoped to the thread id. An earlier
+    comment noted "live Copilot turns under a session-scoped server
+    occasionally stalled at the provider dispatch layer"; that symptom was
+    historically tied to HTTP pool exhaustion in the Copilot adapter. The
+    ``OPENCODE_COPILOT_HTTP_RETRY_RACE_ENABLED`` env below still provides
+    account-failover mitigation if it resurfaces.
 
     Uses a separate binary symlink so sibling harnesses' ``pkill -f
     opencode-unify`` calls leave us alone (same pattern as
@@ -135,6 +140,12 @@ def autobest_sgr_server(tmp_path_factory):
 
 @pytest.fixture()
 def autobest_sgr_client(autobest_sgr_server):
+    """Per-test client over the session-scoped SGR server.
+
+    The server is shared across all SGR autobest tests; per-test state
+    lives on a fresh session (``create_thread`` returns a new session
+    ID that scopes messages + autobest state).
+    """
     server, project_dir = autobest_sgr_server
     client = OpencodeClient(
         server.base_url,

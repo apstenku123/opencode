@@ -997,14 +997,15 @@ def _subagent_sgr_binary() -> str:
     return dst
 
 
-@pytest.fixture()
+@pytest.fixture(scope="session")
 def subagent_sgr_server(tmp_path_factory):
-    """Per-test SGR server (isolated home + Copilot creds).
+    """Session-scoped SGR server (isolated home + Copilot creds).
 
-    Function-scoped — see ``test_autobest.py::autobest_sgr_server`` for
-    the rationale (live Copilot turns under a session-scoped server
-    occasionally stall at the provider dispatch layer once the first
-    SGR turn settles).
+    Migrated from function-scoped to save ~3s/test spawn cost across the
+    9 SGR subagent variants. Per-test state isolation comes from each
+    test creating a new opencode session (``create_thread`` /
+    ``create_session``) — subagent state (task_list, child sessions,
+    guardian decisions) is scoped to the parent session ID.
     """
     if not has_copilot_credentials():
         pytest.skip(

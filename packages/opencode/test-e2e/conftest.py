@@ -393,6 +393,12 @@ def pytest_configure(config) -> None:
         "live: live-LLM smoke tests that call a real provider (opt-in: "
         "-m live). Require real Copilot credentials on disk.",
     )
+    config.addinivalue_line(
+        "markers",
+        "needs_auth_lock: test writes to the shared auth.json or "
+        "copilot-rate-state.sqlite; serialise access to those files. "
+        "See ``_auth_hotspot_lock`` fixture for scope semantics.",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -598,6 +604,130 @@ def live_copilot_model(isolated_copilot_home: Path) -> dict[str, str]:
         model_id = non_4o[0] if non_4o else "gpt-4.1"
 
     return {"providerID": "github-copilot", "modelID": model_id}
+
+
+# ---------------------------------------------------------------------------
+# Shared-server fixtures (refactor for faster serial runs)
+# ---------------------------------------------------------------------------
+#
+# Design intent (see task "Refactor the e2e test harness"):
+#
+#   - ``long_lived_server`` = the ONE session-scoped opencode serve that tests
+#     which don't need a private ``auth.json`` / ``memories.db`` / ``config.json``
+#     can share. Aliases ``live_copilot_server`` — the live-LLM server that
+#     already runs with ``prepare_isolated_home(preserve_tokens=True)`` and is
+#     session-scoped. Tests create + delete per-test sessions over it so
+#     their session-state is isolated even though the process is shared.
+#
+#   - ``isolated_server`` = a function-scoped fixture consumers construct on
+#     demand when they need a fully private home (e.g. they write a custom
+#     config.json, register hooks, mutate memory rows). Currently a pointer
+#     at the existing manual pattern in ``test_hooks.py`` /
+#     ``test_memory.py`` / ``test_skills.py`` — those suites already own
+#     ``OpencodeServer(data_dir=prepare_isolated_home(...))`` blocks; this
+#     fixture surfaces that pattern as a reusable contract.
+#
+#   - ``_auth_hotspot_lock`` = the file-lock moved from session-wide
+#     autouse to function-scoped, acquired ONLY by tests marked
+#     ``@pytest.mark.needs_auth_lock``. Most tests now skip the lock. The
+#     original session-wide lock (``_e2e_session_lock``) is retained as a
+#     cross-process serialiser because multiple pytest invocations on the
+#     same workstation still cannot safely share the user's real Copilot
+#     OAuth tokens. Removing it would require product changes (per-session
+#     token pool, in-memory rate-state) that are out of scope for this
+#     refactor.
+
+
+@pytest.fixture(scope="session")
+def long_lived_server(
+    live_copilot_server: tuple["OpencodeServer", "OpencodeClient"],
+) -> Iterator[tuple["OpencodeServer", "OpencodeClient"]]:
+    """Session-scoped shared ``opencode serve`` for tests that only need
+    per-session state (``POST /session`` → ``DELETE /session/:id``).
+
+    Backed by ``live_copilot_server`` — same isolated home with preserved
+    Copilot tokens, same session-long lifetime. Tests that consume this
+    fixture should create a new session per test and delete it on
+    teardown to keep per-test state isolated.
+    """
+    yield live_copilot_server
+
+
+@pytest.fixture()
+def isolated_server(
+    project_dir: Path,
+    tmp_path_factory,
+) -> Iterator[tuple["OpencodeServer", "OpencodeClient", Path]]:
+    """Function-scoped ``opencode serve`` with a fully private isolated home.
+
+    Use this only when a test must:
+      - write a custom ``config.json`` (hooks, memory, skills) that can't
+        be expressed as a per-session overlay,
+      - mutate ``auth.json`` or ``copilot-rate-state.sqlite`` destructively,
+      - register hooks that would leak into sibling tests on the shared
+        server.
+
+    Yields ``(server, client, home_root)``. Copilot credentials are seeded
+    via ``prepare_isolated_home(preserve_tokens=True)`` when available.
+    """
+    import shutil
+
+    home_root = prepare_isolated_home(preserve_tokens=True)
+    cwd_root = tmp_path_factory.mktemp("isolated-server")
+    server = OpencodeServer(
+        data_dir=home_root,
+        cwd=cwd_root,
+        ready_timeout_s=30.0,
+        capture_stderr=True,
+    )
+    server.start()
+    try:
+        with OpencodeClient(
+            server.base_url,
+            project_directory=str(cwd_root),
+            timeout_s=180.0,
+        ) as client:
+            yield server, client, home_root
+    finally:
+        server.stop()
+        shutil.rmtree(home_root, ignore_errors=True)
+
+
+@pytest.fixture()
+def _auth_hotspot_lock(request) -> Iterator[None]:
+    """Function-scoped lock acquired ONLY for tests marked
+    ``@pytest.mark.needs_auth_lock``.
+
+    Serialises access to ``auth.json`` / ``copilot-rate-state.sqlite`` for
+    tests that mutate those files (bundle export/import, auth rotation,
+    rate-state flush tests). All other tests skip the lock entirely — a
+    meaningful wall-clock win on suites with 30+ tests that used to each
+    wait on a session-wide filelock.
+
+    Uses the same path as ``_e2e_session_lock`` but with a short acquire
+    timeout: if two tests contend they serialise, but we never block for
+    minutes on a stale holder.
+    """
+    if not request.node.get_closest_marker("needs_auth_lock"):
+        yield
+        return
+
+    lock_path = "/tmp/opencode-e2e-auth-hotspot.lock"
+    lock = FileLock(lock_path, timeout=60.0)
+    try:
+        lock.acquire(timeout=60.0)
+    except Timeout:
+        pytest.skip(
+            f"could not acquire auth-hotspot lock at {lock_path} within 60s — "
+            "another auth-mutating test is active"
+        )
+    try:
+        yield
+    finally:
+        try:
+            lock.release()
+        except Exception:
+            pass
 
 
 @pytest.fixture()
