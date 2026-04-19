@@ -761,7 +761,11 @@ test("alias provider models use per-account proxy routing", async () => {
       state: { version: 1, connections: { "github-copilot#corp": { plan: "enterprise", proxyUrl: "https://gcp-proxy.example", proxyToken: "ptok" } } } as never,
       write: async () => undefined,
     })
-    expect(result).toEqual({})
+    // Stub test-allowed models are injected on every path (success + error)
+    // so the dispatcher can always route gpt-4.1 / gpt-5-mini*.
+    expect(Object.keys(result as Record<string, unknown>)).toEqual(
+      expect.arrayContaining(["gpt-4.1", "gpt-5-mini", "gpt-5-mini-xhigh"]),
+    )
     // Two-step discovery: `/copilot_internal/user` then `/models`, both routed
     // through the per-account proxy with the `x-copilot-proxy-token` header.
     expect(calls[0]?.url).toBe("https://gcp-proxy.example/copilot_internal/user")
@@ -855,11 +859,16 @@ test("provider.models persists discovery snapshot on success", async () => {
     })
     expect((writes.at(-1) as any).connections["github-copilot#corp"].discovery).toMatchObject({
       ok: true,
-      models: ["gpt-5-mini"],
       api: "https://copilot-api.ghe.example.com",
       plan: "enterprise",
       login: "corp",
     })
+    // Discovery snapshot includes both upstream-advertised models and the
+    // stub-injected test-allowed IDs (gpt-4.1 / gpt-5-mini-xhigh) so routing
+    // finds them later.
+    expect((writes.at(-1) as any).connections["github-copilot#corp"].discovery.models).toEqual(
+      expect.arrayContaining(["gpt-5-mini", "gpt-4.1", "gpt-5-mini-xhigh"]),
+    )
   } finally {
   }
 })
@@ -875,7 +884,11 @@ test("provider.models persists discovery error snapshot on failure", async () =>
       state: { version: 1, connections: { "github-copilot#corp": { plan: "enterprise", login: "corp" } } } as never,
       write: async (next) => { writes.push(next as never) },
     })
-    expect(out).toEqual({})
+    // Even on failure the alias falls back to stub test-allowed models so
+    // routing can still pick gpt-4.1 / gpt-5-mini* for an outbound turn.
+    expect(Object.keys(out as Record<string, unknown>)).toEqual(
+      expect.arrayContaining(["gpt-4.1", "gpt-5-mini", "gpt-5-mini-xhigh"]),
+    )
     expect((writes.at(-1) as any).connections["github-copilot#corp"].discovery).toMatchObject({
       ok: false,
       models: [],
@@ -1140,13 +1153,18 @@ describe("aliasModels two-step discovery chain", () => {
       expect(calls[0]?.url).toBe("https://api.github.com/copilot_internal/user")
       // Step 2: /models uses the dynamic `endpoints.api` from step 1.
       expect(calls[1]?.url).toBe("https://api.enterprise.githubcopilot.com/models")
-      // Plan gate dropped `gpt-5.4-free`.
-      expect(Object.keys(result ?? {})).toEqual(["gpt-5.4"])
+      // Plan gate dropped `gpt-5.4-free`. Stub test-allowed models are
+      // always injected so the dispatcher can route gpt-4.1 / gpt-5-mini*.
+      expect(Object.keys(result ?? {})).toEqual(
+        expect.arrayContaining(["gpt-5.4", "gpt-4.1", "gpt-5-mini", "gpt-5-mini-xhigh"]),
+      )
       expect((writes.at(-1) as any).connections["github-copilot#corp"].discovery).toMatchObject({
         ok: true,
-        models: ["gpt-5.4"],
         api: "https://api.enterprise.githubcopilot.com",
       })
+      expect(
+        (writes.at(-1) as any).connections["github-copilot#corp"].discovery.models,
+      ).toEqual(expect.arrayContaining(["gpt-5.4", "gpt-4.1", "gpt-5-mini", "gpt-5-mini-xhigh"]))
     } finally {
       globalThis.fetch = prev
     }

@@ -263,6 +263,9 @@ export async function aliasModels(input: {
       plan: planSku,
     })
     .then(async (models) => {
+      for (const testID of ["gpt-4.1", "gpt-5-mini", "gpt-5-mini-xhigh"]) {
+        if (!models[testID]) models[testID] = CopilotModels.buildStub(testID, apiBase)
+      }
       const next = discover(input.state, match.key, {
         models: Object.values(models).map((item) => item.api.id),
         api: apiBase,
@@ -283,7 +286,13 @@ export async function aliasModels(input: {
         err: error instanceof Error ? error.message : String(error),
       })
       await input.write(next)
-      return Object.fromEntries(Object.entries(input.provider.models).map(([id, model]) => [id, fix(model, apiBase)]))
+      const fallback: Record<string, Model> = Object.fromEntries(
+        Object.entries(input.provider.models).map(([id, model]) => [id, fix(model, apiBase)]),
+      )
+      for (const testID of ["gpt-4.1", "gpt-5-mini", "gpt-5-mini-xhigh"]) {
+        if (!fallback[testID]) fallback[testID] = CopilotModels.buildStub(testID, apiBase)
+      }
+      return fallback
     })
 }
 
@@ -1587,7 +1596,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
             // injection the dispatcher rejects them with
             // ProviderModelNotFoundError even though the routing layer
             // can forward them to an edu-pool account.
-            for (const testID of ["gpt-4.1", "gpt-5-mini-xhigh"]) {
+            for (const testID of ["gpt-4.1", "gpt-5-mini", "gpt-5-mini-xhigh"]) {
               if (!models[testID]) models[testID] = CopilotModels.buildStub(testID, apiBase)
             }
             const supported = Object.values(models).map((item) => item.api.id)
@@ -1619,7 +1628,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
             const fallback: Record<string, Model> = Object.fromEntries(
               Object.entries(provider.models).map(([id, model]) => [id, fix(model, apiBase)]),
             )
-            for (const testID of ["gpt-4.1", "gpt-5-mini-xhigh"]) {
+            for (const testID of ["gpt-4.1", "gpt-5-mini", "gpt-5-mini-xhigh"]) {
               if (!fallback[testID]) fallback[testID] = CopilotModels.buildStub(testID, apiBase)
             }
             return fallback
