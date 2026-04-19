@@ -17,6 +17,8 @@ from __future__ import annotations
 import time
 from typing import Any, Optional
 
+import httpx
+
 from .client import OpencodeClient
 
 
@@ -110,7 +112,15 @@ def run_live_turn(
     if agent is not None:
         start_kwargs["agent"] = agent
 
-    start = client.start_turn(thread_id, prompt, **start_kwargs)
+    # ``POST /turn/start`` can hit httpx.ReadTimeout when the upstream
+    # Copilot endpoint stalls mid-stream (observed on bash_echo turns).
+    # Swallow the transport error and fall through to the poll loop —
+    # the assistant message is persisted server-side even when the POST
+    # disconnects, so `get_messages` will eventually see it.
+    try:
+        start = client.start_turn(thread_id, prompt, **start_kwargs)
+    except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ReadError):
+        start = {}
     # ``POST /turn/start`` returns an assistant-message stub with an id —
     # we use it to filter once the turn completes.
     assistant_id = None
