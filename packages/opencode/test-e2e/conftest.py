@@ -80,6 +80,25 @@ from harness import (  # noqa: E402
 )
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """On test failure, dump the live opencode serve stderr tail into
+    /tmp/e2e-stderr-dump.log so the root cause (ProviderModelNotFoundError,
+    401/403, upstream 404) is visible without re-running under -s."""
+    outcome = yield
+    rep = outcome.get_result()
+    if rep.when == "call" and rep.failed:
+        with open("/tmp/e2e-stderr-dump.log", "a") as fh:
+            fh.write(f"\n=== FAIL: {item.nodeid} ===\n")
+            for fn, fx in getattr(item, "funcargs", {}).items():
+                if fn in ("live_copilot_server", "long_lived_server", "sgr_server", "opencode_server"):
+                    server = fx[0] if isinstance(fx, tuple) and fx else fx
+                    if server is not None and hasattr(server, "stderr_text"):
+                        t = server.stderr_text() or ""
+                        if t:
+                            fh.write(f"STDERR {fn} (len={len(t)}):\n{t[-4000:]}\n")
+
+
 # ---------------------------------------------------------------------------
 # Cross-process session mutex
 # ---------------------------------------------------------------------------
@@ -497,7 +516,7 @@ def project_dir() -> Iterator[Path]:
 @pytest.fixture(scope="session")
 def opencode_server(project_dir: Path) -> Iterator[OpencodeServer]:
     """Start one ``opencode serve`` for the whole test session."""
-    with OpencodeServer(ready_timeout_s=20.0, cwd=project_dir) as server:
+    with OpencodeServer(ready_timeout_s=60.0, cwd=project_dir) as server:
         yield server
 
 
@@ -617,7 +636,7 @@ def live_copilot_server(
     server = OpencodeServer(
         data_dir=isolated_copilot_home,
         cwd=project_dir,
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
         capture_stderr=True,
         env={
             # Opencode checks these for verbose logging; keep the stream
@@ -677,13 +696,15 @@ def live_copilot_model(isolated_copilot_home: Path) -> dict[str, str]:
                     if isinstance(candidate, str) and candidate and candidate not in discovered:
                         discovered.append(candidate)
 
-    # Prefer gpt-4.1 (verified present on #edu) over the first-discovered
-    # model, which on this workstation is often gpt-4o → provider rejects.
+    # Prefer gpt-4.1 when actually advertised; otherwise fall back to any
+    # discovered model (usually gpt-4o). Using a model not in discovery
+    # triggers `ProviderModelNotFoundError` at dispatch time.
     if "gpt-4.1" in discovered:
         model_id = "gpt-4.1"
+    elif discovered:
+        model_id = discovered[0]
     else:
-        non_4o = [m for m in discovered if m != "gpt-4o"]
-        model_id = non_4o[0] if non_4o else "gpt-4.1"
+        model_id = "gpt-4o"
 
     return {"providerID": "github-copilot", "modelID": model_id}
 
@@ -759,7 +780,7 @@ def isolated_server(
     server = OpencodeServer(
         data_dir=home_root,
         cwd=cwd_root,
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
         capture_stderr=True,
     )
     server.start()

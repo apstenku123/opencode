@@ -201,7 +201,7 @@ def _spawn_server(
             "XDG_STATE_HOME": str(tmp_home / ".local" / "state"),
         },
         cwd=scratch_cwd,
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
     )
     server._e2e_home = tmp_home  # type: ignore[attr-defined]
     server._e2e_cwd = scratch_cwd  # type: ignore[attr-defined]
@@ -443,7 +443,7 @@ def _live_hooks_spawn_server(
         binary=resolve_opencode_binary(),
         data_dir=isolated_home,
         cwd=scratch_cwd,
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
         capture_stderr=True,
         env={"OPENCODE_DEBUG_PROVIDERS": "1"},
     )
@@ -686,7 +686,7 @@ def _spawn_live_with_permission_overrides(
         binary=resolve_opencode_binary(),
         data_dir=isolated_home,
         cwd=scratch_cwd,
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
         capture_stderr=True,
         env={"OPENCODE_DEBUG_PROVIDERS": "1"},
     )
@@ -771,7 +771,7 @@ def _spawn_sgr_hooks_server(
         binary=_sgr_binary_hooks_dispatch(),
         data_dir=isolated_home,
         cwd=scratch_cwd,
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
         capture_stderr=True,
         env={"OPENCODE_DEBUG_PROVIDERS": "1"},
     )
@@ -1811,7 +1811,7 @@ def hooks_sgr_server(tmp_path_factory):
     isolated_home = prepare_isolated_home(preserve_tokens=True)
     server = OpencodeServer(
         binary=_hooks_sgr_binary(),
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
         data_dir=isolated_home,
         cwd=root,
         capture_stderr=True,

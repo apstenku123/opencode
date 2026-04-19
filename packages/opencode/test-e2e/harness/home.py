@@ -41,6 +41,7 @@ _COPY_FILES = (
     "auth.json",
     "copilot-connections.json",
     "copilot-rate-state.sqlite",
+    "copilot-models-cache.json",
 )
 
 

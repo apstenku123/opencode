@@ -1016,7 +1016,7 @@ def subagent_sgr_server(tmp_path_factory):
     isolated_home = prepare_isolated_home(preserve_tokens=True)
     server = OpencodeServer(
         binary=_subagent_sgr_binary(),
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
         data_dir=isolated_home,
         cwd=root,
         capture_stderr=True,

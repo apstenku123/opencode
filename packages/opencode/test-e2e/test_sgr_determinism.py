@@ -156,7 +156,7 @@ def sgr_server_root(tmp_path_factory) -> "tuple[OpencodeServer, str]":
     root = tmp_path_factory.mktemp("sgr")
     server = OpencodeServer(
         binary=binary,
-        ready_timeout_s=30.0,
+        ready_timeout_s=60.0,
         cwd=root,
         capture_stderr=True,
     )

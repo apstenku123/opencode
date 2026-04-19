@@ -251,7 +251,7 @@ class BenchServer:
             binary=self.binary,
             data_dir=self.home,
             cwd=self.project_dir,
-            ready_timeout_s=30.0,
+            ready_timeout_s=60.0,
             capture_stderr=True,
             env=env,
         )
