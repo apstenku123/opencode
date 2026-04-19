@@ -1304,14 +1304,25 @@ async function reserveSlot(input: {
     // `isAgent` boolean so legacy callers keep the old routing behaviour.
     const tierAware = shouldPreferSecondarySubagentAccounts(input.modelId, input.parentModelId)
     const preferSecondary = input.parentModelId ? tierAware : input.isAgent
-    try {
-      const lease = preferSecondary
-        ? await input.pool.acquirePreferSecondary(input.key, { timeoutMs: ACQUIRE_TIMEOUT_MS })
-        : await input.pool.acquire(input.key, { timeoutMs: ACQUIRE_TIMEOUT_MS })
-      return { lease }
-    } catch {
-      // fall through to the legacy reservation path so we never deadlock the
-      // dispatcher just because the pool can't immediately give us the slot.
+    // Guard: when the pool's roster doesn't contain `input.key` (e.g. no
+    // accounts have been registered yet during plugin boot / tests that
+    // mock `allAuths()` as empty), `acquire()` would block for up to
+    // ACQUIRE_TIMEOUT_MS (5 min) before the bounded-wait timer fires.
+    // Skip straight to the legacy reservation path so dispatches never
+    // deadlock on an empty roster — mirrors Rust's "no pool → flat
+    // reserve" behaviour and keeps unit-level loader tests fast.
+    const roster = input.pool.getAccounts()
+    const rosterHasKey = roster.some((item) => item.key === input.key)
+    if (rosterHasKey) {
+      try {
+        const lease = preferSecondary
+          ? await input.pool.acquirePreferSecondary(input.key, { timeoutMs: ACQUIRE_TIMEOUT_MS })
+          : await input.pool.acquire(input.key, { timeoutMs: ACQUIRE_TIMEOUT_MS })
+        return { lease }
+      } catch {
+        // fall through to the legacy reservation path so we never deadlock the
+        // dispatcher just because the pool can't immediately give us the slot.
+      }
     }
   }
   const { reserve, reserveBatch } = await import("./runtime")
