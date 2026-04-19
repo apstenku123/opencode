@@ -49,3 +49,10 @@ export const macOSAppSupportAuthFile = path.join(
   "auth.json",
 )
 export const migrationFile = path.join(Global.Path.data, "copilot-migration.json")
+/**
+ * SQLite file where `CopilotRateLimiter` / `AccountPool` persist per-account
+ * rate-limit state (cooldown deadlines, headerless-429 escalator counter,
+ * `last429At`). Exposed separately so the `providers stats` CLI and the
+ * `/copilot/stats` HTTP endpoint can read it without duplicating the literal.
+ */
+export const rateStateFile = path.join(Global.Path.data, "copilot-rate-state.sqlite")

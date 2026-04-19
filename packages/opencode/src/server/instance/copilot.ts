@@ -24,6 +24,7 @@ import {
   jsonMigration,
   jsonStatus,
   loadAccountStatuses,
+  loadProvidersStats,
   loadRouteDebug,
   poolAllowedProdModels,
   poolAllowedTestModels,
@@ -31,6 +32,7 @@ import {
   resolveMigrationSummary,
   saveProxy,
 } from "@/cli/cmd/providers"
+import { parseDuration, STATS_SCHEMA_VERSION } from "@/plugin/github-copilot/stats"
 import {
   clearDeactivated,
   empty,
@@ -103,6 +105,41 @@ const KeyParamSchema = z.object({
 const PoolParamSchema = z.object({
   pool: z.enum(["edu", "prod"]).meta({ description: "Copilot routing pool" }),
 })
+
+const StatsQuerySchema = z.object({
+  since: z
+    .string()
+    .optional()
+    .meta({
+      description: "Time window (10m, 1h, 24h, …). Omit for since-boot totals.",
+    }),
+})
+
+const StatsResponseSchema = z
+  .object({
+    schemaVersion: z.number().meta({ example: STATS_SCHEMA_VERSION }),
+    generatedAt: z.number(),
+    bootedAt: z.number(),
+    windowMs: z.number().nullable(),
+    accounts: z.array(z.any()),
+    topModels: z.array(z.object({ model: z.string(), count: z.number() })),
+    pools: z.array(
+      z.object({
+        pool: z.string(),
+        accounts: z.number(),
+        deactivated: z.number(),
+        inCooldown: z.number(),
+      }),
+    ),
+    totals: z.object({
+      accounts: z.number(),
+      deactivated: z.number(),
+      dispatches: z.number(),
+      rateLimits: z.number(),
+      premium: z.number(),
+    }),
+  })
+  .loose()
 
 // --------------------------------------------------------------------------
 // Routes
@@ -424,6 +461,33 @@ export const CopilotRoutes = lazy(() =>
           prod: poolAllowedProdModels(pool),
           testOnly: poolAllowedTestModels(pool),
         })
+      },
+    )
+    /* ---------------- Observability ------------------------------------ */
+    .get(
+      "/stats",
+      describeRoute({
+        summary: "GitHub Copilot dispatch stats",
+        description:
+          "Per-account dispatch counts, 429 hits, retry-after average and premium stamps since boot. Mirrors `opencode providers stats --json`. Optional `since` query narrows to a window (e.g. `10m`, `1h`, `24h`).",
+        operationId: "copilot.stats",
+        responses: {
+          200: {
+            description: "Aggregate stats payload",
+            content: { "application/json": { schema: resolver(StatsResponseSchema) } },
+          },
+          ...errors(400),
+        },
+      }),
+      validator("query", StatsQuerySchema),
+      async (c) => {
+        const { since } = c.req.valid("query")
+        const sinceMs = parseDuration(since)
+        if (since !== undefined && sinceMs === undefined) {
+          return c.json({ error: `invalid since value: ${since}` }, 400)
+        }
+        const payload = await loadProvidersStats({ sinceMs })
+        return c.json(payload)
       },
     )
     /* ---------------- Quota + route debug ------------------------------ */

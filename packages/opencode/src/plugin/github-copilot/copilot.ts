@@ -21,7 +21,7 @@ import {
 import { AccountPool, type Lease } from "./account-pool"
 import { openRateStore } from "./account-pool-sqlite"
 import { CopilotRateLimiter, copilotRateLimiterConfig, type Release as RateLimiterRelease } from "./rate-limiter"
-import path from "path"
+import { CopilotStats } from "./stats"
 import { classifyPlan, fetchQuota } from "./quota"
 import { MessageV2 } from "@/session/message-v2"
 import { Auth } from "@/auth"
@@ -792,6 +792,9 @@ export async function envelopeFetch(
     timeout_ms: PROXY_FETCH_TIMEOUT_SEC * 1000,
   }
   if (body !== undefined) envelope.body = body
+  try {
+    ;(await import("fs")).appendFileSync("/tmp/dbgzz9.log", `DBGZZ9 envelopeFetch target=${targetUrl} method=${method} hdrCT=${filtered["content-type"] ?? filtered["Content-Type"] ?? "NONE"} bodyLen=${body?.length ?? 0} bodyPreview=${(body ?? "").slice(0, 300)}\n`)
+  } catch {}
   const endpoint = `${cfg.url.replace(/\/$/, "")}/fetch`
   const proxyHeadersInit: Record<string, string> = {
     "Content-Type": "application/json",
@@ -1044,6 +1047,12 @@ async function dispatchOnce(ctx: {
 }): Promise<Response> {
   const { input, live, state } = ctx
   const isPremium = input.modelId ? premiumState(input.premium, live.key, input.modelId) : !input.isAgent
+  // Record the observability stamp *before* refresh/fetch so the counter
+  // reflects the intent to dispatch even if the network call fails or is
+  // rate-limited downstream. `recordPremium` is emitted alongside so the
+  // CLI can show when premium budget was actually spent vs. just routed.
+  CopilotStats.recordDispatch(live.key, input.modelId)
+  if (input.modelId && isPremium) CopilotStats.recordPremium(live.key, input.modelId)
   const fresh = await refreshAccount({ state, key: live.key, token: live.refresh, enterpriseUrl: live.enterpriseUrl })
   const [nextState, machineId] = machine(routed(fresh, live.key), live.key)
   await input.write(nextState)
@@ -1088,6 +1097,9 @@ async function dispatchOnce(ctx: {
     input.runtime.rateLimiter?.record429(live.key)
     const retryAfter = res.headers.get("retry-after") ?? res.headers.get("Retry-After")
     const retryAfterMs = parseRetryAfterHeader(retryAfter)
+    // Observability: record the 429 with the parsed retry-after (or
+    // undefined for headerless 429s so the avg doesn't skew to 0).
+    CopilotStats.recordRateLimit(live.key, retryAfterMs)
     const result = input.pool
       ? input.pool.recordExhaustion(live.key, { retryAfter, ...(retryAfterMs !== undefined ? { delayMs: retryAfterMs } : {}) })
       : (await import("./runtime")).record429(input.runtime, live.key, { retryAfterMs })
@@ -1311,9 +1323,8 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   // Boot the AccountPool against the live runtime + SQLite cooldown store.
   // The roster is refreshed lazily in `dispatch` (every call observes the
   // current `auths` + `state.connections.unsupportedModels`).
-  const { Global } = await import("@/global")
-  const sqlitePath = path.join(Global.Path.data, "copilot-rate-state.sqlite")
-  const rateStore = await openRateStore(sqlitePath).catch(() => undefined)
+  const { rateStateFile } = await import("./paths")
+  const rateStore = await openRateStore(rateStateFile).catch(() => undefined)
   const pool = new AccountPool({ runtime, store: rateStore })
   CopilotRuntimeState.pool = pool
   return {
