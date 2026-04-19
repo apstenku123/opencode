@@ -100,7 +100,7 @@ describe("envelopeFetch (Rust-compatible POST /fetch wrapper)", () => {
     )
 
     expect(captured.method).toBe("POST")
-    expect(captured.body).toBe('{"messages":[]}')
+    expect(captured.data).toBe('{"messages":[]}')
     expect(res.status).toBe(429)
     expect(res.headers.get("retry-after")).toBe("60")
     expect(await res.text()).toBe("rate limited")

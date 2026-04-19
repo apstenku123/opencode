@@ -791,10 +791,12 @@ export async function envelopeFetch(
     headers: filtered,
     timeout_ms: PROXY_FETCH_TIMEOUT_SEC * 1000,
   }
-  if (body !== undefined) envelope.body = body
-  try {
-    ;(await import("fs")).appendFileSync("/tmp/dbgzz9.log", `DBGZZ9 envelopeFetch target=${targetUrl} method=${method} hdrCT=${filtered["content-type"] ?? filtered["Content-Type"] ?? "NONE"} bodyLen=${body?.length ?? 0} bodyPreview=${(body ?? "").slice(0, 300)}\n`)
-  } catch {}
+  // The GCP fetch-proxy expects the inner request body under the `data`
+  // field (not `body`). Using `body` silently results in an empty
+  // upstream body and Copilot responds `400 {"error":{"code":
+  // "invalid_request_body","message":"request body is not valid JSON"}}`
+  // regardless of what we send.
+  if (body !== undefined) envelope.data = body
   const endpoint = `${cfg.url.replace(/\/$/, "")}/fetch`
   const proxyHeadersInit: Record<string, string> = {
     "Content-Type": "application/json",
