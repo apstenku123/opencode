@@ -35,12 +35,15 @@ import {
   proxyList,
   quotaAccounts,
   saveProxy,
+  seedMachineIds,
   writeGlobalConfigRaw,
 } from "@/cli/cmd/providers"
 import { connectionFile } from "@/plugin/github-copilot/paths"
 import { Auth } from "@/auth"
 import * as providersCmd from "@/cli/cmd/providers"
-import { empty } from "@/plugin/github-copilot/connections"
+import { AppFileSystem } from "@opencode-ai/shared/filesystem"
+import { Effect, Layer } from "effect"
+import { Store as ConnectionsStore, empty, empty as emptyConnections } from "@/plugin/github-copilot/connections"
 import { readFile, rm } from "node:fs/promises"
 
 // Disable the live `/models` discovery probe in unit tests. Without this,
@@ -1231,5 +1234,265 @@ describe("mutateConnections", () => {
     await rm(connectionFile, { force: true }).catch(() => undefined)
     const next = await mutateConnections((state) => state)
     expect(next).toEqual(empty())
+  })
+})
+
+describe("machineId lifecycle", () => {
+  const provide = <A, E>(effect: Effect.Effect<A, E, Auth.Service | AppFileSystem.Service>) =>
+    Effect.runPromise(effect.pipe(Effect.provide(Layer.mergeAll(Auth.defaultLayer, AppFileSystem.defaultLayer))))
+
+  async function resetCopilotAuth() {
+    await provide(
+      Effect.gen(function* () {
+        const auth = yield* Auth.Service
+        const all = yield* auth.all()
+        for (const key of Object.keys(all)) {
+          if (key.startsWith("github-copilot")) yield* auth.remove(key)
+        }
+        const fs = yield* AppFileSystem.Service
+        const store = new ConnectionsStore(fs)
+        yield* store.write(emptyConnections())
+      }),
+    )
+  }
+
+  test("importing a new account populates machineId and re-running does not regenerate", async () => {
+    const { migrate } = await import("@/plugin/github-copilot/auth")
+    const { mkdir, writeFile } = await import("node:fs/promises")
+    const { tmpdir } = await import("node:os")
+    const path = await import("node:path")
+    await resetCopilotAuth()
+    const dir = path.join(tmpdir(), `opencode-machineid-stable-${Date.now()}`)
+    await mkdir(dir, { recursive: true })
+    const legacyPath = path.join(dir, "legacy.json")
+    const markerPath = path.join(dir, "marker.json")
+    await writeFile(legacyPath, JSON.stringify({ "github.com": { token: "tok-new-acct", user: "alice" } }))
+    const ioFor = (fs: AppFileSystem.Interface) => ({
+      legacy: legacyPath,
+      apps: legacyPath + ".apps",
+      oauth: legacyPath + ".oauth",
+      forge: legacyPath + ".forge",
+      codedash: legacyPath + ".codedash",
+      macOSAppSupport: legacyPath + ".macOSAppSupport",
+      marker: markerPath,
+      read(p: string) {
+        return fs.readJson(p)
+      },
+      write(p: string, value: unknown) {
+        return fs.writeJson(p, value, 0o600)
+      },
+    })
+    try {
+      // First migrate: the NEW account gets a machineId minted at add-time.
+      const after1 = await provide(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          yield* migrate(ioFor(fs))
+          return yield* new ConnectionsStore(fs).read()
+        }),
+      )
+      const mid1 = after1.connections["github-copilot"]?.machineId
+      expect(typeof mid1).toBe("string")
+      expect(mid1).toMatch(/^[0-9a-f-]{36}$/i)
+
+      // Second migrate: the account already exists; machineId MUST be
+      // identical — migrate() is forbidden from regenerating the
+      // UA-identity of an account it imported earlier.
+      const after2 = await provide(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          yield* migrate(ioFor(fs))
+          return yield* new ConnectionsStore(fs).read()
+        }),
+      )
+      expect(after2.connections["github-copilot"]?.machineId).toBe(mid1!)
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined)
+      await resetCopilotAuth()
+    }
+  })
+
+  test("seedMachineIds backfill is idempotent across calls (no regeneration)", async () => {
+    await resetCopilotAuth()
+    try {
+      await provide(
+        Effect.gen(function* () {
+          const auth = yield* Auth.Service
+          yield* auth.set(
+            "github-copilot",
+            new Auth.Oauth({ type: "oauth", refresh: "r-primary", access: "", expires: 0 }),
+          )
+          yield* auth.set(
+            "github-copilot#edu-1",
+            new Auth.Oauth({ type: "oauth", refresh: "r-edu-1", access: "", expires: 0 }),
+          )
+        }),
+      )
+      const first = await provide(seedMachineIds())
+      expect(first.assigned.sort()).toEqual(["github-copilot", "github-copilot#edu-1"])
+      const after1 = await provide(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          return yield* new ConnectionsStore(fs).read()
+        }),
+      )
+      const mid1 = { ...after1.connections }
+      // Re-run: MUST be a no-op — already-minted ids stay stable.
+      const second = await provide(seedMachineIds())
+      expect(second.assigned).toEqual([])
+      const after2 = await provide(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          return yield* new ConnectionsStore(fs).read()
+        }),
+      )
+      for (const [key, conn] of Object.entries(mid1)) {
+        expect(after2.connections[key]?.machineId).toBe(conn.machineId!)
+      }
+    } finally {
+      await resetCopilotAuth()
+    }
+  })
+})
+
+describe("seedMachineIds (machineId pre-population)", () => {
+  const provide = <A, E>(effect: Effect.Effect<A, E, Auth.Service | AppFileSystem.Service>) =>
+    Effect.runPromise(effect.pipe(Effect.provide(Layer.mergeAll(Auth.defaultLayer, AppFileSystem.defaultLayer))))
+
+  async function resetCopilotAuth() {
+    await provide(
+      Effect.gen(function* () {
+        const auth = yield* Auth.Service
+        const all = yield* auth.all()
+        for (const key of Object.keys(all)) {
+          if (key.startsWith("github-copilot")) yield* auth.remove(key)
+        }
+        const fs = yield* AppFileSystem.Service
+        const store = new ConnectionsStore(fs)
+        yield* store.write(emptyConnections())
+      }),
+    )
+  }
+
+  test("providers accounts surfaces a non-null machineId on every live account", async () => {
+    // The invariant `providers accounts --json` relies on: every account
+    // present in `Auth.Service.all()` (type === "oauth") must carry a
+    // non-empty `status.machineId`.  Mirrors the per-account UA rotation
+    // codex_git performs via `ConnectionManager::with_test_accounts`.
+    await resetCopilotAuth()
+    try {
+      const liveKeys = [
+        "github-copilot",
+        "github-copilot#edu-1",
+        "github-copilot#edu-2",
+        "github-copilot#enterprise",
+      ]
+      await provide(
+        Effect.gen(function* () {
+          const auth = yield* Auth.Service
+          for (const key of liveKeys) {
+            yield* auth.set(
+              key,
+              new Auth.Oauth({ type: "oauth", refresh: `r-${key}`, access: "", expires: 0 }),
+            )
+          }
+        }),
+      )
+      // Partially populated connections.json — the buggy state from the
+      // original report: some accounts carry a machineId, others don't.
+      await seedState({
+        "github-copilot": { machineId: "fffffff0-0000-0000-0000-000000000000", plan: "free" },
+        "github-copilot#edu-1": { plan: "edu" },
+        "github-copilot#enterprise": {},
+      })
+      const result = await provide(seedMachineIds())
+      expect(result.assigned.sort()).toEqual(
+        ["github-copilot#edu-1", "github-copilot#edu-2", "github-copilot#enterprise"].sort(),
+      )
+      const state = await provide(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          return yield* new ConnectionsStore(fs).read()
+        }),
+      )
+      const statuses = liveKeys.map((key) => jsonStatus(accountStatus({ key, state })))
+      for (const status of statuses) {
+        expect(status.machineId).not.toBeNull()
+        expect(typeof status.machineId).toBe("string")
+        expect(status.machineId!.length).toBeGreaterThan(0)
+      }
+      // Each account gets a distinct identity — the traffic-split
+      // heuristics depend on per-account UA distinctness.
+      const ids = statuses.map((status) => status.machineId!)
+      expect(new Set(ids).size).toBe(ids.length)
+      // Pre-existing machineIds are preserved, never regenerated.
+      expect(state.connections["github-copilot"].machineId).toBe("fffffff0-0000-0000-0000-000000000000")
+    } finally {
+      await resetCopilotAuth()
+    }
+  })
+
+  test("idempotent — a second pass assigns nothing and keeps existing ids stable", async () => {
+    await resetCopilotAuth()
+    try {
+      await provide(
+        Effect.gen(function* () {
+          const auth = yield* Auth.Service
+          yield* auth.set(
+            "github-copilot",
+            new Auth.Oauth({ type: "oauth", refresh: "r", access: "", expires: 0 }),
+          )
+        }),
+      )
+      const first = await provide(seedMachineIds())
+      expect(first.assigned).toEqual(["github-copilot"])
+      const initial = await provide(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          return yield* new ConnectionsStore(fs).read()
+        }),
+      )
+      const mid = initial.connections["github-copilot"].machineId
+      expect(mid).toMatch(/^[0-9a-f-]{36}$/i)
+      const second = await provide(seedMachineIds())
+      expect(second.assigned).toEqual([])
+      const after = await provide(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          return yield* new ConnectionsStore(fs).read()
+        }),
+      )
+      expect(after.connections["github-copilot"].machineId).toBe(mid!)
+    } finally {
+      await resetCopilotAuth()
+    }
+  })
+
+  test("skips non-copilot and non-oauth accounts", async () => {
+    await resetCopilotAuth()
+    try {
+      await provide(
+        Effect.gen(function* () {
+          const auth = yield* Auth.Service
+          yield* auth.set("anthropic", new Auth.Api({ type: "api", key: "sk-test" }))
+          yield* auth.set(
+            "github-copilot",
+            new Auth.Oauth({ type: "oauth", refresh: "r", access: "", expires: 0 }),
+          )
+        }),
+      )
+      const result = await provide(seedMachineIds())
+      expect(result.assigned).toEqual(["github-copilot"])
+      const state = await provide(
+        Effect.gen(function* () {
+          const fs = yield* AppFileSystem.Service
+          return yield* new ConnectionsStore(fs).read()
+        }),
+      )
+      expect(state.connections["anthropic"]).toBeUndefined()
+      expect(state.connections["github-copilot"]?.machineId).toMatch(/^[0-9a-f-]{36}$/i)
+    } finally {
+      await resetCopilotAuth()
+    }
   })
 })

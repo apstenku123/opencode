@@ -10,6 +10,7 @@ import {
 import { Auth } from "@/auth"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { Effect } from "effect"
+import { Store as ConnectionsStore, upsert as upsertConn } from "./connections"
 
 export type CopilotAuth = {
   key: string
@@ -344,15 +345,32 @@ export const migrate = Effect.fn("CopilotAuth.migrate")(function* (src?: Migrati
   // every CLI/plugin boot so edu/GCP-proxy accounts added to
   // ~/.copilot/auth/credential.json AFTER the initial migration still
   // land in opencode.
-  for (const item of items) {
-    yield* auth.set(item.key, {
-      type: "oauth",
-      refresh: item.refresh,
-      access: item.access,
-      expires: item.expires,
-      accountId: item.key,
-      enterpriseUrl: item.enterpriseUrl,
-    })
+  // Every fresh account also gets a `machineId` minted into
+  // copilot-connections.json in the SAME pass — so UA-identity is
+  // generated exactly once at account-add-time and persists across
+  // restarts. Existing accounts (machineId already set) are untouched.
+  if (items.length > 0) {
+    const afs = yield* AppFileSystem.Service
+    const connStore = new ConnectionsStore(afs)
+    let connState = yield* connStore.read()
+    let connChanged = false
+    for (const item of items) {
+      yield* auth.set(item.key, {
+        type: "oauth",
+        refresh: item.refresh,
+        access: item.access,
+        expires: item.expires,
+        accountId: item.key,
+        enterpriseUrl: item.enterpriseUrl,
+      })
+      if (!connState.connections[item.key]?.machineId) {
+        connState = upsertConn(connState, item.key, {
+          machineId: crypto.randomUUID().toLowerCase(),
+        })
+        connChanged = true
+      }
+    }
+    if (connChanged) yield* connStore.write(connState)
   }
   // Stash proxy metadata (not on Auth.Info) for downstream upsert into
   // copilot-connections.json. All legacy entries are considered — not
