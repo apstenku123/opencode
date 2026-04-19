@@ -721,6 +721,7 @@ export async function loadAccountStatuses() {
   log(`accounts filtered: ${accounts.length}`)
   let state = await readConnections()
   log(`connections loaded (${Object.keys(state.connections).length})`)
+  const newlyDeactivated = new Set<string>()
   const items = await Promise.all(
     accounts.map(async ([key, info]) => {
       const proxy = state.connections[key]?.proxyUrl
@@ -743,12 +744,21 @@ export async function loadAccountStatuses() {
           ghe: info.enterpriseUrl ?? null,
         }
       } catch (err) {
-        log(`fetchQuota ${key} err: ${err instanceof Error ? err.message : String(err)}`)
+        const msg = err instanceof Error ? err.message : String(err)
+        log(`fetchQuota ${key} err: ${msg}`)
+        // Detect suspended/deactivated accounts (401/403 from upstream).
+        // Mark persistently so routing skips them and a subsequent
+        // `providers accounts` display filters them out by default.
+        const match = msg.match(/Failed to fetch quota: (\d{3})/)
+        const statusCode = match ? Number(match[1]) : undefined
+        if (statusCode === 401 || statusCode === 403) {
+          newlyDeactivated.add(key)
+        }
         return {
           info,
           quota: undefined,
           proxy,
-          status: accountStatus({ key, state, quotaError: err instanceof Error ? err.message : String(err) }),
+          status: accountStatus({ key, state, quotaError: msg }),
           premium: undefined,
           ghe: info.enterpriseUrl ?? null,
         }
@@ -756,6 +766,27 @@ export async function loadAccountStatuses() {
     }),
   )
   log(`items resolved (${items.length})`)
+  // Persist any 401/403-triggered deactivations + surface them in status
+  // so the pool routing layer (connections.ts::next) skips them on the
+  // next dispatch. Suspended/revoked accounts stay on disk until the user
+  // re-authenticates via `providers login`.
+  if (newlyDeactivated.size > 0) {
+    const { markDeactivated } = await import("../../plugin/github-copilot/connections")
+    for (const key of newlyDeactivated) {
+      state = markDeactivated(state, key)
+      const hit = items.find((it) => it.status.key === key)
+      if (hit) {
+        hit.status.health = "deactivated"
+        hit.status.error = hit.status.error ?? "account suspended / token revoked (401/403)"
+      }
+    }
+    try {
+      await Bun.write(connectionFile, JSON.stringify(state, null, 2))
+    } catch {
+      // non-fatal
+    }
+    log(`marked deactivated: ${[...newlyDeactivated].join(", ")}`)
+  }
   // Lazy discovery probe: populate Conn.discovery for accounts that haven't
   // yet been routed through a real provider dispatch. Default on; disable via
   // OPENCODE_PROBE_DISCOVERY=0. Hard-capped at 8 s so a hanging upstream can
@@ -979,9 +1010,13 @@ export const ProvidersCommand = cmd({
  * persisted `connections.json` so we don't trigger live network calls
  * inside `providers list`.
  */
-export function renderBestPerVendor(state: State): string[] {
+export function renderBestPerVendor(state: State, opts?: { includeDeactivated?: boolean }): string[] {
   const lines: string[] = []
+  const showDeactivated = !!opts?.includeDeactivated
   for (const [key, conn] of Object.entries(state.connections)) {
+    // Skip suspended / revoked accounts by default — they can't actually
+    // route the "best" model anyway.
+    if (!showDeactivated && conn.deactivated) continue
     const pool = accountPoolLabel(key, conn.plan)
     const unsupported = new Set(conn.unsupportedModels ?? [])
     // "best" now reflects the POOL ROUTING default, not the raw cached
@@ -1387,11 +1422,22 @@ export async function loadAccountHealth(): Promise<AccountStatusInfo[]> {
 export const ProvidersAccountsCommand = cmd({
   command: "accounts",
   describe: "show GitHub Copilot account overview",
-  builder: (yargs) => yargs.option("json", { type: "boolean", describe: "output account overview as json" }),
+  builder: (yargs) =>
+    yargs
+      .option("json", { type: "boolean", describe: "output account overview as json" })
+      .option("all", {
+        type: "boolean",
+        describe: "include deactivated (suspended / revoked) accounts — default: hide them",
+      }),
   async handler(args) {
     UI.empty()
     prompts.intro("GitHub Copilot Accounts")
-    const { accounts, items, state } = await loadAccountStatuses()
+    const { accounts, items: allItems, state } = await loadAccountStatuses()
+    const includeDeactivated = !!(args as { all?: boolean }).all
+    const items = includeDeactivated
+      ? allItems
+      : allItems.filter((it) => it.status.health !== "deactivated")
+    const hiddenCount = allItems.length - items.length
     const migration = resolveMigrationSummary(accounts.length > 0)
     if (accounts.length === 0) {
       prompts.log.error("No GitHub Copilot accounts configured. Run: opencode providers login")
@@ -1446,10 +1492,13 @@ export const ProvidersAccountsCommand = cmd({
       else prompts.log.info(text)
     }
     // Render best-per-vendor pick when discovery data is available.
-    for (const line of renderBestPerVendor(state)) {
+    for (const line of renderBestPerVendor(state, { includeDeactivated })) {
       prompts.log.info(line)
     }
-    prompts.outro(`${accounts.length} account${accounts.length === 1 ? "" : "s"}`)
+    const tail = hiddenCount > 0
+      ? ` (${hiddenCount} deactivated hidden — pass --all to show)`
+      : ""
+    prompts.outro(`${items.length} account${items.length === 1 ? "" : "s"}${tail}`)
   },
 })
 
