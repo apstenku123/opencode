@@ -150,13 +150,18 @@ export function poolForAccount(input: {
   if (/^github-copilot#edu-/.test(key)) return "edu"
   if (!plan) return undefined
   const normalized = plan.toLowerCase()
-  if (normalized === "edu" || normalized === "free") return "edu"
+  // "edu", "free", and "individual" (Copilot Pro / personal seat) all
+  // carry limited-quota traffic that's safe to use as the test pool.
+  // User routing treats anything non-enterprise as edu — codex-5.3-xhigh
+  // prod traffic + gpt-4.1/gpt-5-mini-xhigh test traffic both route to
+  // these accounts, while enterprise-only traffic (gpt-5.4-xhigh,
+  // claude-4.7-opus-high) stays on the enterprise pool.
+  if (normalized === "edu" || normalized === "free" || normalized === "individual") return "edu"
   if (
     normalized === "enterprise" ||
     normalized === "pro" ||
     normalized === "business" ||
-    normalized === "team" ||
-    normalized === "individual"
+    normalized === "team"
   ) {
     return "prod"
   }
