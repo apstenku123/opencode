@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
+import select
 import socket
 import subprocess
 import threading
@@ -156,24 +158,91 @@ class OpencodeServer:
     def _drain_stderr(self, stream) -> None:
         """Background reader that appends stderr chunks to ``self._stderr_buf``.
 
+        Uses ``fcntl`` to put the stream fd into non-blocking mode and
+        ``select.select`` with a short timeout so the reader thread can
+        exit promptly when ``stop()`` closes the pipe. Previously this
+        looped on ``stream.read(4096)`` which blocks indefinitely until
+        the kernel returns data — that caused per-test 120s hangs when
+        the subprocess exited cleanly but stderr pipe shutdown lagged
+        (e.g. test_memory.py::test_phase1_extracts_sextuples).
+
         Also mirrors to the parent process's stderr when ``print_logs`` is
         set, so pytest ``-s`` still shows logs interactively.
+        """
+        try:
+            fd = stream.fileno()
+        except (AttributeError, OSError):
+            # Fallback to the old blocking path if we can't get an fd.
+            self._drain_stderr_blocking(stream)
+            return
+
+        # Put fd into non-blocking mode.
+        try:
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        except OSError:
+            self._drain_stderr_blocking(stream)
+            return
+
+        try:
+            while True:
+                # Short select timeout — allows prompt exit when the pipe
+                # closes during stop().
+                try:
+                    ready, _, _ = select.select([fd], [], [], 0.5)
+                except (OSError, ValueError):
+                    return
+                if not ready:
+                    # Peek at proc status — if the child is gone and the
+                    # pipe buffer is drained, bail out.
+                    if self._proc is not None and self._proc.poll() is not None:
+                        # One final non-blocking read to pick up the tail.
+                        try:
+                            chunk = os.read(fd, 4096)
+                            if chunk:
+                                self._record_stderr_chunk(chunk)
+                        except (BlockingIOError, OSError):
+                            pass
+                        return
+                    continue
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    return
+                if not chunk:
+                    # EOF — pipe closed.
+                    return
+                self._record_stderr_chunk(chunk)
+        except Exception:
+            # Reader threads must never bubble exceptions — the test will
+            # see the missing data via empty ``stderr_text()``.
+            pass
+
+    def _drain_stderr_blocking(self, stream) -> None:
+        """Fallback blocking drain when fcntl/select isn't available.
+
+        Kept only for platform/pipe objects that don't expose a real fd;
+        in the common ``subprocess.Popen(..., stderr=PIPE)`` case this is
+        never reached.
         """
         try:
             for chunk in iter(lambda: stream.read(4096), b""):
                 if not chunk:
                     break
-                with self._stderr_lock:
-                    self._stderr_buf.append(chunk)
-                if self.print_logs:
-                    try:
-                        os.write(2, chunk)
-                    except OSError:
-                        pass
+                self._record_stderr_chunk(chunk)
         except Exception:
-            # Reader threads must never bubble exceptions — the test will
-            # see the missing data via empty ``stderr_text()``.
             pass
+
+    def _record_stderr_chunk(self, chunk: bytes) -> None:
+        with self._stderr_lock:
+            self._stderr_buf.append(chunk)
+        if self.print_logs:
+            try:
+                os.write(2, chunk)
+            except OSError:
+                pass
 
     def stderr_text(self) -> str:
         """Return the captured stderr so far as a UTF-8 string.
@@ -186,19 +255,33 @@ class OpencodeServer:
 
     def stop(self, timeout_s: float = 5.0) -> None:
         proc = self._proc
+        stderr_thread = self._stderr_thread
         if proc is None:
             return
         self._proc = None
 
-        if proc.poll() is not None:
-            return
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=timeout_s)
 
-        proc.terminate()
+        # Close stderr pipe so the non-blocking drain loop sees EOF and
+        # exits without waiting for the 0.5s select tick.
         try:
-            proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=timeout_s)
+            if proc.stderr is not None:
+                proc.stderr.close()
+        except OSError:
+            pass
+
+        # Join the drain thread with a short timeout — prevents a dangling
+        # thread from blocking the pytest session teardown (root cause of
+        # the 120s hang in test_memory.py::test_phase1_extracts_sextuples).
+        if stderr_thread is not None and stderr_thread.is_alive():
+            stderr_thread.join(timeout=2.0)
+        self._stderr_thread = None
 
     # --- readiness -----------------------------------------------------
 
