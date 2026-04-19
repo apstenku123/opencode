@@ -312,6 +312,41 @@ export namespace CopilotModels {
     }
   }
 
+  /**
+   * Minimal stub Model for a model ID that isn't in the upstream
+   * catalog — lets the dispatcher recognize `gpt-4.1` / `gpt-5-mini-xhigh`
+   * on accounts whose `/models` endpoint is unreachable (enterprise API
+   * currently 404s here), so the pool router can still redirect the turn
+   * to an account that actually handles the call. Wide-open capability
+   * defaults because the real capabilities get overwritten when the
+   * eventual upstream response streams through the ai-sdk adapter.
+   */
+  export function buildStub(id: string, baseURL: string): Model {
+    return {
+      id,
+      providerID: "github-copilot",
+      api: { id, url: baseURL, npm: "@ai-sdk/github-copilot" },
+      status: "active",
+      limit: { context: 128_000, input: 128_000, output: 16_384 },
+      capabilities: {
+        temperature: true,
+        reasoning: false,
+        attachment: true,
+        toolcall: true,
+        input: { text: true, audio: false, image: false, video: false, pdf: false },
+        output: { text: true, audio: false, image: false, video: false, pdf: false },
+        interleaved: false,
+      },
+      family: "openai",
+      name: id,
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      options: {},
+      headers: {},
+      release_date: "",
+      variants: {},
+    }
+  }
+
   export async function get(
     baseURL: string,
     headers: HeadersInit = {},

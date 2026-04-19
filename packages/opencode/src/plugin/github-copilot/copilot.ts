@@ -1581,6 +1581,15 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
             plan: planSku,
           })
           .then(async (models) => {
+            // Always surface pool-routing `test_allowed` models. The
+            // upstream /models endpoint doesn't advertise gpt-4.1 /
+            // gpt-5-mini-xhigh (they're non-picker), so without this
+            // injection the dispatcher rejects them with
+            // ProviderModelNotFoundError even though the routing layer
+            // can forward them to an edu-pool account.
+            for (const testID of ["gpt-4.1", "gpt-5-mini-xhigh"]) {
+              if (!models[testID]) models[testID] = CopilotModels.buildStub(testID, apiBase)
+            }
             const supported = Object.values(models).map((item) => item.api.id)
             const next = discover(storeState, key, {
               models: supported,
@@ -1590,9 +1599,6 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
               ok: true,
             })
             await writeState(next)
-            // Hand the supported model set to the AccountPool so
-            // `failoverTokenForModel` can rank Supported > Unknown for
-            // this account on subsequent dispatches.
             pool.setAccountCapabilities(key, supported)
             discoveryBarrier.resolve(key)
             return models
@@ -1610,9 +1616,13 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
             await writeState(next)
             pool.markDiscoveryFailed(key)
             discoveryBarrier.resolve(key)
-            return Object.fromEntries(
+            const fallback: Record<string, Model> = Object.fromEntries(
               Object.entries(provider.models).map(([id, model]) => [id, fix(model, apiBase)]),
             )
+            for (const testID of ["gpt-4.1", "gpt-5-mini-xhigh"]) {
+              if (!fallback[testID]) fallback[testID] = CopilotModels.buildStub(testID, apiBase)
+            }
+            return fallback
           })
       },
     },
