@@ -870,11 +870,26 @@ def test_skill_mention_flags_invocation(
     isolated_skill_home: Path,
     live_copilot_model: dict[str, str],
 ) -> None:
-    """A `$deploy` mention in the user prompt flags the skill as invoked;
-    the evolution engine publishes ``skill.evolution-suggested`` (when the
-    utility sample crosses threshold) or at minimum bumps the in-memory
-    utility table. We assert via the bus event first, with a
-    per-skill-name fallback to direct state inspection.
+    """A `$deploy` mention in the user prompt flags the skill as invoked.
+
+    The evolution engine bookkeeping runs inside the session runLoop
+    (``prompt.ts`` ~ line 1934) BEFORE the model is called:
+    ``handleUserPromptMentions`` → ``recordInvocations`` →
+    ``onToolComplete({success: true})`` → ``utility_table[name].successes++``
+    → ``persistAsync`` writes ``skill-evolution.json``. The mention path
+    is fire-and-forget (``Effect.forkIn(scope)``) and independent of
+    whether the model produces a response.
+
+    SGR rewrite: drives the turn through ``/turn/start`` with a trivial
+    ``{done: bool}`` structured-output schema so the turn completes
+    deterministically (no tool-call required) even when upstream Copilot
+    slows down on free-form text. The turn text still contains the
+    ``$deploy`` sigil — that's what triggers mention parsing. We then
+    poll the persisted ``skill-evolution.json`` for a ``deploy`` record
+    with ``successes >= 1``.
+
+    Replaces the legacy skip-on-stall flake where the model's reply
+    didn't matter but the test still required ``_wait_idle_or_skip``.
     """
     skills_root = _user_skills_dir(isolated_skill_home)
     skills_root.mkdir(parents=True, exist_ok=True)
@@ -897,47 +912,114 @@ def test_skill_mention_flags_invocation(
                 warmup._get("/skill")
             collector = _EventCollector(server, global_stream=True).start()
             try:
-                with _client_for(server, timeout_s=180.0) as client:
-                    session = client.create_session()
-                    # `$deploy please` should be parsed by
-                    # `parseSkillMentions` as an explicit mention.
-                    _prompt_async(client, session["id"], "$deploy please — reply in one short sentence.", model=live_copilot_model)
-                    _wait_idle_or_skip(client, session["id"], timeout_s=180.0)
+                with _client_for(server, timeout_s=300.0) as client:
+                    thread = client.create_thread()
+                    thread_id = thread["id"]
 
-                # The invocation record is a successful tool-complete for the
-                # skill. Evolution only publishes "evolution-suggested" on
-                # failure paths, so success records often don't fire an
-                # event — fall back to the persisted utility table.
-                evolution_path = (
-                    isolated_skill_home / "state" / "opencode" / "skill-evolution.json"
-                )
-                deadline = time.monotonic() + 10.0
-                seen_invocation = False
-                while time.monotonic() < deadline:
-                    if evolution_path.exists():
+                    # Trivial SGR schema — the model only needs to emit
+                    # `{done: true}`. No tool call, no fan-out, just a
+                    # deterministic structured payload that terminates the
+                    # turn. The `$deploy` sigil in the prompt triggers
+                    # mention parsing before the model is invoked.
+                    schema: dict[str, Any] = {
+                        "type": "object",
+                        "properties": {
+                            "done": {
+                                "type": "boolean",
+                                "description": "Set to true to acknowledge the prompt.",
+                            },
+                        },
+                        "required": ["done"],
+                        "additionalProperties": False,
+                    }
+
+                    turn_err: list[BaseException] = []
+                    turn_done = threading.Event()
+
+                    def _drive() -> None:
                         try:
-                            data = json.loads(evolution_path.read_text())
-                        except (OSError, json.JSONDecodeError):
-                            data = {}
-                        table = (data or {}).get("utility_table") or {}
-                        record = table.get("deploy") if isinstance(table, dict) else None
-                        if isinstance(record, dict) and record.get("successes", 0) >= 1:
-                            seen_invocation = True
+                            client.start_turn(
+                                thread_id,
+                                # The `$deploy` sigil is what `parseSkillMentions`
+                                # matches against the seeded skill name. The
+                                # rest of the prompt is filler so the model
+                                # has something to structure.
+                                "$deploy — acknowledge with the JSON object {done: true}.",
+                                model=live_copilot_model,
+                                format={"type": "json_schema", "schema": schema},
+                            )
+                        except BaseException as err:  # noqa: BLE001
+                            turn_err.append(err)
+                        finally:
+                            turn_done.set()
+
+                    drv = threading.Thread(target=_drive, daemon=True, name="sgr-mention")
+                    drv.start()
+
+                    # Poll the persisted evolution state. The mention path
+                    # runs fire-and-forget so we don't have to wait for
+                    # the full turn to complete — the bookkeeping may
+                    # land before the model even replies. `persistAsync`
+                    # uses a microtask-deferred write so we give it a
+                    # generous window after the turn begins.
+                    evolution_path = (
+                        isolated_skill_home / "state" / "opencode" / "skill-evolution.json"
+                    )
+                    deadline = time.monotonic() + 240.0
+                    seen_invocation = False
+                    while time.monotonic() < deadline:
+                        if evolution_path.exists():
+                            try:
+                                data = json.loads(evolution_path.read_text())
+                            except (OSError, json.JSONDecodeError):
+                                data = {}
+                            table = (data or {}).get("utility_table") or {}
+                            record = table.get("deploy") if isinstance(table, dict) else None
+                            if isinstance(record, dict) and record.get("successes", 0) >= 1:
+                                seen_invocation = True
+                                break
+                        # Bus-event fallback: evolution-suggested fires on
+                        # non-trivial actions (tips / optimizations). A
+                        # first-time success won't publish it, but leave
+                        # the watchdog in case a later path stores the
+                        # record differently.
+                        for ev in collector.snapshot():
+                            if ev.type != "skill.evolution-suggested":
+                                continue
+                            action = ev.properties.get("action") or {}
+                            if action.get("skillName") == "deploy":
+                                seen_invocation = True
+                                break
+                        if seen_invocation:
                             break
-                    for ev in collector.snapshot():
-                        if ev.type != "skill.evolution-suggested":
-                            continue
-                        action = ev.properties.get("action") or {}
-                        if action.get("skillName") == "deploy":
-                            seen_invocation = True
-                            break
-                    if seen_invocation:
-                        break
-                    time.sleep(0.3)
-                assert seen_invocation, (
-                    "no invocation record for 'deploy' — neither the evolution "
-                    f"utility table at {evolution_path} nor a bus event appeared."
-                )
+                        # Hit a provider error? Bail out as skip — the
+                        # mention runLoop path requires the turn to
+                        # actually enter prompt.ts:runLoop; if spawn
+                        # failed before that we'd never see the record.
+                        if turn_done.is_set() and turn_err:
+                            # Give the fire-and-forget mention path a
+                            # final moment to settle before concluding.
+                            time.sleep(1.0)
+                            if evolution_path.exists():
+                                try:
+                                    data = json.loads(evolution_path.read_text())
+                                except (OSError, json.JSONDecodeError):
+                                    data = {}
+                                table = (data or {}).get("utility_table") or {}
+                                record = table.get("deploy") if isinstance(table, dict) else None
+                                if isinstance(record, dict) and record.get("successes", 0) >= 1:
+                                    seen_invocation = True
+                                    break
+                            pytest.skip(
+                                f"SGR mention turn driver raised before "
+                                f"mention bookkeeping landed: {turn_err[0]!r}"
+                            )
+                        time.sleep(0.5)
+
+                    assert seen_invocation, (
+                        "no invocation record for 'deploy' — neither the evolution "
+                        f"utility table at {evolution_path} nor a bus event appeared."
+                    )
             finally:
                 collector.stop()
         finally:
