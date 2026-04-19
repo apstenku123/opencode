@@ -89,17 +89,29 @@ describe("thread/turn compat aliases", () => {
       fn: async () => {
         const session = await svc.create({})
         const app = Server.Default().app
+        const headers = { "content-type": "application/json", "x-opencode-directory": tmp.path }
 
+        // Use `noReply: true` so the route only records the user message
+        // and short-circuits BEFORE entering the model loop. Without that
+        // guard, `/turn/start` would block on a real LLM call — unavailable
+        // in this unit test — and hit the bun:test 5s timeout. The intent
+        // of the test is to verify the alias routes reach the underlying
+        // `SessionPrompt` service; it is not a full-turn integration test.
         const started = await app.request(`/turn/start`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ sessionID: session.id, parts: [{ type: "text", text: "hello" }], agent: "build" }),
+          headers,
+          body: JSON.stringify({
+            sessionID: session.id,
+            parts: [{ type: "text", text: "hello" }],
+            agent: "build",
+            noReply: true,
+          }),
         })
         expect(started.status).toBe(200)
 
         const interrupted = await app.request(`/turn/interrupt`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers,
           body: JSON.stringify({ sessionID: session.id }),
         })
         expect(interrupted.status).toBe(200)
