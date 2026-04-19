@@ -433,6 +433,7 @@ def _cleanup_live_server(server: OpencodeServer) -> None:
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_turn_lifecycle_hooks_fire_on_prompt(
     hook_log_dir: Path,
@@ -478,6 +479,7 @@ def test_turn_lifecycle_hooks_fire_on_prompt(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_precompact_postcompact_hooks_fire_on_summarize(
     hook_log_dir: Path,
@@ -531,6 +533,7 @@ def test_precompact_postcompact_hooks_fire_on_summarize(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_pretooluse_deny_short_circuits_tool(
     hook_log_dir: Path,
@@ -691,6 +694,7 @@ def _spawn_live_with_permission_overrides(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_pretooluse_updated_input_rewrites_bash_command(
     hook_log_dir: Path,
@@ -788,6 +792,7 @@ def test_pretooluse_updated_input_rewrites_bash_command(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_posttooluse_updated_output_replaces_tool_result(
     hook_log_dir: Path,
@@ -951,6 +956,7 @@ def test_pretooluse_ask_emits_permission_request(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_stop_hook_failed_abort_injects_stop_abort_tag(
     hook_log_dir: Path,
@@ -1032,6 +1038,7 @@ def test_stop_hook_failed_abort_injects_stop_abort_tag(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_posttooluse_normal_fires_after_tool(
     hook_log_dir: Path,
@@ -1070,6 +1077,7 @@ def test_posttooluse_normal_fires_after_tool(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_subagent_start_stop_fire_on_sync_task(
     hook_log_dir: Path,
@@ -1122,6 +1130,7 @@ def test_subagent_start_stop_fire_on_sync_task(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_subagent_stop_cancelled_on_interrupt(
     hook_log_dir: Path,
@@ -1207,6 +1216,7 @@ def test_subagent_stop_cancelled_on_interrupt(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_permission_denied_source_reject(
     hook_log_dir: Path,
@@ -1281,6 +1291,7 @@ def test_permission_denied_source_reject(
 
 
 @pytest.mark.live
+@pytest.mark.timeout(300)
 @_skip_if_live_disabled
 def test_permission_granted_source_hook(
     hook_log_dir: Path,
