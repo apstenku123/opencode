@@ -41,7 +41,14 @@ from typing import Any, Iterator, Optional
 
 import pytest
 
-from harness import OpencodeClient, OpencodeServer, resolve_opencode_binary
+from harness import (
+    OpencodeClient,
+    OpencodeServer,
+    has_copilot_credentials,
+    prepare_isolated_home,
+    resolve_opencode_binary,
+    run_sgr_or_skip,
+)
 
 # Instance-context smoke check: ``POST /session`` depends on the
 # ``WorkspaceRouterMiddleware`` being wired into ``InstanceRoutes``. If the
@@ -1451,3 +1458,265 @@ def test_permission_granted_source_hook(
                     pass
         finally:
             _cleanup_live_server(server)
+
+
+# ---------------------------------------------------------------------------
+# SGR (Schema-Guided Reasoning) hook tests
+# ---------------------------------------------------------------------------
+#
+# Context: the legacy hook tests above skip whenever the Copilot model
+# declines to invoke the ``bash`` tool (the ``PreToolUse`` /
+# ``PostToolUse`` hooks only fire on a real tool execution). SGR
+# fixes the "will the model emit a valid plan" half of that problem:
+# ``format={"type": "json_schema"}`` forces the model to emit a
+# schema-conforming JSON payload representing the desired bash
+# command.
+#
+# Limitation (documented for future plumbing): SGR constrains the
+# model to a single ``StructuredOutput`` tool call. It does NOT
+# translate the validated payload into a downstream ``bash`` tool
+# invocation, so PreToolUse/PostToolUse hooks DO NOT fire on a
+# pure SGR turn. Wiring ``info.structured`` through the tool
+# dispatch layer is a separate server-side change
+# (``packages/opencode/src/session/prompt.ts`` + registry + hook
+# service) and is out of scope for these tests.
+#
+# These SGR tests therefore validate the deterministic upstream
+# contract that a PreToolUse/PostToolUse rewrite path could rely on:
+# given a ``BashPlan`` schema, the server + pydantic reliably
+# produce a validated bash-command payload.
+#
+# Documentation gap for opencode itself
+# -------------------------------------
+# The opencode server currently does NOT support ``format: json_schema``
+# on ``/turn/start`` for every provider. This build works for
+# ``opencode / gpt-5-nano`` (verified in test_sgr_determinism.py) and
+# ``github-copilot#personal / gpt-5-mini`` (verified here). It does
+# NOT currently work for vanilla ``github-copilot / gpt-4.1`` —
+# the provider's ``/chat/completions`` envelope returns
+# "request body is not valid JSON" regardless of whether
+# ``format`` is set. Until opencode closes that gap the SGR tests
+# must target the known-good provider/model pairs.
+
+
+def _hooks_sgr_binary() -> str:
+    """Return a binary symlink insulated from sibling pkill harnesses.
+
+    Same pattern as ``test_sgr_determinism.py::_resolve_sgr_binary``,
+    ``test_autobest.py::_sgr_binary``, and
+    ``test_subagent.py::_subagent_sgr_binary``, but with a distinct
+    link name so these tests don't collide when run in parallel.
+    """
+    src = os.environ.get("OPENCODE_BINARY") or "/Users/dave/.local/bin/opencode-unify"
+    dst = "/tmp/opencode-sgr-hooks"
+    try:
+        real_src = os.path.realpath(src)
+    except OSError:
+        return src
+    try:
+        current = os.readlink(dst)
+    except (OSError, FileNotFoundError):
+        current = None
+    if current != real_src:
+        tmp = dst + f".{os.getpid()}"
+        try:
+            os.symlink(real_src, tmp)
+        except FileExistsError:
+            os.unlink(tmp)
+            os.symlink(real_src, tmp)
+        os.replace(tmp, dst)
+    return dst
+
+
+@pytest.fixture()
+def hooks_sgr_server(tmp_path_factory):
+    """Per-test SGR server (isolated home + Copilot creds).
+
+    Function-scoped per the rationale in
+    ``test_autobest.py::autobest_sgr_server`` (session-scoped SGR
+    servers occasionally stalled once the first SGR turn settled).
+    """
+    if not has_copilot_credentials():
+        pytest.skip(
+            "No github-copilot OAuth token — SGR hook tests need Copilot creds"
+        )
+
+    root = tmp_path_factory.mktemp("sgr-hooks")
+    isolated_home = prepare_isolated_home(preserve_tokens=True)
+    server = OpencodeServer(
+        binary=_hooks_sgr_binary(),
+        ready_timeout_s=30.0,
+        data_dir=isolated_home,
+        cwd=root,
+        capture_stderr=True,
+    )
+    server.start()
+    try:
+        yield server, str(root)
+    finally:
+        server.stop()
+        shutil.rmtree(isolated_home, ignore_errors=True)
+
+
+@pytest.fixture()
+def hooks_sgr_client(hooks_sgr_server):
+    server, project_dir = hooks_sgr_server
+    client = OpencodeClient(
+        server.base_url,
+        project_directory=project_dir,
+        timeout_s=180.0,
+    )
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+@pytest.fixture(scope="session")
+def hooks_sgr_model() -> dict[str, str]:
+    """Provider/model pair for SGR hook tests.
+
+    Defaults to ``github-copilot#personal / gpt-5-mini``. Overridable
+    via ``OPENCODE_E2E_SGR_PROVIDER`` / ``OPENCODE_E2E_SGR_MODEL``.
+    """
+    return {
+        "providerID": os.environ.get(
+            "OPENCODE_E2E_SGR_PROVIDER", "github-copilot#personal"
+        ),
+        "modelID": os.environ.get("OPENCODE_E2E_SGR_MODEL", "gpt-5-mini"),
+    }
+
+
+# --- SGR schemas -----------------------------------------------------------
+
+
+from pydantic import BaseModel, Field  # noqa: E402
+
+
+class BashPlan(BaseModel):
+    """Schema for a bash-command invocation plan.
+
+    Mirrors the zod input schema of ``Tool.bash`` (see
+    ``src/tool/bash.ts``): required ``command`` + ``description``
+    fields both non-empty. SGR forces the provider to emit this exact
+    shape — the server-side ``StructuredOutput`` validator rejects
+    payloads that omit either field.
+    """
+
+    command: str = Field(
+        description="The shell command to run.",
+        min_length=1,
+    )
+    description: str = Field(
+        description="Short human-readable description of the command.",
+        min_length=1,
+    )
+
+
+class PreToolUseRewritePlan(BaseModel):
+    """Schema for a PreToolUse updatedInput rewrite plan.
+
+    When a PreToolUse hook returns ``updatedInput: {...}`` the
+    opencode server replaces the tool args verbatim (see
+    ``src/tool/registry.ts`` line ~376). A hook author building that
+    ``updatedInput`` needs a schema-valid payload — this SGR test
+    asserts the provider can emit the exact shape the hook-protocol
+    expects.
+    """
+
+    updated_command: str = Field(
+        description="The rewritten bash command the hook wants to run.",
+        min_length=1,
+    )
+    reason: str = Field(
+        description="Why the hook rewrote the command.",
+        min_length=1,
+    )
+
+
+# ---- Tests ---------------------------------------------------------------
+
+
+@pytest.mark.live
+@pytest.mark.timeout(300)
+def test_hooks_sgr_bash_plan_has_required_fields(
+    hooks_sgr_client: OpencodeClient,
+    hooks_sgr_model: dict[str, str],
+) -> None:
+    """SGR forces ``{command: str, description: str}`` bash plan.
+
+    Deterministic assertions:
+
+        1. ``BashPlan.model_validate`` succeeds — pydantic accepted
+           the payload (``min_length=1`` enforces non-empty).
+        2. ``instance.command.strip()`` is truthy — the shell command
+           is non-empty.
+        3. ``instance.description.strip()`` is truthy.
+
+    These three are the minimum preconditions that the bash tool
+    (and therefore PreToolUse/PostToolUse hooks, once tool
+    dispatch from ``info.structured`` exists) would need.
+    """
+    instance, _msg, _thread_id = run_sgr_or_skip(
+        hooks_sgr_client,
+        model=hooks_sgr_model,
+        prompt=(
+            "Build a plan to run `echo hooked` via the bash tool. "
+            "Return a JSON object with `command` and `description` "
+            "fields, both non-empty strings."
+        ),
+        pydantic_model=BashPlan,
+        poll_timeout_s=240.0,
+    )
+    assert isinstance(instance, BashPlan)
+    assert instance.command.strip(), instance.command
+    assert instance.description.strip(), instance.description
+    # Loose content assertion — the plan should mention echo or hooked,
+    # but we allow the model latitude on exactly how it phrases the
+    # command (e.g. `echo hooked` vs `echo "hooked"`).
+    assert "echo" in instance.command.lower() or "hook" in instance.command.lower(), (
+        f"plan command did not reference echo/hook: {instance.command!r}"
+    )
+
+
+@pytest.mark.live
+@pytest.mark.timeout(300)
+def test_hooks_sgr_pretooluse_rewrite_plan(
+    hooks_sgr_client: OpencodeClient,
+    hooks_sgr_model: dict[str, str],
+) -> None:
+    """SGR forces a PreToolUse-rewrite plan (``updated_command`` + ``reason``).
+
+    This is the upstream contract a PreToolUse hook would emit via
+    ``updatedInput``: a rewritten bash command plus a human-readable
+    reason. Pydantic's ``min_length=1`` on both fields guarantees
+    non-empty strings reach downstream consumers.
+
+    Deterministic assertions:
+
+        1. ``PreToolUseRewritePlan.model_validate`` succeeds.
+        2. ``updated_command`` is non-empty stripped.
+        3. ``reason`` is non-empty stripped.
+        4. JSON roundtrip preserves both fields byte-for-byte.
+    """
+    import json as _json
+
+    instance, _msg, _thread_id = run_sgr_or_skip(
+        hooks_sgr_client,
+        model=hooks_sgr_model,
+        prompt=(
+            "A PreToolUse hook wants to rewrite a bash command. "
+            "Build the rewrite plan: set `updated_command` to "
+            "`echo hooked` and set `reason` to a short sentence "
+            "explaining that the original command was intercepted. "
+            "Return as a JSON object."
+        ),
+        pydantic_model=PreToolUseRewritePlan,
+        poll_timeout_s=240.0,
+    )
+    assert isinstance(instance, PreToolUseRewritePlan)
+    assert instance.updated_command.strip()
+    assert instance.reason.strip()
+    decoded = _json.loads(instance.model_dump_json())
+    assert decoded["updated_command"] == instance.updated_command
+    assert decoded["reason"] == instance.reason
