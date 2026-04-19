@@ -32,4 +32,20 @@ export const forgeCredentialFile = path.join(Global.Path.home, "forge", ".creden
  * in the other stores.
  */
 export const codedashProfileFile = path.join(Global.Path.home, ".codedash", "github-profile.json")
+/**
+ * macOS opencode auth store under Apple's Application Support
+ * convention: `~/Library/Application Support/opencode/auth.json`. On
+ * macOS opencode can be configured to use either XDG (`$XDG_DATA_HOME`)
+ * or Apple's native dir; this path lets us pick up accounts stashed
+ * under the non-XDG location so `providers accounts` surfaces every
+ * Copilot credential the user actually has — in particular the 7
+ * edu/test slots registered under this store.
+ */
+export const macOSAppSupportAuthFile = path.join(
+  Global.Path.home,
+  "Library",
+  "Application Support",
+  "opencode",
+  "auth.json",
+)
 export const migrationFile = path.join(Global.Path.data, "copilot-migration.json")

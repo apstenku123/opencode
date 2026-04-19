@@ -4,6 +4,7 @@ import {
   githubCopilotAppsFile,
   githubCopilotOAuthFile,
   legacyCredentialFile,
+  macOSAppSupportAuthFile,
   migrationFile,
 } from "./paths"
 import { Auth } from "@/auth"
@@ -177,6 +178,42 @@ export function oauth(raw: unknown): CopilotAuth[] {
 }
 
 /**
+ * Parse an opencode-native `auth.json` shape — keys are already
+ * `github-copilot[#suffix]` and values are `{type, refresh, access,
+ * expires, proxy_url?, proxy_token?}`. Used for the macOS Application
+ * Support auth store which preserves the user's original key names
+ * (e.g. `github-copilot#edu-1` through `#edu-7`).
+ */
+export function opencodeNative(raw: unknown): CopilotAuth[] {
+  if (!raw || typeof raw !== "object") return []
+  const data = raw as Record<string, unknown>
+  const items: CopilotAuth[] = []
+  for (const [key, value] of Object.entries(data)) {
+    if (!key.startsWith("github-copilot")) continue
+    if (!value || typeof value !== "object") continue
+    const e = value as Record<string, unknown>
+    if (e.type !== "oauth") continue
+    const refresh = typeof e.refresh === "string" ? e.refresh : undefined
+    const access = typeof e.access === "string" ? e.access : refresh
+    if (!refresh || !access) continue
+    const proxyUrl = typeof e.proxy_url === "string" ? e.proxy_url : typeof e.proxyUrl === "string" ? e.proxyUrl : undefined
+    const proxyToken = typeof e.proxy_token === "string" ? e.proxy_token : typeof e.proxyToken === "string" ? e.proxyToken : undefined
+    const enterpriseUrl = typeof e.enterpriseUrl === "string" ? e.enterpriseUrl : typeof e.enterprise_uri === "string" ? e.enterprise_uri : undefined
+    items.push({
+      key,
+      label: label(key),
+      refresh,
+      access,
+      expires: typeof e.expires === "number" ? e.expires : 0,
+      enterpriseUrl,
+      proxyUrl,
+      proxyToken,
+    })
+  }
+  return items
+}
+
+/**
  * Parse `~/forge/.credentials.json` — the Forge CLI credential store.
  * Array of `{id, auth_details: {o_auth_with_api_key: {tokens: {access_token}}}}`
  * entries. Each `github_copilot` entry becomes its own
@@ -252,11 +289,14 @@ export const migrate = Effect.fn("CopilotAuth.migrate")(function* (src?: Migrati
   const rawOauth = yield* fs.read(fs.oauth).pipe(Effect.orElseSucceed(() => ({})))
   const rawForge = yield* fs.read(fs.forge).pipe(Effect.orElseSucceed(() => [] as unknown))
   const rawCodedash = yield* fs.read(fs.codedash).pipe(Effect.orElseSucceed(() => ({})))
-  // Merge all five on-disk sources plus env-supplied test tokens. Dedup by
-  // final `key`; the legacy CLI credential file is preferred when the
-  // same key is produced by multiple sources.
+  const rawMacAS = yield* fs.read(fs.macOSAppSupport).pipe(Effect.orElseSucceed(() => ({})))
+  // Merge all six on-disk sources plus env-supplied test tokens. Dedup by
+  // final `key`; macOS Application Support opencode auth.json is parsed
+  // via `opencodeNative` (keyed `{"github-copilot#edu-N": {type,refresh,
+  // access,proxy_url}}` format) and wins for those namespaced keys.
   const envTests = testTokensFromEnv(process.env.OPENCODE_TEST_COPILOT_TOKENS)
   const allFound = [
+    ...opencodeNative(rawMacAS),
     ...legacy(raw),
     ...apps(rawApps),
     ...oauth(rawOauth),
@@ -339,6 +379,7 @@ export type MigrationIO = {
   oauth: string
   forge: string
   codedash: string
+  macOSAppSupport: string
   marker: string
   read(path: string): Effect.Effect<unknown, unknown>
   write(path: string, value: unknown): Effect.Effect<void, unknown>
@@ -353,6 +394,7 @@ export function io(): Effect.Effect<MigrationIO, never, AppFileSystem.Service> {
       oauth: githubCopilotOAuthFile,
       forge: forgeCredentialFile,
       codedash: codedashProfileFile,
+      macOSAppSupport: macOSAppSupportAuthFile,
       marker: migrationFile,
       read(path: string) {
         return fs.readJson(path)
