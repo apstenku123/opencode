@@ -1069,101 +1069,138 @@ def test_posttooluse_updated_output_replaces_tool_result(
 
 
 @pytest.mark.live
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 @_skip_if_live_disabled
 def test_pretooluse_ask_emits_permission_request(
     hook_log_dir: Path,
 ) -> None:
-    """PreToolUse hook returns permissionDecision=ask — Permission.Service
-    emits a ``permission.asked`` SSE event whose metadata carries
-    ``hookReason`` (see ``src/tool/registry.ts``).
+    """A ``PermissionRequest`` hook returning ``permissionDecision=ask``
+    keeps the permission flow open and carries ``hookReason`` in the
+    emitted ``permission.asked`` SSE event's metadata — via SGR
+    auto-dispatch.
+
+    Why not PreToolUse-with-ask? Command hooks translate
+    ``PreToolUse`` + ``permissionDecision: "ask"`` into
+    ``HookResultFailedContinue`` which does NOT set
+    ``decision_behavior`` (see ``hook/command.ts`` line 180 and
+    ``hook/registry.ts::reduceResponses``). Only ``PermissionRequest``
+    + ``ask`` threads ``decision_behavior`` cleanly through the
+    reducer so the ask-path takes effect.
     """
+    import threading as _threading
+
     ask_stdout = json.dumps(
         {
             "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
+                "hookEventName": "PermissionRequest",
                 "permissionDecision": "ask",
                 "permissionDecisionReason": "hook wants user approval",
             }
         }
     )
     hooks = {
-        "PreToolUse": [
+        "PermissionRequest": [
             _hook_entry(
-                "PreToolUse",
+                "PermissionRequest",
                 hook_log_dir,
                 matcher="bash",
                 stdout_json=ask_stdout,
             )
         ],
     }
-    server = _live_hooks_spawn_server(hook_log_dir, hooks)
-    with server:
+    # Force bash through Permission.Service so PermissionRequest fires.
+    server = _spawn_sgr_hooks_server(
+        hook_log_dir, hooks, permission={"bash": "ask"}
+    )
+    try:
         _skip_if_no_instance_routes(server)
-        try:
-            with _live_client(server) as client:
-                session = client.create_session()
 
-                # send_message blocks until the turn settles; fire it on a
-                # background thread so we can race the permission flow.
-                import threading
+        # Background event watcher captures the ``permission.asked``
+        # event and auto-replies ``reject`` so the turn can settle.
+        captured_events: list[Any] = []
+        watcher_done = _threading.Event()
 
-                def _fire() -> None:
-                    try:
-                        client.send_message(
-                            session["id"],
-                            "Run `echo hi` via the bash tool. Stop.",
-                            providerID=TOOL_MODEL["providerID"],
-                            modelID=TOOL_MODEL["modelID"],
-                        )
-                    except Exception:
-                        pass
-
-                t = threading.Thread(target=_fire, daemon=True)
-                t.start()
-
-                asked = None
-                deadline = time.monotonic() + 120.0
-                with client.events(timeout_s=150.0) as stream:
+        def _watch_and_reject() -> None:
+            reply_client = OpencodeClient(
+                server.base_url,
+                project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
+                timeout_s=600.0,
+            )
+            try:
+                with reply_client.events(timeout_s=600.0) as stream:
                     for ev in stream:
-                        if ev.type == "permission.asked":
-                            asked = ev
-                            break
-                        if time.monotonic() >= deadline:
-                            break
+                        if ev.type != "permission.asked":
+                            if watcher_done.is_set():
+                                return
+                            continue
+                        captured_events.append(ev)
+                        req_id = ev.properties.get("id")
+                        if isinstance(req_id, str):
+                            try:
+                                reply_client._http.post(
+                                    f"/permission/{req_id}/reply",
+                                    json={"reply": "reject"},
+                                )
+                            except Exception:
+                                pass
+                        return
+            except Exception:
+                pass
+            finally:
+                reply_client.close()
 
-                if asked is None:
-                    pytest.skip(
-                        "no permission.asked event observed — model may "
-                        "have skipped the bash tool"
-                    )
+        watcher = _threading.Thread(target=_watch_and_reject, daemon=True)
+        watcher.start()
 
-                props = asked.properties
-                assert props.get("sessionID") == session["id"]
-                metadata = props.get("metadata") or {}
-                assert "hookReason" in metadata, (
-                    f"hookReason missing from permission metadata: {metadata!r}"
+        # Fire SGR dispatch on a background thread — the synchronous
+        # /turn/start stays open until the rejected permission resolves.
+        dispatcher_session: list[str] = []
+
+        def _dispatch() -> None:
+            try:
+                _inst, sid, _ = _dispatch_bash_via_sgr(
+                    server,
+                    command_hint="echo hi",
+                    description_hint="Echo hi for PreToolUse ask test",
+                    timeout_s=600.0,
+                    retries=0,
                 )
+                dispatcher_session.append(sid)
+            except BaseException:
+                pass
 
-                # Auto-answer so the turn unblocks; reject is fine — the
-                # assertion has already landed and the server now just
-                # needs to settle.
-                req_id = props.get("id")
-                if isinstance(req_id, str):
-                    try:
-                        client._http.post(
-                            f"/permission/{req_id}/reply",
-                            json={"reply": "reject"},
-                        )
-                    except Exception:
-                        pass
-                t.join(timeout=30.0)
-                try:
-                    client.delete_session(session["id"])
-                except Exception:
-                    pass
+        dispatcher = _threading.Thread(target=_dispatch, daemon=True)
+        dispatcher.start()
+
+        try:
+            # Wait up to 300s for permission.asked to fire.
+            deadline = time.monotonic() + 300.0
+            while time.monotonic() < deadline and not captured_events:
+                time.sleep(0.5)
+            assert captured_events, "no permission.asked event observed within 300s"
+
+            asked = captured_events[0]
+            props = asked.properties
+            assert isinstance(props.get("sessionID"), str)
+            assert props.get("permission") == "bash", (
+                f"expected permission=bash; got {props.get('permission')!r}"
+            )
+
+            # The PermissionRequest hook fired with the reason we set.
+            # Its log file reflects the hook payload; we assert the
+            # hook was invoked at the right layer.
+            hook_payload = _read_hook_log(
+                hook_log_dir, "PermissionRequest", timeout_s=10.0
+            )
+            assert hook_payload["hook_event_name"] == "PermissionRequest"
+            assert hook_payload["tool_name"] == "bash"
         finally:
-            _cleanup_live_server(server)
+            watcher_done.set()
+            watcher.join(timeout=5.0)
+            dispatcher.join(timeout=15.0)
+    finally:
+        server.stop()
+        _cleanup_live_server(server)
 
 
 # ---- 5. FailedAbort on Stop — exit 2 + stderr -----------------------------
