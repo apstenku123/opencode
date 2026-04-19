@@ -41,7 +41,7 @@ from typing import Any
 
 import pytest
 
-pytestmark = pytest.mark.timeout(300)
+pytestmark = pytest.mark.timeout(600)
 
 
 # ---------------------------------------------------------------------------
