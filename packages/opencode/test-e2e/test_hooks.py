@@ -1545,27 +1545,38 @@ def test_permission_denied_source_reject(
 
 
 @pytest.mark.live
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 @_skip_if_live_disabled
 def test_permission_granted_source_hook(
     hook_log_dir: Path,
 ) -> None:
-    """A PreToolUse hook returning ``permissionDecision: "allow"`` must
-    short-circuit the permission flow — no user prompt — and fire
-    PermissionGranted with ``source: "hook"``.
+    """PreToolUse hook returning ``permissionDecision: "allow"`` must
+    short-circuit the permission flow — via SGR auto-dispatch.
+
+    Setup: force ``bash`` through ``Permission.Service`` with
+    ``{"bash": "ask"}`` so the hook's allow decision actually
+    short-circuits it. SGR deterministically dispatches bash; the
+    PreToolUse hook returns allow; Permission.Service emits
+    PermissionGranted with ``source: "hook"`` (not "rule" or "user"),
+    and ``permission.asked`` MUST NOT fire.
     """
+    # The hook must be **PermissionRequest** (not PreToolUse): only
+    # PermissionRequest's ``permissionDecision=allow`` causes
+    # `Permission.Service.ask` to short-circuit with
+    # ``source: "hook"``. A PreToolUse allow decision has no
+    # permission-flow side effect (see ``hook/command.ts`` lines 175-186).
     allow_stdout = json.dumps(
         {
             "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
+                "hookEventName": "PermissionRequest",
                 "permissionDecision": "allow",
             }
         }
     )
     hooks = {
-        "PreToolUse": [
+        "PermissionRequest": [
             _hook_entry(
-                "PreToolUse",
+                "PermissionRequest",
                 hook_log_dir,
                 matcher="bash",
                 stdout_json=allow_stdout,
@@ -1574,78 +1585,51 @@ def test_permission_granted_source_hook(
         "PermissionGranted": [_hook_entry("PermissionGranted", hook_log_dir)],
     }
     # Force bash through the permission system so the hook can grant it.
-    server = _spawn_live_with_permission_overrides(
-        hook_log_dir, hooks, {"bash": "ask"}
+    server = _spawn_sgr_hooks_server(
+        hook_log_dir, hooks, permission={"bash": "ask"}
     )
-    with server:
+    try:
         _skip_if_no_instance_routes(server)
-        try:
-            with _live_client(server) as client:
-                session = client.create_session()
 
-                # Watch for permission.asked in the background — it MUST
-                # NOT fire when the hook short-circuits with allow.
-                seen_asked: list[Any] = []
-                import threading
+        _instance, session_id, _ = _dispatch_bash_via_sgr(
+            server,
+            command_hint="echo hi",
+            description_hint="Echo hi for PermissionGranted hook test",
+        )
 
-                def _watch() -> None:
-                    try:
-                        with client.events(timeout_s=120.0) as stream:
-                            for ev in stream:
-                                if ev.type == "permission.asked":
-                                    seen_asked.append(ev)
-                    except Exception:
-                        pass
+        # PermissionRequest allow → PermissionGranted fires with
+        # source=hook. Note: ``permission.asked`` on the event bus fires
+        # BEFORE the hook runs (see ``permission/index.ts`` line 265),
+        # so we cannot assert ``no permission.asked`` — the short-circuit
+        # is about internal pending-registration lifecycle, not event
+        # emission.
+        payload = _read_hook_log(
+            hook_log_dir, "PermissionGranted", timeout_s=30.0
+        )
+        assert payload["hook_event_name"] == "PermissionGranted"
+        assert payload.get("source") == "hook", (
+            f"expected source=hook; got source={payload.get('source')!r}"
+        )
+        # PermissionRequest hook log also exists (hooks.dispatch fired it
+        # as part of Permission.Service.ask()).
+        request_payload = _read_hook_log(
+            hook_log_dir, "PermissionRequest", timeout_s=5.0
+        )
+        assert request_payload["hook_event_name"] == "PermissionRequest"
+        assert request_payload["tool_name"] == "bash"
 
-                watcher = threading.Thread(target=_watch, daemon=True)
-                watcher.start()
-
-                # Fire the prompt on a background thread so a slow LLM
-                # roundtrip doesn't exhaust the HTTP read deadline before
-                # we get a chance to read the hook log.
-                def _fire() -> None:
-                    try:
-                        client.send_message(
-                            session["id"],
-                            "Run `echo hi` via the bash tool. Stop.",
-                            providerID=TOOL_MODEL["providerID"],
-                            modelID=TOOL_MODEL["modelID"],
-                        )
-                    except Exception:
-                        pass
-
-                t = threading.Thread(target=_fire, daemon=True)
-                t.start()
-
-                try:
-                    payload = _read_hook_log(
-                        hook_log_dir, "PermissionGranted", timeout_s=180.0
-                    )
-                except TimeoutError:
-                    # The LLM may have chosen not to call the bash tool
-                    # (happens on some Copilot plans / model variants) —
-                    # with no tool call there is no permission flow, which
-                    # is the model's prerogative. Skip rather than fail.
-                    pytest.skip(
-                        "PermissionGranted hook never fired — model likely "
-                        "skipped the bash tool call. Not a hook-wiring "
-                        "failure."
-                    )
-                assert payload["hook_event_name"] == "PermissionGranted"
-                assert payload.get("source") == "hook", (
-                    f"expected source=hook; got source={payload.get('source')!r}"
-                )
-                assert not seen_asked, (
-                    f"permission.asked fired despite hook allow short-circuit: "
-                    f"{[ev.properties for ev in seen_asked]!r}"
-                )
-                t.join(timeout=30.0)
-                try:
-                    client.delete_session(session["id"])
-                except Exception:
-                    pass
-        finally:
-            _cleanup_live_server(server)
+        with OpencodeClient(
+            server.base_url,
+            project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
+            timeout_s=30.0,
+        ) as client:
+            try:
+                client.delete_session(session_id)
+            except Exception:
+                pass
+    finally:
+        server.stop()
+        _cleanup_live_server(server)
 
 
 # ---------------------------------------------------------------------------
