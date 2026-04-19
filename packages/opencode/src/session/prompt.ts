@@ -62,6 +62,7 @@ import { EffectBridge } from "@/effect"
 import { Skill } from "@/skill"
 import { SkillInjection } from "@/skill/injection"
 import { SkillEvolution } from "@/skill/evolution"
+import { maybeAutoExtractSkill } from "@/skill/hook"
 import { Rollout } from "@/rollout"
 
 // @ts-ignore
@@ -2197,6 +2198,36 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       }
                     }
                   }
+                }
+                // ---- SGR autoskill trigger ---------------------------------
+                // The session processor's own autoskill hook fires at
+                // `handle.process` terminal — which in the SGR path lands
+                // BEFORE our dispatch runs, so the assistant message has
+                // zero tool parts at that point. Fire the hook again here
+                // (after fan-out dispatch has written all tool parts) so
+                // `collectToolCallsFromParts` sees the N bash/etc. calls we
+                // just dispatched. Fire-and-forget: autoskill must never
+                // fail the turn.
+                if (format.type === "json_schema") {
+                  const autoskillParts = MessageV2.parts(handle.message.id)
+                  const autoskillModelResponse = autoskillParts
+                    .filter((p): p is MessageV2.TextPart => p.type === "text")
+                    .map((p) => p.text)
+                    .join("\n")
+                  const autoskillUserPrompt =
+                    lastUserMsg?.parts
+                      .filter((p): p is MessageV2.TextPart => p.type === "text")
+                      .filter((p) => !p.synthetic && !p.ignored)
+                      .map((p) => p.text)
+                      .join("\n") ?? ""
+                  const autoskillIsSubAgent = session.parentID !== undefined
+                  yield* maybeAutoExtractSkill({
+                    turnId: handle.message.id,
+                    userPrompt: autoskillUserPrompt,
+                    modelResponse: autoskillModelResponse,
+                    parts: autoskillParts,
+                    isSubAgent: autoskillIsSubAgent,
+                  }).pipe(Effect.ignore, Effect.forkIn(scope))
                 }
                 return "break" as const
               }
