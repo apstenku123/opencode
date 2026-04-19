@@ -51,6 +51,7 @@ from harness import (
     has_copilot_credentials,
     prepare_isolated_home,
     resolve_opencode_binary,
+    run_sgr_or_skip,
 )
 
 pytestmark = pytest.mark.timeout(900)
@@ -924,3 +925,284 @@ def test_guardian_forwards_when_no_rule(lc, lc_model) -> None:
         f"ForwardedToParent parentID mismatch: {props}"
     )
     assert "childID" in props and "requestID" in props
+
+
+# ---------------------------------------------------------------------------
+# SGR (Schema-Guided Reasoning) subagent tests
+# ---------------------------------------------------------------------------
+#
+# Context: the legacy subagent tests above skip whenever the Copilot model
+# declines to invoke the ``task`` tool (it sometimes replies with plain
+# text "DONE" instead). SGR fixes the "will the model emit a valid plan"
+# half of that problem: with ``format={"type":"json_schema"}`` set, the
+# opencode server registers a ``StructuredOutput`` tool (see
+# ``packages/opencode/src/session/prompt.ts``) and forces
+# ``toolChoice="required"`` — so the model MUST emit a schema-conforming
+# JSON object, and the server validates it before writing to
+# ``info.structured``.
+#
+# Limitation: SGR constrains the model to a single ``StructuredOutput``
+# tool call. It does NOT translate the structured payload into a
+# downstream ``task`` tool invocation — that would require a server
+# plumb from ``info.structured`` through the real tool dispatch, which
+# doesn't exist today. These SGR tests therefore validate the
+# *upstream* deterministic contract: we can reliably extract a
+# schema-valid ``{subagent_type, description, prompt, async}``
+# payload from the model. A follow-up PR could wire the dispatcher
+# to auto-invoke ``task`` when ``info.structured`` matches the
+# TaskInvocationPlan shape.
+#
+# These tests share the SGR server infrastructure pattern with
+# ``test_autobest.py`` (per-test isolated-home + github-copilot SGR
+# server).
+
+
+def _subagent_sgr_binary() -> str:
+    """Return a binary symlink insulated from sibling pkill harnesses.
+
+    Same pattern as ``test_sgr_determinism.py::_resolve_sgr_binary``
+    and ``test_autobest.py::_sgr_binary``, but with a distinct link
+    name so these tests don't collide with those suites if run in
+    parallel.
+    """
+    src = os.environ.get("OPENCODE_BINARY") or "/Users/dave/.local/bin/opencode-unify"
+    dst = "/tmp/opencode-sgr-subagent"
+    try:
+        real_src = os.path.realpath(src)
+    except OSError:
+        return src
+    try:
+        current = os.readlink(dst)
+    except (OSError, FileNotFoundError):
+        current = None
+    if current != real_src:
+        tmp = dst + f".{os.getpid()}"
+        try:
+            os.symlink(real_src, tmp)
+        except FileExistsError:
+            os.unlink(tmp)
+            os.symlink(real_src, tmp)
+        os.replace(tmp, dst)
+    return dst
+
+
+@pytest.fixture()
+def subagent_sgr_server(tmp_path_factory):
+    """Per-test SGR server (isolated home + Copilot creds).
+
+    Function-scoped — see ``test_autobest.py::autobest_sgr_server`` for
+    the rationale (live Copilot turns under a session-scoped server
+    occasionally stall at the provider dispatch layer once the first
+    SGR turn settles).
+    """
+    if not has_copilot_credentials():
+        pytest.skip(
+            "No github-copilot OAuth token — SGR subagent tests need Copilot creds"
+        )
+
+    root = tmp_path_factory.mktemp("sgr-subagent")
+    isolated_home = prepare_isolated_home(preserve_tokens=True)
+    server = OpencodeServer(
+        binary=_subagent_sgr_binary(),
+        ready_timeout_s=30.0,
+        data_dir=isolated_home,
+        cwd=root,
+        capture_stderr=True,
+    )
+    server.start()
+    try:
+        yield server, str(root)
+    finally:
+        server.stop()
+        shutil.rmtree(isolated_home, ignore_errors=True)
+
+
+@pytest.fixture()
+def subagent_sgr_client(subagent_sgr_server):
+    server, project_dir = subagent_sgr_server
+    client = OpencodeClient(
+        server.base_url,
+        project_directory=project_dir,
+        timeout_s=180.0,
+    )
+    try:
+        yield client
+    finally:
+        client.close()
+
+
+@pytest.fixture(scope="session")
+def subagent_sgr_model() -> dict[str, str]:
+    """Provider/model pair for SGR subagent tests.
+
+    Defaults to ``github-copilot#personal / gpt-5-mini`` (verified in
+    ``test_sgr_determinism.py`` + ``test_autobest.py`` to honour
+    ``format=json_schema`` and land ``info.structured`` in ~15-30s).
+    Overridable via ``OPENCODE_E2E_SGR_PROVIDER`` /
+    ``OPENCODE_E2E_SGR_MODEL``.
+    """
+    return {
+        "providerID": os.environ.get(
+            "OPENCODE_E2E_SGR_PROVIDER", "github-copilot#personal"
+        ),
+        "modelID": os.environ.get("OPENCODE_E2E_SGR_MODEL", "gpt-5-mini"),
+    }
+
+
+# --- SGR schemas for subagent tests ---------------------------------------
+
+
+from pydantic import BaseModel, Field  # noqa: E402
+
+
+class TaskInvocationPlan(BaseModel):
+    """Schema for a ``task`` tool invocation plan.
+
+    Mirrors the zod input schema of ``Tool.task`` (see
+    ``src/tool/task.ts``): ``subagent_type``, ``description``,
+    ``prompt``, and ``async`` are the four required fields the tool
+    accepts today. SGR forces the model to emit all four with
+    non-empty content before the validator lets the payload through.
+    """
+
+    subagent_type: str = Field(
+        description="Which subagent class to spawn. Use 'general'.",
+        min_length=1,
+    )
+    description: str = Field(
+        description="Short one-word human-readable label for the task.",
+        min_length=1,
+    )
+    prompt: str = Field(
+        description="The actual prompt for the subagent to execute.",
+        min_length=1,
+    )
+    async_: bool = Field(
+        alias="async",
+        description="Whether to spawn the subagent asynchronously.",
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class TaskListRequest(BaseModel):
+    """Schema for a ``task_list`` invocation (takes no args — SGR asserts the shape).
+
+    Validating an empty-object schema via SGR proves the provider
+    can produce a correctly-typed tool call payload even when the
+    "plan" collapses to a zero-field contract.
+    """
+
+    reason: str = Field(
+        description="Why the caller wants the task list now.",
+        min_length=1,
+    )
+
+
+# ---- Tests ---------------------------------------------------------------
+
+
+@pytest.mark.live
+@pytest.mark.timeout(300)
+def test_task_tool_sgr_sync_invocation_plan(
+    subagent_sgr_client: OpencodeClient,
+    subagent_sgr_model: dict[str, str],
+) -> None:
+    """SGR produces a valid sync ``task`` invocation plan.
+
+    Deterministic assertions (SGR kills the legacy "model returned
+    DONE instead of calling task" skip):
+
+        1. ``TaskInvocationPlan.model_validate`` succeeds (pydantic-
+           accepted payload).
+        2. ``subagent_type`` is a non-empty stripped string (the schema's
+           ``min_length=1`` enforces it).
+        3. ``async_`` is a bool and is ``False`` (sync variant).
+        4. ``prompt`` is non-empty stripped.
+    """
+    instance, _msg, _thread_id = run_sgr_or_skip(
+        subagent_sgr_client,
+        model=subagent_sgr_model,
+        prompt=(
+            "Build a plan to invoke the `task` tool once. Use "
+            "subagent_type='general', description='done', "
+            "prompt='Reply DONE', async=false. Return the plan as a "
+            "JSON object matching the schema."
+        ),
+        pydantic_model=TaskInvocationPlan,
+        poll_timeout_s=240.0,
+    )
+    assert isinstance(instance, TaskInvocationPlan)
+    assert instance.subagent_type.strip(), instance.subagent_type
+    assert instance.description.strip(), instance.description
+    assert instance.prompt.strip(), instance.prompt
+    assert instance.async_ is False, f"expected sync (async=false), got {instance.async_}"
+
+
+@pytest.mark.live
+@pytest.mark.timeout(300)
+def test_task_tool_sgr_async_invocation_plan(
+    subagent_sgr_client: OpencodeClient,
+    subagent_sgr_model: dict[str, str],
+) -> None:
+    """SGR produces a valid async ``task`` invocation plan.
+
+    Complement of the sync variant — asserts ``async_=True`` rather
+    than ``False``. Pydantic rejects anything that isn't a proper
+    bool; if the model returned a string "true" the server-side
+    validator would have already raised.
+    """
+    instance, _msg, _thread_id = run_sgr_or_skip(
+        subagent_sgr_client,
+        model=subagent_sgr_model,
+        prompt=(
+            "Build a plan to invoke the `task` tool asynchronously. "
+            "Use subagent_type='general', description='async-work', "
+            "prompt='Count to three and reply DONE', async=true. Return "
+            "the plan as a JSON object matching the schema."
+        ),
+        pydantic_model=TaskInvocationPlan,
+        poll_timeout_s=240.0,
+    )
+    assert isinstance(instance, TaskInvocationPlan)
+    assert instance.subagent_type.strip()
+    assert instance.prompt.strip()
+    assert instance.async_ is True, f"expected async=true, got {instance.async_}"
+
+
+@pytest.mark.live
+@pytest.mark.timeout(300)
+def test_task_list_sgr_produces_well_formed_request(
+    subagent_sgr_client: OpencodeClient,
+    subagent_sgr_model: dict[str, str],
+) -> None:
+    """SGR produces a valid ``task_list`` request envelope.
+
+    Uses a different schema (``TaskListRequest``) to exercise the SGR
+    pipe with a second shape — ensuring the harness + server round-trip
+    doesn't only work for ``TaskInvocationPlan``.
+
+    Deterministic assertions:
+
+        1. ``TaskListRequest.model_validate`` succeeds.
+        2. ``reason`` is a non-empty stripped string.
+        3. JSON roundtrip via ``model_dump_json`` preserves content.
+    """
+    import json as _json
+
+    instance, _msg, _thread_id = run_sgr_or_skip(
+        subagent_sgr_client,
+        model=subagent_sgr_model,
+        prompt=(
+            "Return a short JSON object with one field `reason` explaining "
+            "why the caller wants to list running subagent tasks right now. "
+            "Keep the reason under 20 words."
+        ),
+        pydantic_model=TaskListRequest,
+        poll_timeout_s=240.0,
+    )
+    assert isinstance(instance, TaskListRequest)
+    assert instance.reason.strip(), instance.reason
+    # Roundtrip determinism.
+    decoded = _json.loads(instance.model_dump_json())
+    assert decoded["reason"] == instance.reason
