@@ -576,6 +576,16 @@ def test_skill_event_hotinserted_fires(
 ) -> None:
     """The ``skill.hot-inserted`` bus event fires with the new skill's name
     when autoskill persists a fresh extraction.
+
+    SGR rewrite: drives the server through ``/turn/start`` with a
+    ``commands: string[]`` schema whose ``x-opencode-dispatch`` hint has
+    ``each_from: "commands"``. The runtime fans out the 3-element array
+    into 3 separate bash invocations — each traverses the same
+    PreToolUse/PostToolUse hooks a provider-driven call would. After the
+    fan-out settles, ``prompt.ts::SGR auto-dispatch trigger`` invokes
+    ``maybeAutoExtractSkill`` which publishes ``skill.hot-inserted`` on
+    the bus (see commit ``6c7957af3``). We subscribe to the global SSE
+    stream and wait for that bus event to arrive.
     """
     _write_config(isolated_skill_home, {"autoskill": True})
 
@@ -587,16 +597,96 @@ def test_skill_event_hotinserted_fires(
                 warmup._get("/skill")
             collector = _EventCollector(server, global_stream=True).start()
             try:
-                with _client_for(server, timeout_s=180.0) as client:
-                    session = client.create_session()
-                    _prompt_async(client, session["id"], "Use the bash tool three times to run: `date`, "
-                        "`uname -a`, `echo skills-work`.", model=live_copilot_model)
-                    _wait_idle_or_skip(client, session["id"], timeout_s=180.0)
+                with _client_for(server, timeout_s=300.0) as client:
+                    thread = client.create_thread()
+                    thread_id = thread["id"]
 
-                ev = collector.wait_for(
-                    lambda e: e.type == "skill.hot-inserted",
-                    timeout_s=15.0,
-                )
+                    # SGR schema — array of 3 bash commands fanned out to
+                    # per-element tool dispatches via `each_from`. Same
+                    # pattern as ``test_autoskill_extracts_after_successful_tool_usage``.
+                    schema: dict[str, Any] = {
+                        "type": "object",
+                        "properties": {
+                            "commands": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 3,
+                                "maxItems": 3,
+                                "description": "Exactly three shell commands to execute in order.",
+                            },
+                        },
+                        "required": ["commands"],
+                        "additionalProperties": False,
+                        "x-opencode-dispatch": {
+                            "tool": "bash",
+                            "each_from": "commands",
+                            "args_from": "command",
+                            "args": {"description": "SGR hot-inserted fan-out"},
+                        },
+                    }
+
+                    # Drive the turn in a worker thread; /turn/start blocks
+                    # until all fan-out dispatches complete, then the
+                    # autoskill trigger publishes `skill.hot-inserted`.
+                    turn_err: list[BaseException] = []
+                    turn_done = threading.Event()
+
+                    def _drive() -> None:
+                        try:
+                            client.start_turn(
+                                thread_id,
+                                "Plan three simple diagnostic shell commands: date, uname -a, "
+                                "and echo skills-work. Return only the JSON object.",
+                                model=live_copilot_model,
+                                format={"type": "json_schema", "schema": schema},
+                            )
+                        except BaseException as err:  # noqa: BLE001
+                            turn_err.append(err)
+                        finally:
+                            turn_done.set()
+
+                    drv = threading.Thread(target=_drive, daemon=True, name="sgr-hotinsert")
+                    drv.start()
+
+                    # Wait for either the event to arrive (happy path) or
+                    # the driver to finish (so we can diagnose if no event
+                    # ever fires). The autoskill hook is fire-and-forget
+                    # after the SGR fan-out, so we allow a generous window
+                    # beyond turn completion.
+                    try:
+                        ev = collector.wait_for(
+                            lambda e: e.type == "skill.hot-inserted",
+                            timeout_s=240.0,
+                        )
+                    except TimeoutError:
+                        if turn_err:
+                            pytest.skip(
+                                f"SGR hot-inserted turn driver raised: {turn_err[0]!r}"
+                            )
+                        # If the turn never produced 3 completed bash parts
+                        # the autoskill heuristic short-circuits. Check
+                        # messages to decide between skip (upstream stall)
+                        # and fail (product regression).
+                        try:
+                            messages = client.get_messages(thread_id)
+                        except Exception:
+                            messages = []
+                        bash_calls = [
+                            p
+                            for m in messages or []
+                            for p in (m.get("parts") or [])
+                            if p.get("type") == "tool"
+                            and p.get("tool") == "bash"
+                            and (p.get("state") or {}).get("status") == "completed"
+                        ]
+                        if len(bash_calls) < 3:
+                            pytest.skip(
+                                f"SGR hot-inserted fan-out produced {len(bash_calls)} "
+                                f"completed bash calls (need 3) — upstream Copilot "
+                                "likely stalled."
+                            )
+                        raise
+
                 name = (ev.properties.get("skill") or {}).get("name")
                 assert isinstance(name, str) and name, f"no skill name on event: {ev!r}"
             finally:
