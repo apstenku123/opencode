@@ -289,32 +289,32 @@ export const Info = z
               .boolean()
               .optional()
               .describe(
-                "Enable the HTTP retry-race orchestrator. When true, a stalled Copilot request spawns duplicate attempts against other accounts/proxies every `staggerMs`; first-to-respond wins, siblings are aborted. Dramatically cuts p99 latency on slow turns. Mirrors Rust `[http_retry_race]` section.",
+                "Enable the HTTP retry-race orchestrator. When true (default in the opencode fork), a stalled Copilot request spawns duplicate attempts against other accounts/proxies every `staggerMs`; first-to-respond wins, siblings are aborted. Dramatically cuts p99 latency on slow turns. Set to `false` (or export `OPENCODE_COPILOT_HTTP_RETRY_RACE_ENABLED=false`) to restore strict single-account behaviour. Mirrors Rust `[http_retry_race]` section.",
               ),
             staggerMs: z
               .number()
               .int()
               .min(100)
               .optional()
-              .describe("Delay before spawning each next parallel attempt (ms). Default 40000."),
+              .describe("Delay before spawning each next parallel attempt (ms). Default 45000 — most healthy turns complete in under 30s."),
             concurrentLimit: z
               .number()
               .int()
               .min(1)
               .optional()
-              .describe("Maximum in-flight attempts at once. Mirrors Rust `max_parallel`. Default 3."),
+              .describe("Maximum in-flight attempts at once. Mirrors Rust `max_parallel`. Default 2 — original plus one backup, keeps worst-case quota burn near 2×."),
             maxAttempts: z
               .number()
               .int()
               .min(1)
               .optional()
-              .describe("Absolute cap on attempts spawned per race (`max_parallel * max_cycles`). Default 6."),
+              .describe("Absolute cap on attempts spawned per race (`max_parallel * max_cycles`). Default 3."),
             totalDeadlineMs: z
               .number()
               .int()
               .min(1000)
               .optional()
-              .describe("Hard deadline for the whole race (ms). Mirrors Rust `abort_after_ms * max_cycles`. Default 120000."),
+              .describe("Hard deadline for the whole race (ms). Mirrors Rust `abort_after_ms * max_cycles`. Default 180000 (3 min)."),
             eventBusCapacity: z
               .number()
               .int()
@@ -373,6 +373,76 @@ export const Info = z
           .optional()
           .describe(
             "Per-account adaptive semaphore that reacts to 429s over a sliding window. Mirrors Rust `copilot_rate_limiter.rs`.",
+          ),
+        modelsCache: z
+          .object({
+            enabled: z
+              .boolean()
+              .optional()
+              .describe(
+                "Enable in-memory + disk cache for `/models` responses. When true, dispatch/alias/probe paths consult the cache before issuing an HTTPS probe. Defaults to true.",
+              ),
+            ttlMs: z
+              .number()
+              .int()
+              .min(0)
+              .optional()
+              .describe(
+                "Per-account cache TTL in ms. A hit within this window returns cached models immediately. Default 300000 (5 min), mirroring the Rust `DEFAULT_MODEL_CACHE_TTL` in `codex-rs/core/src/models_manager/manager.rs`.",
+              ),
+            staleWhileRevalidateMs: z
+              .number()
+              .int()
+              .min(0)
+              .optional()
+              .describe(
+                "Cache age threshold (ms) after which a hit still returns cached models but kicks off a background refresh. Defaults to `ttlMs / 2`. Set to 0 to disable SWR.",
+              ),
+          })
+          .optional()
+          .describe(
+            "Cache for GitHub Copilot `/models` responses with TTL + stale-while-revalidate. Mirrors Rust `ModelsCacheManager` in `codex-rs/core/src/models_manager`. Env overrides: `OPENCODE_COPILOT_MODELS_CACHE_{ENABLED,TTL_MS,SWR_MS}`.",
+          ),
+        telemetry: z
+          .object({
+            enabled: z
+              .boolean()
+              .optional()
+              .describe(
+                "Enable OpenTelemetry export for Copilot dispatch. When true and `endpoint` is set, per-request + per-SSE metrics are exported via OTLP/HTTP. When false (default), an in-memory ring buffer still records events so `providers telemetry --tail/--json` works without a collector. Env override: `OPENCODE_COPILOT_TELEMETRY_ENABLED`.",
+              ),
+            endpoint: z
+              .string()
+              .optional()
+              .describe(
+                "OTLP/HTTP metrics collector URL (e.g. http://localhost:4318/v1/metrics). Falls back to `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` env vars. Env override: `OPENCODE_COPILOT_TELEMETRY_ENDPOINT`.",
+              ),
+            headers: z
+              .record(z.string(), z.string())
+              .optional()
+              .describe(
+                "Extra headers attached to each OTLP request (e.g. `{ \"X-Honeycomb-Team\": \"...\" }` for Honeycomb, or bearer tokens for Grafana Cloud).",
+              ),
+            bufferCap: z
+              .number()
+              .int()
+              .min(16)
+              .optional()
+              .describe(
+                "In-memory ring buffer size (records). Default 2048. Env override: `OPENCODE_COPILOT_TELEMETRY_BUFFER`.",
+              ),
+            exportIntervalMs: z
+              .number()
+              .int()
+              .min(1000)
+              .optional()
+              .describe(
+                "PeriodicExportingMetricReader interval (ms). Default 15000. Env override: `OPENCODE_COPILOT_TELEMETRY_EXPORT_INTERVAL_MS`.",
+              ),
+          })
+          .optional()
+          .describe(
+            "OTEL export + in-memory buffer for Copilot dispatch observability. Parallel to `copilot.stats` — ports codex_git `SessionTelemetry` / `RequestTelemetry` / `SseTelemetry` to opencode TS.",
           ),
         testAccounts: z
           .object({

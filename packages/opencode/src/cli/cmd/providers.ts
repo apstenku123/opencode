@@ -27,6 +27,7 @@ import {
 import { poolForAccount, type PoolId } from "../../plugin/github-copilot/pool-routing"
 import { StateSchema, empty, type State } from "../../plugin/github-copilot/connections"
 import { CopilotModels } from "../../plugin/github-copilot/models"
+import { ModelsCache } from "../../plugin/github-copilot/models-cache"
 import {
   BUNDLE_VERSION,
   exportBundle as exportBundleEffect,
@@ -925,18 +926,18 @@ export async function loadAccountStatuses() {
       log(`probe: ${key} GET ${apiBase}/models start`)
       const probeOutcome = await withDeadline(
         () =>
-          CopilotModels.get(
+          ModelsCache.instance().get(key, {
             apiBase,
-            {
+            headers: {
               Authorization: `Bearer ${refresh}`,
               "User-Agent": `opencode/providers-cli`,
               ...proxyHeaders(proxy?.token),
             },
-            {},
-            proxy?.url,
-            quota.plan,
-            { token: proxy?.token, envelope: proxy?.envelope },
-          ),
+            existing: {},
+            proxyUrl: proxy?.url,
+            plan: quota.plan,
+            proxy: { token: proxy?.token, envelope: proxy?.envelope },
+          }),
         PROBE_DEADLINE_MS,
       ).catch((err) => ({ ok: false as const, err: err instanceof Error ? err.message : String(err) }))
       if ("ok" in probeOutcome && probeOutcome.ok === true) {
@@ -1662,6 +1663,113 @@ export const ProvidersTestAccountsCommand = cmd({
   async handler() {},
 })
 
+export const ProvidersModelsCacheCommand = cmd({
+  command: "models-cache <action>",
+  describe: "inspect or invalidate the GitHub Copilot /models response cache",
+  builder: (yargs) =>
+    yargs
+      .command({
+        command: "list",
+        describe: "show cached /models entries with age",
+        builder: (y) => y.option("json", { type: "boolean", describe: "emit result as JSON" }),
+        async handler(args) {
+          const cache = ModelsCache.instance()
+          const entries = cache.list()
+          const now = Date.now()
+          const rows = entries.map((e) => ({
+            accountKey: e.accountKey,
+            apiBase: e.apiBase,
+            plan: e.plan,
+            fetchedAt: new Date(e.fetchedAt).toISOString(),
+            ageMs: now - e.fetchedAt,
+            modelCount: Object.keys(e.models).length,
+          }))
+          if (args.json) {
+            process.stdout.write(
+              JSON.stringify(
+                {
+                  entries: rows,
+                  hits: cache.hits,
+                  misses: cache.misses,
+                  refreshes: cache.refreshes,
+                  swrRefreshes: cache.swrRefreshes,
+                },
+                null,
+                2,
+              ) + "\n",
+            )
+            return
+          }
+          if (rows.length === 0) {
+            prompts.log.info("models cache is empty")
+            return
+          }
+          for (const r of rows) {
+            prompts.log.info(
+              `${r.accountKey} ${UI.Style.TEXT_DIM}age=${Math.floor(r.ageMs / 1000)}s models=${r.modelCount} plan=${r.plan ?? "unknown"} api=${r.apiBase}`,
+            )
+          }
+          prompts.log.info(
+            `${UI.Style.TEXT_DIM}hits=${cache.hits} misses=${cache.misses} refreshes=${cache.refreshes} swr=${cache.swrRefreshes}`,
+          )
+        },
+      })
+      .command({
+        command: "clear [account]",
+        describe: "invalidate one or all cache entries",
+        builder: (y) =>
+          y.positional("account", {
+            describe: "account key (omit to clear all)",
+            type: "string",
+          }),
+        async handler(args) {
+          const cache = ModelsCache.instance()
+          const key = typeof args.account === "string" && args.account.length > 0 ? args.account : undefined
+          await cache.clear(key)
+          prompts.log.success(key ? `cleared cache entry for ${key}` : "cleared all cache entries")
+        },
+      })
+      .command({
+        command: "refresh <account>",
+        describe: "force a live /models fetch for the given account",
+        builder: (y) =>
+          y.positional("account", {
+            describe: "account key (e.g. github-copilot or github-copilot#edu)",
+            type: "string",
+            demandOption: true,
+          }),
+        async handler(args) {
+          const key = String(args.account)
+          const credentials = await allAuth()
+          const info = (credentials as Record<string, { type?: string; refresh?: string; enterpriseUrl?: string }>)[key]
+          if (!info || info.type !== "oauth" || !info.refresh) {
+            prompts.log.error(`no oauth credential for ${key}`)
+            process.exit(1)
+          }
+          const { base, proxyHeaders } = await import("../../plugin/github-copilot/copilot")
+          const state = await readConnections()
+          const conn = state.connections[key]
+          const apiBase = conn?.discovery?.api ?? base(info!.enterpriseUrl)
+          const cfg = conn ? { url: conn.proxyUrl, token: conn.proxyToken, envelope: conn.envelope } : undefined
+          const entry = await ModelsCache.instance().refresh(key, {
+            apiBase,
+            headers: {
+              Authorization: `Bearer ${info!.refresh!}`,
+              "User-Agent": `opencode/providers-cli`,
+              ...proxyHeaders(cfg?.token),
+            },
+            existing: {},
+            proxyUrl: cfg?.url,
+            plan: conn?.plan,
+            proxy: { token: cfg?.token, envelope: cfg?.envelope },
+          })
+          prompts.log.success(`refreshed ${key} (${Object.keys(entry.models).length} models)`)
+        },
+      })
+      .demandCommand(),
+  async handler() {},
+})
+
 export const ProvidersCommand = cmd({
   command: "providers",
   aliases: ["auth"],
@@ -1686,6 +1794,7 @@ export const ProvidersCommand = cmd({
       .command(ProvidersPoolCommand)
       .command(ProvidersAllowedModelsCommand)
       .command(ProvidersTestAccountsCommand)
+      .command(ProvidersModelsCacheCommand)
       .demandCommand(),
   async handler() {},
 })
@@ -2522,6 +2631,155 @@ export const ProvidersStatsCommand = cmd({
 })
 
 /**
+ * `providers telemetry` — live-tail or JSON-dump the in-memory OTEL
+ * ring buffer populated by `packages/opencode/src/plugin/github-copilot/telemetry.ts`.
+ * Parallel to `providers stats` — both surfaces observability, but
+ * telemetry captures per-HTTP / per-SSE samples with OTEL-style tags
+ * (`account_key`, `model`, `pool`, `status_code`) rather than aggregate
+ * rollups.
+ *
+ * Two modes:
+ *   --json         dump the current buffer as JSON (no follow)
+ *   --tail [N]     print the last N records (default 20) then follow
+ *                  live additions; 500ms poll
+ *
+ * The ring buffer is always populated regardless of whether the OTLP
+ * exporter is enabled, so local debugging never requires a collector.
+ */
+export const ProvidersTelemetryCommand = cmd({
+  command: "telemetry",
+  describe: "tail or dump the Copilot dispatch OTEL telemetry ring buffer",
+  builder: (yargs) =>
+    yargs
+      .option("json", { type: "boolean", describe: "dump the current buffer as JSON" })
+      .option("tail", {
+        type: "number",
+        describe: "print last N records then follow live additions (default 20)",
+      })
+      .option("since", {
+        type: "string",
+        describe: "time window to include when printing (e.g. 10m, 1h). Default: full buffer.",
+      })
+      .option("limit", {
+        type: "number",
+        describe: "max records to include in --json output (default: full buffer)",
+      }),
+  async handler(args) {
+    const { getCopilotTelemetry } = await import("../../plugin/github-copilot/telemetry")
+    const telemetry = getCopilotTelemetry()
+    const rawSince = (args as { since?: string }).since
+    const sinceMs = parseDuration(rawSince)
+    if (rawSince !== undefined && sinceMs === undefined) {
+      process.stderr.write(`error: invalid --since value "${rawSince}" (try 10m, 1h, 24h)\n`)
+      process.exit(1)
+    }
+    const now = Date.now()
+    const cutoff = sinceMs !== undefined ? now - sinceMs : undefined
+    const full = telemetry.snapshot()
+    const windowed = cutoff !== undefined ? full.filter((r) => r.at >= cutoff) : full
+
+    if ((args as { json?: boolean }).json) {
+      const limit = (args as { limit?: number }).limit
+      const out = limit !== undefined && limit > 0 ? windowed.slice(Math.max(0, windowed.length - limit)) : windowed
+      process.stdout.write(
+        JSON.stringify(
+          {
+            generatedAt: now,
+            config: {
+              enabled: telemetry.config.enabled,
+              endpoint: telemetry.config.endpoint ?? null,
+              bufferCap: telemetry.config.bufferCap ?? null,
+            },
+            windowMs: sinceMs ?? null,
+            count: out.length,
+            records: out,
+          },
+          null,
+          2,
+        ) + "\n",
+      )
+      return
+    }
+
+    const tailRaw = (args as { tail?: number }).tail
+    const tailN = tailRaw === undefined ? 20 : tailRaw
+    const follow = tailRaw !== undefined
+    const initial = windowed.slice(Math.max(0, windowed.length - tailN))
+
+    UI.empty()
+    prompts.intro("GitHub Copilot telemetry")
+    prompts.log.info(
+      `exporter=${telemetry.config.enabled ? "enabled" : "disabled"} endpoint=${telemetry.config.endpoint ?? "none"} buffered=${full.length}`,
+    )
+    for (const record of initial) prompts.log.info(formatTelemetryRecord(record, now))
+
+    if (!follow) {
+      prompts.outro(`${initial.length} record${initial.length === 1 ? "" : "s"}`)
+      return
+    }
+
+    // Live-follow: poll the ring every 500ms, diff against the last seen
+    // record's `at` stamp, print new entries.
+    let cursor = initial.length > 0 ? initial[initial.length - 1]!.at : 0
+    let running = true
+    const stop = () => {
+      running = false
+    }
+    process.on("SIGINT", stop)
+    process.on("SIGTERM", stop)
+    try {
+      while (running) {
+        await new Promise((r) => setTimeout(r, 500))
+        const next = telemetry.snapshot().filter((r) => r.at > cursor)
+        for (const record of next) {
+          prompts.log.info(formatTelemetryRecord(record, Date.now()))
+          cursor = record.at
+        }
+      }
+    } finally {
+      prompts.outro("follow ended")
+    }
+  },
+})
+
+function formatTelemetryRecord(
+  record: {
+    at: number
+    kind: string
+    account_key?: string
+    model?: string
+    pool?: string
+    status?: number
+    durationMs?: number
+    success?: boolean
+    sseKind?: string
+    inputTokens?: number
+    outputTokens?: number
+    cost?: number
+    tool?: string
+  },
+  now: number,
+): string {
+  const ts = new Date(record.at).toISOString().replace("T", " ").replace("Z", "")
+  const age = Math.max(0, now - record.at)
+  const ago = age < 1000 ? `${age}ms` : `${Math.round(age / 1000)}s`
+  const parts: string[] = [ts, record.kind]
+  if (record.account_key) parts.push(`key=${record.account_key}`)
+  if (record.model) parts.push(`model=${record.model}`)
+  if (record.pool) parts.push(`pool=${record.pool}`)
+  if (record.status !== undefined) parts.push(`status=${record.status}`)
+  if (record.durationMs !== undefined) parts.push(`dur=${record.durationMs}ms`)
+  if (record.sseKind) parts.push(`sse=${record.sseKind}`)
+  if (record.success !== undefined) parts.push(`ok=${record.success}`)
+  if (record.inputTokens !== undefined) parts.push(`in=${record.inputTokens}`)
+  if (record.outputTokens !== undefined) parts.push(`out=${record.outputTokens}`)
+  if (record.cost !== undefined) parts.push(`cost=${record.cost}`)
+  if (record.tool) parts.push(`tool=${record.tool}`)
+  parts.push(`(${ago} ago)`)
+  return parts.join(" ")
+}
+
+/**
  * Table of all `OPENCODE_*` environment variables that influence the
  * GitHub Copilot integration. Used by `providers env` to print a
  * self-documenting list so operators can discover knobs without
@@ -2609,6 +2867,26 @@ export const COPILOT_ENV_VARS: ReadonlyArray<{
     name: "OPENCODE_COPILOT_RATE_LIMITER_ACQUIRE_TIMEOUT_MS",
     description: "Max time (ms) a dispatch will wait on acquire() before giving up. Default 30000.",
     defaultValue: "30000",
+  },
+  {
+    name: "OPENCODE_COPILOT_TELEMETRY_ENABLED",
+    description:
+      "Enable OTEL/OTLP export for the Copilot dispatch pipeline. When true, per-request and per-SSE metrics are exported via OTLP/HTTP (see ENDPOINT). When unset, auto-enables iff an endpoint is present. Default auto.",
+  },
+  {
+    name: "OPENCODE_COPILOT_TELEMETRY_ENDPOINT",
+    description:
+      "OTLP/HTTP metrics collector URL (e.g. http://localhost:4318/v1/metrics). Overrides config `copilot.telemetry.endpoint`. Falls back to `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT`.",
+  },
+  {
+    name: "OPENCODE_COPILOT_TELEMETRY_BUFFER",
+    description: "In-memory telemetry ring buffer capacity (records). Default 2048.",
+    defaultValue: "2048",
+  },
+  {
+    name: "OPENCODE_COPILOT_TELEMETRY_EXPORT_INTERVAL_MS",
+    description: "OTLP PeriodicExportingMetricReader interval (ms). Default 15000.",
+    defaultValue: "15000",
   },
 ]
 

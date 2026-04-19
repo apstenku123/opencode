@@ -6,6 +6,7 @@ import { Log } from "../../util"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Effect } from "effect"
 import { CopilotModels } from "./models"
+import { ModelsCache } from "./models-cache"
 import {
   ACQUIRE_TIMEOUT_MS,
   cooldown,
@@ -31,6 +32,7 @@ import {
   type HttpRetryRaceConfig,
 } from "./retry-race"
 import { CopilotStats } from "./stats"
+import { getCopilotTelemetry } from "./telemetry"
 import { classifyPlan, fetchQuota } from "./quota"
 import { MessageV2 } from "@/session/message-v2"
 import { Auth } from "@/auth"
@@ -248,17 +250,18 @@ export async function aliasModels(input: {
   })
   const apiBase = disc.api ?? base(match.enterpriseUrl)
   const planSku = disc.sku
-  return CopilotModels.get(
-    apiBase,
-    {
-      Authorization: `Bearer ${match.refresh}`,
-      "User-Agent": `opencode/${InstallationVersion}`,
-      ...proxyHeaders(cfg?.token),
-    },
-    input.provider.models,
-    cfg?.url,
-    planSku,
-  )
+  return ModelsCache.instance()
+    .get(match.key, {
+      apiBase,
+      headers: {
+        Authorization: `Bearer ${match.refresh}`,
+        "User-Agent": `opencode/${InstallationVersion}`,
+        ...proxyHeaders(cfg?.token),
+      },
+      existing: input.provider.models,
+      proxyUrl: cfg?.url,
+      plan: planSku,
+    })
     .then(async (models) => {
       const next = discover(input.state, match.key, {
         models: Object.values(models).map((item) => item.api.id),
@@ -1169,6 +1172,12 @@ async function dispatchOnce(ctx: {
   // CLI can show when premium budget was actually spent vs. just routed.
   CopilotStats.recordDispatch(live.key, input.modelId)
   if (input.modelId && isPremium) CopilotStats.recordPremium(live.key, input.modelId)
+  // OTEL parallel — mirror Rust ApiTelemetry::on_request. Resolved `pool`
+  // tag is best-effort (undefined when the plan is unknown at dispatch
+  // time), but every emission always carries `account_key` + `model`.
+  const telemetry = getCopilotTelemetry()
+  const telemetryPool = poolForAccount({ key: live.key, cfg: poolRoutingConfig })
+  const dispatchStart = Date.now()
   const fresh = await refreshAccount({ state, key: live.key, token: live.refresh, enterpriseUrl: live.enterpriseUrl })
   const [nextState, machineId] = machine(routed(fresh, live.key), live.key)
   await input.write(nextState)
@@ -1202,6 +1211,15 @@ async function dispatchOnce(ctx: {
   const cfg = proxyConfig(nextState, live.key)
   const res = await routedFetch(input.request, { ...input.init, headers }, cfg)
   const triage = copilotStatus(res)
+  // Always record the request to telemetry (success or failure) so the
+  // OTLP exporter + in-memory buffer reflect every dispatch attempt.
+  telemetry.recordRequest({
+    accountKey: live.key,
+    model: input.modelId,
+    pool: telemetryPool,
+    status: res.status,
+    durationMs: Date.now() - dispatchStart,
+  })
   if (triage.rateLimited) {
     // Honor Retry-After when present; else run the headerless-429 escalator
     // (11m → 21m → 41m). `record429` is monotonic — it never shortens an
@@ -1216,6 +1234,12 @@ async function dispatchOnce(ctx: {
     // Observability: record the 429 with the parsed retry-after (or
     // undefined for headerless 429s so the avg doesn't skew to 0).
     CopilotStats.recordRateLimit(live.key, retryAfterMs)
+    // OTEL: bump the 429 retry counter so external dashboards can chart
+    // per-account rate-limit density. Mirror Rust `record_api_request`
+    // which folds the 429 into the status tag; here we also fire a
+    // dedicated `opencode.copilot.retries.429` counter that's easier to
+    // alert on.
+    telemetry.record429(live.key, input.modelId, telemetryPool)
     const result = input.pool
       ? input.pool.recordExhaustion(live.key, { retryAfter, ...(retryAfterMs !== undefined ? { delayMs: retryAfterMs } : {}) })
       : (await import("./runtime")).record429(input.runtime, live.key, { retryAfterMs })
@@ -1464,6 +1488,28 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   // buffer retains the most recent `eventBusCapacity` observations so
   // late-joining debug consumers see race history without tailing logs.
   setHttpRetryRaceConfig(httpRetryRaceConfig(resolvedCfg as any))
+  // Seed the Copilot `/models` response cache with the user's
+  // `copilot.modelsCache.*` settings. Mirrors Rust
+  // `ModelsCacheManager::new(codex_home, DEFAULT_MODEL_CACHE_TTL)` in
+  // `codex-rs/core/src/models_manager/manager.rs`. Env overrides win
+  // per `optionsFromConfig`.
+  ModelsCache.__setInstance(new ModelsCache.Manager({ options: ModelsCache.optionsFromConfig(resolvedCfg as any) }))
+  // Initialise the OTEL telemetry singleton. When `copilot.telemetry.*`
+  // or `OPENCODE_COPILOT_TELEMETRY_*` env vars request OTLP export the
+  // singleton attaches a `PeriodicExportingMetricReader`; otherwise the
+  // in-memory ring buffer keeps accepting records for `providers
+  // telemetry --tail/--json`. Fire-and-forget so boot isn't blocked by
+  // collector availability. Mirror: Rust `codex-otel` init in
+  // `codex-rs/otel/src/provider.rs`.
+  {
+    const { initCopilotTelemetry } = await import("./telemetry")
+    const teleCfg = (resolvedCfg as any)?.copilot?.telemetry
+    initCopilotTelemetry(teleCfg).catch((err: unknown) => {
+      if (process.env.OPENCODE_DEBUG_PROVIDERS === "1") {
+        process.stderr.write(`copilot telemetry init failed: ${String(err)}\n`)
+      }
+    })
+  }
   const discoveryBarrier = createDiscoveryBarrier()
   CopilotRuntimeState.current = runtime
   // Boot the AccountPool against the live runtime + SQLite cooldown store.
@@ -1522,17 +1568,18 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
         const apiBase = disc.api ?? base(auth.enterpriseUrl)
         const planSku = disc.sku
 
-        return CopilotModels.get(
-          apiBase,
-          {
-            Authorization: `Bearer ${auth.refresh}`,
-            "User-Agent": `opencode/${InstallationVersion}`,
-            ...proxyHeaders(cfg?.token),
-          },
-          provider.models,
-          cfg?.url,
-          planSku,
-        )
+        return ModelsCache.instance()
+          .get(key, {
+            apiBase,
+            headers: {
+              Authorization: `Bearer ${auth.refresh}`,
+              "User-Agent": `opencode/${InstallationVersion}`,
+              ...proxyHeaders(cfg?.token),
+            },
+            existing: provider.models,
+            proxyUrl: cfg?.url,
+            plan: planSku,
+          })
           .then(async (models) => {
             const supported = Object.values(models).map((item) => item.api.id)
             const next = discover(storeState, key, {

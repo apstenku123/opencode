@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, mock, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { CopilotModels } from "@/plugin/github-copilot/models"
+import { ModelsCache } from "@/plugin/github-copilot/models-cache"
 import {
   CopilotAuthPlugin,
   aliasModels,
@@ -13,6 +14,17 @@ import {
 } from "@/plugin/github-copilot/copilot"
 import { discover } from "@/plugin/github-copilot/connections"
 import { MessageV2 } from "@/session/message-v2"
+
+// Each test gets a fresh, no-persist ModelsCache so warm entries from a
+// previous test don't suppress the raw `fetch` calls new tests inspect.
+beforeEach(() => {
+  ModelsCache.__setInstance(
+    new ModelsCache.Manager({
+      persistPath: "/tmp/oc-models-cache-test-noop-" + Math.random().toString(36).slice(2) + ".json",
+      options: { enabled: true, ttlMs: 5 * 60 * 1000, staleWhileRevalidateMs: 0 },
+    }),
+  )
+})
 
 // Suppress the eager /copilot_internal/user + /models fan-out that
 // `CopilotAuthPlugin` spawns at boot. Those background fetches race
