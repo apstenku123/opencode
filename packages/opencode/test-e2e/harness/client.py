@@ -230,6 +230,17 @@ class OpencodeClient:
         """GET /session/:id/message — list all messages on a session."""
         return self._get(f"/session/{session_id}/message")
 
+    def get_session_children(self, session_id: str) -> list[dict[str, Any]]:
+        """GET /session/:id/children — list child sessions of a parent.
+
+        Returns the list of child session dicts (each with ``id``,
+        ``parentID``, ``title``, etc.). Used by the SGR subagent tests to
+        verify that an auto-dispatched ``task`` call created a child
+        session even when the downstream dispatcher errors out (e.g.
+        because the auto-dispatch context lacks ``promptOps``).
+        """
+        return self._get(f"/session/{session_id}/children")
+
     def create_session(self, **body: Any) -> dict[str, Any]:
         """POST /session — create a session directly (fires SessionStart)."""
         return self._post("/session", json=body)
