@@ -69,10 +69,16 @@ def http_client(
     opencode_server: OpencodeServer,
     project_dir: Path,
 ) -> Iterator[OpencodeClient]:
-    """Fresh HTTP client per test, bound to the shared server."""
+    """Fresh HTTP client per test, bound to the shared server.
+
+    timeout_s=300s so live-LLM /session/.../message calls (which block
+    for the full assistant turn) don't raise httpx.ReadTimeout on slow
+    Copilot plans.
+    """
     with OpencodeClient(
         opencode_server.base_url,
         project_directory=str(project_dir),
+        timeout_s=300.0,
     ) as client:
         yield client
 
