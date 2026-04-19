@@ -286,12 +286,24 @@ export namespace SessionMemoryObserver {
             return bridges
           }
           odbg(`resolveBridges: cfg.memories.extractionModel=${cfg.memories?.extractionModel ?? "(unset)"} cfg.model=${cfg.model ?? "(unset)"}`)
+          // Per-phase formatSchema override. Only the extraction phase has
+          // a config slot today — the others stay on `generateText`.
+          const extractionFormatSchema =
+            (cfg as { memories?: { extractionFormatSchema?: Record<string, unknown> } } | undefined)
+              ?.memories?.extractionFormatSchema
+          odbg(
+            `resolveBridges: extractionFormatSchema=${extractionFormatSchema ? "(present)" : "(unset)"}`,
+          )
           const tryResolve = (phase: "extraction" | "rerank" | "polish" | "querySynth") =>
             Effect.gen(function* () {
               const spec = resolveModelSpec(cfg, phase)
               odbg(`resolveBridges[${phase}]: spec=${spec ?? "(undefined)"}`)
               if (!spec) return undefined
-              const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+              const bridge = yield* makeMemoryBridge({
+                modelSpec: spec,
+                formatSchema: phase === "extraction" ? extractionFormatSchema : undefined,
+                schemaName: phase === "extraction" ? "Phase1Extraction" : undefined,
+              }).pipe(
                 Effect.provideService(Provider.Service, providerSvc),
                 Effect.catchCause((c) => {
                   odbg(`resolveBridges[${phase}] bridge error: ${String(c).slice(0, 200)}`)

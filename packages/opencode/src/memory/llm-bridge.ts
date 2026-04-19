@@ -23,13 +23,20 @@
  */
 
 import { Effect } from "effect"
-import { generateText } from "ai"
+import { generateObject, generateText, jsonSchema } from "ai"
 
 import { Provider } from "@/provider"
 import type { Phase1Model } from "./phase1"
 import type { SynthesizeModel } from "./query-synth"
 import type { RerankModel } from "./rerank"
 import type { RefiningModel } from "./refining"
+
+/**
+ * Narrow JSON-Schema shape accepted by `formatSchema`. We don't need the
+ * full `JSONSchema7` surface here — the caller hands us a plain object
+ * that the `ai` SDK's `jsonSchema()` wrapper validates/downcasts.
+ */
+export type MemoryJsonSchema = Record<string, unknown>
 
 /** Per-call deadline for a memory-side one-shot LLM call (ms). Kept
  * generous because Phase-1 on a 32 KiB rollout can take a minute. */
@@ -44,6 +51,23 @@ export interface MemoryBridgeOptions {
   readonly temperature?: number
   /** Optional max-tokens cap on the generated response. */
   readonly maxOutputTokens?: number
+  /**
+   * Optional JSON-Schema override. When supplied, the bridge swaps
+   * `generateText` for `generateObject` and forces the model to emit a
+   * schema-conforming object — the SGR (Schema-Guided-Reasoning) path.
+   *
+   * The bridge still hands back a JSON-serialised string so the existing
+   * sub-module parsers (`parsePhase1Response`, `parseQueryResponse`, …)
+   * can continue to decode without a separate code path. When the model
+   * refuses or the schema validator fails the bridge returns `null`,
+   * exactly like the text path.
+   */
+  readonly formatSchema?: MemoryJsonSchema
+  /** Optional name for the SGR schema — surfaces to the provider as the
+   *  tool/schema hint (OpenAI / Anthropic honour this). */
+  readonly schemaName?: string
+  /** Optional description for the SGR schema. */
+  readonly schemaDescription?: string
 }
 
 /**
@@ -76,9 +100,38 @@ export const makeMemoryBridge = (
       .pipe(Effect.catchCause(() => Effect.succeed(undefined as never)))
     if (!language) return undefined
 
+    const schema = opts.formatSchema
+    const useSgr = schema !== undefined && schema !== null
+
     const bridge: Phase1Model = (prompt: string) =>
       Effect.tryPromise({
         try: async () => {
+          if (useSgr) {
+            // Schema-Guided-Reasoning path: the provider is constrained to
+            // emit a JSON object matching `formatSchema`. We re-serialise
+            // to a string so downstream parsers (parsePhase1Response etc.)
+            // see the exact same shape they'd see from `generateText`.
+            const res = await generateObject({
+              model: language,
+              prompt,
+              temperature: opts.temperature ?? 0.2,
+              maxOutputTokens: opts.maxOutputTokens,
+              // `jsonSchema` wraps the JSON-Schema into the SDK's
+              // `Schema<T>` shape expected by `generateObject`.
+              schema: jsonSchema(schema as Parameters<typeof jsonSchema>[0]),
+              schemaName: opts.schemaName,
+              schemaDescription: opts.schemaDescription,
+            })
+            // `res.object` is already parsed; re-stringify so the bridge
+            // keeps its (prompt) => string | null contract.
+            const obj = (res as unknown as { object?: unknown }).object
+            if (obj === undefined || obj === null) return null
+            try {
+              return JSON.stringify(obj)
+            } catch {
+              return null
+            }
+          }
           const res = await generateText({
             model: language,
             prompt,
@@ -95,7 +148,9 @@ export const makeMemoryBridge = (
           // bridges degrade silently by design so a missing model doesn't
           // block the main turn loop.
           if (process.env.OPENCODE_MEMORY_BRIDGE_DEBUG === "1") {
-            process.stderr.write(`[llm-bridge] generateText failed: ${String(c)}\n`)
+            process.stderr.write(
+              `[llm-bridge] ${useSgr ? "generateObject" : "generateText"} failed: ${String(c)}\n`,
+            )
           }
           return Effect.succeed(null as string | null)
         }),

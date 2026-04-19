@@ -67,9 +67,14 @@ const resolveLlmExtractor = Effect.gen(function* () {
   const cfg = yield* Config.Service.use((svc) => svc.get())
   const spec = cfg.memories?.extractionModel?.trim() || cfg.model?.trim()
   if (!spec) return NO_OP_EXTRACTOR
-  const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
-    Effect.catchCause(() => Effect.succeed(undefined as undefined)),
-  )
+  const formatSchema = (
+    cfg.memories as { extractionFormatSchema?: Record<string, unknown> } | undefined
+  )?.extractionFormatSchema
+  const bridge = yield* makeMemoryBridge({
+    modelSpec: spec,
+    formatSchema,
+    schemaName: formatSchema ? "Phase1Extraction" : undefined,
+  }).pipe(Effect.catchCause(() => Effect.succeed(undefined as undefined)))
   if (!bridge) return NO_OP_EXTRACTOR
   return makeLlmSessionExtractor({ model: bridge })
 })
@@ -300,9 +305,17 @@ const resolveLlmPolisher = Effect.gen(function* () {
     cfg.memories?.extractionModel?.trim() ||
     cfg.model?.trim()
   if (!spec) return NOOP_POLISHER
-  const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
-    Effect.catchCause(() => Effect.succeed(undefined as undefined)),
-  )
+  // The crawl polisher uses the SAME schema as extraction because both
+  // parse their response via the Phase-1 contract. Passing the schema
+  // turns the crawl LLM call into a deterministic SGR invocation.
+  const formatSchema = (
+    cfg.memories as { extractionFormatSchema?: Record<string, unknown> } | undefined
+  )?.extractionFormatSchema
+  const bridge = yield* makeMemoryBridge({
+    modelSpec: spec,
+    formatSchema,
+    schemaName: formatSchema ? "Phase1Extraction" : undefined,
+  }).pipe(Effect.catchCause(() => Effect.succeed(undefined as undefined)))
   if (!bridge) return NOOP_POLISHER
   const polisher: CommitPolisher = (_commit: CommitRecord, prompt: string) =>
     Effect.gen(function* () {

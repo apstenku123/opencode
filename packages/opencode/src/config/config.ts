@@ -515,6 +515,12 @@ export const Info = z
           .describe(
             "Provider/model identifier (e.g. `openai/gpt-4.1`) used for post-turn Phase-1 sextuple extraction and for foreign-ingest LLM extraction. When omitted the extractor falls back to the session's default model.",
           ),
+        extractionFormatSchema: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Optional JSON-Schema (object) used to force Phase-1 extraction through the Schema-Guided-Reasoning (SGR) path. When set, the memory LLM bridge swaps `generateText` for `generateObject` with this schema — the provider is then constrained to emit a matching object. Must be shape-compatible with the Phase-1 response contract (`{rollout_summary, rollout_slug, raw_memory, sextuples}`). Leave unset to keep the legacy free-form JSON path.",
+          ),
         rerankModel: z
           .string()
           .optional()
