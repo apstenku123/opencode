@@ -386,8 +386,90 @@ def _e2e_session_lock(request) -> Iterator[None]:
         )
 
 
+_XDIST_ABORT_MSG = (
+    "[e2e] pytest-xdist is incompatible with this suite.\n"
+    "\n"
+    "All tests under test-e2e/ serialise through a single cross-process\n"
+    "file lock at /tmp/opencode-e2e.lock (see _e2e_session_lock in\n"
+    "conftest.py). The lock exists because every test shares the user's\n"
+    "real GitHub Copilot OAuth tokens at ~/.local/share/opencode/auth.json\n"
+    "plus the copilot-rate-state.sqlite rate-limit ledger — those cannot\n"
+    "be raced.\n"
+    "\n"
+    "Running under xdist (``pytest -n N`` with N>1, or any env with\n"
+    "PYTEST_XDIST_WORKER_COUNT>1) would spawn N worker processes that all\n"
+    "race for the same lock; N-1 of them would block for the 900s timeout\n"
+    "and then fail. That is strictly worse than serial execution.\n"
+    "\n"
+    "Fix: run without -n, or with -n 0 / -n 1.\n"
+    "If you need diagnostics on the current lock holder, run\n"
+    "    python3 -m harness.lock_status\n"
+    "from this directory.\n"
+)
+
+
+def _xdist_worker_count(config) -> int:
+    """Detect how many xdist workers pytest is about to spawn.
+
+    Checks two sources:
+      1. ``-n <N>`` / ``--numprocesses <N>`` CLI option (pre-spawn, seen
+         on the controller process before any workers exist).
+      2. ``PYTEST_XDIST_WORKER_COUNT`` env var (post-spawn, populated by
+         xdist inside each worker).
+
+    Returns 1 when xdist is absent or configured single-worker.
+    ``"auto"`` / ``"logical"`` are treated as ``>1`` conservatively — any
+    value that is not ``0``, ``1``, or blank triggers the guard.
+    """
+    # CLI flag on the controller.
+    try:
+        n_opt = config.getoption("numprocesses", default=None)
+    except (ValueError, KeyError):
+        n_opt = None
+    if n_opt is not None:
+        if isinstance(n_opt, int):
+            if n_opt > 1:
+                return n_opt
+        else:
+            val = str(n_opt).strip().lower()
+            if val in ("auto", "logical"):
+                return 99  # treat symbolic values as ">1"
+            if val and val not in ("0", "1"):
+                try:
+                    n = int(val)
+                    if n > 1:
+                        return n
+                except ValueError:
+                    return 99
+
+    # Env var set by xdist inside each worker.
+    env_val = os.environ.get("PYTEST_XDIST_WORKER_COUNT", "").strip()
+    if env_val:
+        try:
+            n = int(env_val)
+            if n > 1:
+                return n
+        except ValueError:
+            pass
+
+    return 1
+
+
 def pytest_configure(config) -> None:
-    """Register custom pytest markers used by live-LLM tests."""
+    """Register custom pytest markers used by live-LLM tests.
+
+    Also aborts at collection time if pytest-xdist is enabled with
+    N>1 workers (see ``_xdist_worker_count``). The abort happens BEFORE
+    any test collection so xdist workers never race against the file
+    lock — catching the misuse here is cheaper than N-1 workers timing
+    out on the lock and failing with a non-obvious error.
+    """
+    n_workers = _xdist_worker_count(config)
+    if n_workers > 1:
+        raise pytest.UsageError(
+            _XDIST_ABORT_MSG + f"\n[detected worker count: {n_workers}]\n"
+        )
+
     config.addinivalue_line(
         "markers",
         "live: live-LLM smoke tests that call a real provider (opt-in: "
