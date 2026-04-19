@@ -272,6 +272,48 @@ def test_memories_disabled_no_extraction(copilot_model: dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 
+# SGR JSON-Schema for the Phase-1 extraction response contract. Mirrors
+# `parsePhase1Response` in `packages/opencode/src/memory/phase1.ts` —
+# any shape drift here is a regression signal, not a config choice.
+# Supplying this via `memories.extractionFormatSchema` swaps the bridge
+# from `generateText` to `generateObject` (see `memory/llm-bridge.ts`),
+# which forces the provider to emit a schema-conforming object instead
+# of free-form JSON.
+PHASE1_SEXTUPLE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "keywords": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 8,
+        },
+        "problem": {"type": "string", "minLength": 1},
+        "root_cause": {"type": "string", "minLength": 1},
+        "solution": {"type": "string", "minLength": 1},
+    },
+    "required": ["keywords", "problem", "root_cause", "solution"],
+    "additionalProperties": False,
+}
+
+PHASE1_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "rollout_summary": {"type": "string"},
+        "rollout_slug": {"type": "string"},
+        "raw_memory": {"type": "string"},
+        "sextuples": {
+            "type": "array",
+            "items": PHASE1_SEXTUPLE_SCHEMA,
+            "minItems": 1,
+            "maxItems": 5,
+        },
+    },
+    "required": ["rollout_summary", "rollout_slug", "raw_memory", "sextuples"],
+    "additionalProperties": False,
+}
+
+
 @skip_if_no_copilot
 def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
     """With memories + Phase-1 extraction enabled, a defect-resolution
@@ -290,6 +332,9 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
                 "retrievalEnabled": False,
                 "rerankEnabled": False,
                 "extractionModel": model_spec,
+                # SGR guard — forces `generateObject` on the Phase-1 LLM
+                # call so the provider can't drift off the schema.
+                "extractionFormatSchema": PHASE1_RESPONSE_SCHEMA,
             },
             "model": model_spec,
         },
@@ -343,18 +388,16 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
                 )
             server.stop()
 
-        if count < 1:
-            # The fork dispatches an LLM extraction turn — if the model
-            # + provider routing is unavailable (e.g. `github-copilot#edu`
-            # provider not present, or the Copilot plan rejects the
-            # extraction model), the fork silently exits with 0 sextuples
-            # persisted. This is a test-infrastructure gap, not a
-            # Phase-1-wiring regression; skip so the suite stays green.
-            pytest.skip(
-                f"Phase-1 extraction produced 0 sextuples after 180s "
-                f"(model={model_spec}) — likely provider/model unavailable "
-                "in this environment."
-            )
+        # SGR-constrained extraction: the provider is forced through
+        # `generateObject`, so a 0-sextuple outcome is a hard failure,
+        # not an upstream flake.
+        assert count >= 1, (
+            f"Phase-1 SGR extraction produced 0 sextuples after 180s "
+            f"(model={model_spec}, schema=PHASE1_RESPONSE_SCHEMA). "
+            f"Provider rejected `generateObject` constraint or the "
+            f"extraction fiber did not finish before server teardown — "
+            f"inspect OPENCODE_MEMORY_OBSERVER_DEBUG=1 logs."
+        )
 
         # Retrieve + verify every required field is non-empty.
         rc, stdout, stderr = _run_memory_cli(
@@ -394,14 +437,17 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
 def test_turn_hook_injects_similar_past_problems(
     copilot_model: dict[str, str],
 ) -> None:
-    """Seed a defect sextuple, start a new thread with a related prompt,
-    and verify the ``<similar_past_problems>`` block reached the model.
+    """SGR-hardened verification that the retrieval enrichment block reaches the system context.
 
     Opencode deliberately does NOT persist the enrichment block in
     message history — it lives only in the per-turn ``system[]`` array
-    passed to ``LLM.generateText``. The black-box way to assert
-    injection is therefore to ask the model to echo a marker when it
-    observes the block in its system context.
+    passed to the model. The black-box way to assert injection is
+    therefore to ask the model to report what it sees in its system
+    context. Routing the question through ``/turn/start`` with a
+    ``format={"type":"json_schema", ...}`` envelope forces the server
+    to register the ``StructuredOutput`` tool + ``toolChoice=required``
+    so the model's only legal next token is a schema-conforming tool
+    call — no refusal paths, no free-form drift, no upstream skips.
     """
     model_spec = f"{copilot_model['providerID']}/{copilot_model['modelID']}"
     root = prepare_isolated_home(preserve_tokens=True)
@@ -444,6 +490,35 @@ def test_turn_hook_injects_similar_past_problems(
         ),
     }
 
+    # SGR schema pinning the answer surface to a 2-value enum + a free
+    # string for the echoed token. Free-form replies are no longer
+    # possible — the model either emits MEM_INJECTED + a token or
+    # MEM_NOT_INJECTED + an empty string.
+    injection_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "saw_memory_block": {
+                "type": "string",
+                "enum": ["MEM_INJECTED", "MEM_NOT_INJECTED"],
+                "description": (
+                    "MEM_INJECTED if the system context contains a "
+                    "`<similar_past_problems>` block, else MEM_NOT_INJECTED."
+                ),
+            },
+            "echoed_marker": {
+                "type": "string",
+                "description": (
+                    "When saw_memory_block == MEM_INJECTED, verbatim "
+                    "copy of a distinguishable identifier from inside "
+                    "the block (e.g. OCTOPUS_MARKER_42). Empty string "
+                    "when MEM_NOT_INJECTED."
+                ),
+            },
+        },
+        "required": ["saw_memory_block", "echoed_marker"],
+        "additionalProperties": False,
+    }
+
     try:
         rc, stdout, stderr = _run_memory_cli(
             root, "seed", "--json", cwd=scratch, stdin=json.dumps(seed_body)
@@ -456,6 +531,7 @@ def test_turn_hook_injects_similar_past_problems(
         assert status["sextupleCount"] >= 1, f"seed not visible: {status}"
 
         server = _spawn_server(root, scratch)
+        structured: Optional[dict[str, Any]] = None
         try:
             if not _server_supports_instance_routes(server.base_url, str(scratch)):
                 pytest.skip("opencode serve missing instance routes")
@@ -464,41 +540,101 @@ def test_turn_hook_injects_similar_past_problems(
                 project_directory=str(scratch),
                 timeout_s=300.0,
             ) as client:
-                session = client.create_session()
-                client.send_message(
-                    session["id"],
-                    (
-                        "I'm getting a TypeError when reading a nested property "
-                        "on an undefined parent. If your system context "
-                        "contains a block labelled `<similar_past_problems>`, "
-                        "reply with exactly the word MEM_INJECTED followed by "
-                        "any unique identifier that appears inside that "
-                        "block. Otherwise reply MEM_NOT_INJECTED."
-                    ),
-                    providerID=copilot_model["providerID"],
-                    modelID=copilot_model["modelID"],
+                thread = client.create_thread()
+                thread_id = thread["id"]
+
+                # Background the /turn/start drive so the HTTP pool can
+                # be torn down without aborting a long Copilot turn.
+                # Poll GET /session/:id/message for `info.structured` on
+                # the main thread (mirrors harness/sgr.py).
+                import threading as _threading
+                import time as _time
+
+                turn_err: list[BaseException] = []
+                turn_done = _threading.Event()
+                turn_prompt = (
+                    "Inspect your system context. If it contains a block "
+                    "labelled `<similar_past_problems>`, set "
+                    "saw_memory_block to MEM_INJECTED and put any unique "
+                    "identifier you see inside that block into "
+                    "echoed_marker. Otherwise set saw_memory_block to "
+                    "MEM_NOT_INJECTED and leave echoed_marker empty."
                 )
-                messages = client.get_messages(session["id"])
+
+                def _drive() -> None:
+                    try:
+                        client.start_turn(
+                            thread_id,
+                            turn_prompt,
+                            model=copilot_model,
+                            format={
+                                "type": "json_schema",
+                                "schema": injection_schema,
+                            },
+                        )
+                    except BaseException as err:  # noqa: BLE001
+                        turn_err.append(err)
+                    finally:
+                        turn_done.set()
+
+                drv = _threading.Thread(
+                    target=_drive,
+                    name=f"mem-inject-{thread_id}",
+                    daemon=True,
+                )
+                drv.start()
+
+                deadline = _time.monotonic() + 240.0
+                while _time.monotonic() < deadline:
+                    try:
+                        msgs = client.get_messages(thread_id)
+                    except Exception:
+                        _time.sleep(1.0)
+                        continue
+                    for m in msgs or []:
+                        info = m.get("info") or {}
+                        if info.get("role") == "assistant":
+                            candidate = info.get("structured")
+                            if isinstance(candidate, dict):
+                                structured = candidate
+                                break
+                    if structured is not None:
+                        break
+                    if turn_done.is_set():
+                        # Final scan after the driver thread finished.
+                        try:
+                            msgs = client.get_messages(thread_id)
+                        except Exception:
+                            msgs = []
+                        for m in msgs or []:
+                            info = m.get("info") or {}
+                            if info.get("role") == "assistant":
+                                candidate = info.get("structured")
+                                if isinstance(candidate, dict):
+                                    structured = candidate
+                                    break
+                        break
+                    _time.sleep(1.0)
         finally:
             server.stop()
 
-        assistant_text = ""
-        for m in messages:
-            info = m.get("info", {})
-            if info.get("role") != "assistant":
-                continue
-            for p in m.get("parts", []):
-                if p.get("type") == "text":
-                    assistant_text += (p.get("text") or "") + "\n"
-        if not assistant_text.strip():
-            pytest.skip(
-                "Copilot did not return assistant text (model declined / "
-                "quota / upstream error) — memory injection cannot be "
-                "observed without a model response."
-            )
-        assert "MEM_INJECTED" in assistant_text, (
-            f"LLM did not echo injection marker; response:\n"
-            f"{assistant_text[:800]}"
+        assert structured is not None, (
+            "SGR turn did not land a structured payload on the assistant "
+            "message within 240s — server plumbing (StructuredOutput tool "
+            "+ toolChoice=required) likely regressed, or provider rejected "
+            "the /turn/start format envelope."
+        )
+        saw = str(structured.get("saw_memory_block") or "")
+        echoed = str(structured.get("echoed_marker") or "")
+        assert saw == "MEM_INJECTED", (
+            f"model reported saw_memory_block={saw!r} echoed_marker={echoed!r}; "
+            "enrichment block did NOT reach the system context, or the "
+            f"model disagreed with the schema. Full payload: {structured!r}"
+        )
+        assert echoed.strip(), (
+            f"model reported MEM_INJECTED but echoed_marker is empty — "
+            f"the enrichment block is present but may not contain a "
+            f"distinguishable identifier. Full payload: {structured!r}"
         )
     finally:
         shutil.rmtree(root, ignore_errors=True)
@@ -635,9 +771,13 @@ def test_retrieval_modes_produce_different_ranks() -> None:
 
 @skip_if_no_copilot
 def test_commit_crawler_produces_jsonl(copilot_model: dict[str, str]) -> None:
-    """Create a temp git repo with ≥3 defect-resolution commits, run
-    ``memory crawl --polish`` with a real Copilot LLM polisher, and
-    assert the per-repo JSONL cache exists with ≥1 sextuple row.
+    """Commit crawler with SGR-constrained polisher yields ≥1 sextuple JSONL row.
+
+    The polisher emits a flat ``PolisherSextuple`` per commit (just
+    ``{keywords, problem, root_cause, solution}`` — NOT the Phase-1
+    wrapped contract). We configure ``memories.polishFormatSchema`` so
+    ``memory crawl --polish`` invokes ``generateObject`` with the flat
+    schema on every commit — no upstream-variance skip branch required.
     """
     model_spec = f"{copilot_model['providerID']}/{copilot_model['modelID']}"
     root = prepare_isolated_home(preserve_tokens=True)
@@ -645,7 +785,14 @@ def test_commit_crawler_produces_jsonl(copilot_model: dict[str, str]) -> None:
     _write_config(
         root,
         {
-            "memories": {"enabled": True, "polishModel": model_spec},
+            "memories": {
+                "enabled": True,
+                "polishModel": model_spec,
+                # SGR guard — forces the polisher through `generateObject`
+                # with the flat `PolisherSextuple` shape. See
+                # `src/memory/commit-crawler.ts::PolisherSextuple`.
+                "polishFormatSchema": PHASE1_SEXTUPLE_SCHEMA,
+            },
             "model": model_spec,
         },
     )
@@ -753,16 +900,13 @@ def test_commit_crawler_produces_jsonl(copilot_model: dict[str, str]) -> None:
                     break
             if found_sextuple:
                 break
-        if not found_sextuple:
-            # LLM extraction can fail upstream (model not supported,
-            # quota, rate-limit). The crawler still records the 3 commit
-            # walks in stats, so the crawler wiring itself is fine —
-            # skip rather than fail when the model couldn't emit a
-            # sextuple.
-            pytest.skip(
-                f"no sextuples produced — upstream LLM likely failed "
-                f"(stats={stats}). Crawler wiring itself is intact."
-            )
+        assert found_sextuple, (
+            f"SGR-constrained polisher produced no non-empty sextuples "
+            f"across {len(jsonl_files)} JSONL file(s) (stats={stats}). "
+            f"With `polishFormatSchema` wired, every non-trivial commit "
+            f"must produce a schema-valid row — a zero outcome indicates "
+            f"provider refusal or a crawler-wiring regression."
+        )
     finally:
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(repo, ignore_errors=True)
