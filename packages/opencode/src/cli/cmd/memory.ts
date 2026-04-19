@@ -305,16 +305,22 @@ const resolveLlmPolisher = Effect.gen(function* () {
     cfg.memories?.extractionModel?.trim() ||
     cfg.model?.trim()
   if (!spec) return NOOP_POLISHER
-  // The crawl polisher uses the SAME schema as extraction because both
-  // parse their response via the Phase-1 contract. Passing the schema
-  // turns the crawl LLM call into a deterministic SGR invocation.
-  const formatSchema = (
-    cfg.memories as { extractionFormatSchema?: Record<string, unknown> } | undefined
-  )?.extractionFormatSchema
+  // Polish schema precedence: the dedicated `polishFormatSchema` (flat
+  // `{keywords, problem, root_cause, solution}` shape matching
+  // `PolisherSextuple`) wins, falling back to `extractionFormatSchema`
+  // when callers want a single schema for both paths. When both are
+  // unset the bridge stays on the free-form text path.
+  const memCfg = cfg.memories as
+    | {
+        polishFormatSchema?: Record<string, unknown>
+        extractionFormatSchema?: Record<string, unknown>
+      }
+    | undefined
+  const formatSchema = memCfg?.polishFormatSchema ?? memCfg?.extractionFormatSchema
   const bridge = yield* makeMemoryBridge({
     modelSpec: spec,
     formatSchema,
-    schemaName: formatSchema ? "Phase1Extraction" : undefined,
+    schemaName: formatSchema ? "PolisherSextuple" : undefined,
   }).pipe(Effect.catchCause(() => Effect.succeed(undefined as undefined)))
   if (!bridge) return NOOP_POLISHER
   const polisher: CommitPolisher = (_commit: CommitRecord, prompt: string) =>

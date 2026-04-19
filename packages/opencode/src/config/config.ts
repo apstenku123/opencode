@@ -533,6 +533,12 @@ export const Info = z
           .describe(
             "Provider/model identifier used for the post-extraction refining pass. Falls back to the deterministic verbatim-signals path when unset.",
           ),
+        polishFormatSchema: z
+          .record(z.string(), z.unknown())
+          .optional()
+          .describe(
+            "Optional JSON-Schema (object) used to force the commit-crawler polisher through SGR `generateObject`. Shape should mirror the flat `PolisherSextuple` contract (`{keywords, problem, root_cause, solution}`). When unset, the polisher falls back to the extractionFormatSchema (or free-form JSON if that is also unset).",
+          ),
         querySynthModel: z
           .string()
           .optional()
