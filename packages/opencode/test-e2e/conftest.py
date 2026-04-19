@@ -107,12 +107,15 @@ def _e2e_session_lock(request) -> Iterator[None]:
     watchdog at 900s that ``SIGTERM``s the current process so the
     ``finally:`` branch below runs — thus releasing the lock even on a
     runaway session.
-    """
-    # Allow an escape hatch for CI environments that don't need the guard.
-    if os.environ.get("OPENCODE_E2E_SKIP_LOCK") == "1":
-        yield
-        return
 
+    NO escape hatch: every pytest invocation under this directory MUST
+    block on ``/tmp/opencode-e2e.lock``. Peer agents cannot safely share
+    the user's real Copilot OAuth tokens or the spawned ``opencode serve``
+    subprocesses, so concurrent pytest runs against this suite are
+    always wrong. If you need to bypass the lock for iteration, use
+    ``flock -n`` externally and inspect ``/tmp/opencode-e2e.lock.meta``
+    to see who is holding.
+    """
     # Collect suite names for the audit file. ``request.session.items`` is
     # not yet populated at the point this fixture runs (collection happens
     # after session start); fall back to the items actually passed on the

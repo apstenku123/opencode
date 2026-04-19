@@ -148,9 +148,6 @@ def test_session_lock_meta_file_is_written_by_parent_fixture() -> None:
     import json
 
     meta_path = Path("/tmp/opencode-e2e.lock.meta")
-    if os.environ.get("OPENCODE_E2E_SKIP_LOCK") == "1":
-        # Lock disabled in this environment; nothing to assert.
-        return
     assert meta_path.exists(), "meta file not written by autouse fixture"
     meta = json.loads(meta_path.read_text())
     assert meta.get("pid") == os.getpid(), (
