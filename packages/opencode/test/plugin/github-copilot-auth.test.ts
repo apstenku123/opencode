@@ -1464,10 +1464,34 @@ test("legacy credential parser maps github copilot credential json", () => {
 
 
 test("migration marker state roundtrips with empty default", async () => {
+  // Isolate from the real `$XDG_DATA_HOME/opencode/copilot-migration.json`
+  // that other Copilot tests in this process have touched by calling
+  // `CopilotAuthPlugin()` (its boot-time `migrate()` writes a marker with
+  // `skipped` populated when an auth store already has github-copilot
+  // entries, tripping the naive `toEqual({version: 1, keys: []})` check).
+  // Injecting `MigrationIO` that points at a non-existent path forces
+  // `readMigration` down its `orElseSucceed(empty)` branch, which is the
+  // behaviour this test actually documents.
+  const dir = await mkdtemp(path.join(tmpdir(), "opencode-copilot-marker-"))
   const out = await Effect.runPromise(
     Effect.gen(function* () {
-      const mark = yield* readMigration()
-      return mark
+      const fs = yield* AppFileSystem.Service
+      const src = {
+        legacy: `${dir}/legacy.json`,
+        apps: `${dir}/apps.json`,
+        oauth: `${dir}/oauth.json`,
+        forge: `${dir}/forge.json`,
+        codedash: `${dir}/codedash.json`,
+        macOSAppSupport: `${dir}/macas.json`,
+        marker: `${dir}/marker.json`,
+        read(path: string) {
+          return fs.readJson(path)
+        },
+        write(path: string, value: unknown) {
+          return fs.writeJson(path, value, 0o600)
+        },
+      }
+      return yield* readMigration(src)
     }).pipe(Effect.provide(Auth.defaultLayer), Effect.provide(AppFileSystem.defaultLayer)),
   )
   expect(out).toEqual({ version: 1, keys: [] })
