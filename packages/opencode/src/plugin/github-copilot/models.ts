@@ -368,7 +368,10 @@ export namespace CopilotModels {
 
     const result = { ...existing }
     const gated = retainForPlan(data.data, plan)
-    const remote = new Map(gated.filter((m) => m.model_picker_enabled).map((m) => [m.id, m] as const))
+    // Include all plan-allowed models, not just picker-enabled ones. Models
+    // like gpt-4.1 (test-only tier) are not in the Copilot UI picker but are
+    // valid dispatch targets for the pool-routing `test_allowed` set.
+    const remote = new Map(gated.map((m) => [m.id, m] as const))
 
     // prune existing models whose api.id isn't in the endpoint response
     for (const [key, model] of Object.entries(result)) {

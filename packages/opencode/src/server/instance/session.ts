@@ -1455,10 +1455,18 @@ export const SessionRoutes = lazy(() =>
         return stream(c, async (stream) => {
           const sessionID = c.req.valid("param").sessionID
           const body = c.req.valid("json")
-          const msg = await AppRuntime.runPromise(
-            SessionPrompt.Service.use((svc) => svc.prompt({ ...body, sessionID })),
-          )
-          void stream.write(JSON.stringify(msg))
+          try {
+            const msg = await AppRuntime.runPromise(
+              SessionPrompt.Service.use((svc) => svc.prompt({ ...body, sessionID })),
+            )
+            void stream.write(JSON.stringify(msg))
+          } catch (err) {
+            const payload =
+              err instanceof NamedError
+                ? err.toObject()
+                : { name: "Unknown", data: { message: err instanceof Error ? err.message : String(err) } }
+            void stream.write(JSON.stringify({ error: payload }))
+          }
         })
       },
     )
