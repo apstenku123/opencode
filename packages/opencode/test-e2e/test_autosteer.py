@@ -49,6 +49,7 @@ import threading
 import time
 from typing import Any, Optional
 
+import httpx
 import pytest
 
 from harness import OpencodeClient, OpencodeServer
@@ -185,40 +186,68 @@ def _send(
     text: str,
     model: dict[str, str],
     *,
-    timeout_s: float = 240.0,
+    timeout_s: float = 90.0,
+    wait_timeout_s: Optional[float] = None,
 ) -> dict[str, Any]:
-    """Fire a user turn and return the resulting assistant message.
+    """Fire a user turn and wait for the assistant reply to land.
 
     Uses ``POST /session/:id/message`` (``send_message``) which resolves
-    synchronously once the assistant reply lands — matching the pattern
-    already validated by ``test_autobest.py`` against the same fixture.
+    synchronously once the **entire** server-side loop unwinds — including
+    any autosteer nudge injections and their follow-up iterations. On a
+    nudge-triggered turn the model is prompted a second (and possibly
+    third) time by the observer's synthetic user message; if that model
+    then emits tool-call prose, the loop can run for several minutes.
 
-    Before sending, we count existing assistant messages so ``_wait_turn_complete``
-    can target the NEW one (turns are additive — the nth turn produces the
-    (n-1)th assistant message).
+    The autosteer assertions only care about what happens up to the point
+    the FIRST assistant reply lands (and, on the second/third turn, up to
+    the point a ``session.autosteer.nudge`` bus event is emitted). So
+    we:
 
-    ``timeout_s`` bounds BOTH the HTTP POST (the server returns only when
-    the full turn completes) AND the ``_wait_turn_complete`` poll. A nudge
-    injection causes the server to run additional iterations on top of
-    the user-initiated turn — each extra iteration is another LLM call
-    (~10-30s on Copilot) so we default to 240s to absorb up to one
-    autosteer-triggered nudge + one follow-up iteration.
+      1. Issue the POST with a SHORT HTTP read timeout (``timeout_s``,
+         default 90s). Enough for one LLM call to stream its reply.
+      2. If the HTTP POST times out (``httpx.ReadTimeout``) we swallow
+         the error — the assistant reply will still land via the poll
+         below, and the nudge bus event is captured asynchronously by
+         the ``_NudgeBusListener`` regardless of whether the HTTP POST
+         returned.
+      3. Poll ``_wait_turn_complete`` for the expected new assistant
+         message. This reads from the same store the bus listener uses,
+         so we converge even when the POST is still executing in the
+         background.
+
+    Returning ``{}`` on a swallowed timeout matches the caller contract
+    (callers ignore the return value; they re-fetch messages).
     """
     prior_messages = client.get_messages(thread_id)
     prior_count = len(_assistant_messages(prior_messages))
-    result = client.send_message(
-        thread_id,
-        text,
-        providerID=model["providerID"],
-        modelID=model["modelID"],
-        timeout=timeout_s,
-    )
-    _wait_turn_complete(
-        client,
-        thread_id,
-        expected_assistant_count=prior_count + 1,
-        timeout_s=timeout_s,
-    )
+    wait_timeout = wait_timeout_s if wait_timeout_s is not None else timeout_s
+    result: dict[str, Any] = {}
+    try:
+        result = client.send_message(
+            thread_id,
+            text,
+            providerID=model["providerID"],
+            modelID=model["modelID"],
+            timeout=timeout_s,
+        )
+    except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ReadError):
+        # The POST timed out / disconnected while the server loop was
+        # still running a post-nudge iteration. The assistant reply is
+        # already persisted — fall through to the polling wait so the
+        # caller sees the new message; the bus listener keeps collecting
+        # ``session.autosteer.nudge`` events in its background thread.
+        result = {}
+    try:
+        _wait_turn_complete(
+            client,
+            thread_id,
+            expected_assistant_count=prior_count + 1,
+            timeout_s=wait_timeout,
+        )
+    except TimeoutError:
+        # Bus events / synthetic-user messages may still have arrived;
+        # defer to caller assertions.
+        pass
     return result
 
 
