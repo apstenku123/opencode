@@ -7,6 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { Effect } from "effect"
 import { CopilotModels } from "./models"
 import {
+  ACQUIRE_TIMEOUT_MS,
   cooldown,
   eligible,
   feed,
@@ -19,8 +20,16 @@ import {
   type Runtime,
 } from "./runtime"
 import { AccountPool, type Lease } from "./account-pool"
+import { shouldPreferSecondarySubagentAccounts } from "./model-tiers"
 import { openRateStore } from "./account-pool-sqlite"
 import { CopilotRateLimiter, copilotRateLimiterConfig, type Release as RateLimiterRelease } from "./rate-limiter"
+import {
+  DEFAULT_HTTP_RETRY_RACE_CONFIG,
+  HttpAttemptBus,
+  httpRetryRaceConfig,
+  raceFetch,
+  type HttpRetryRaceConfig,
+} from "./retry-race"
 import { CopilotStats } from "./stats"
 import { classifyPlan, fetchQuota } from "./quota"
 import { MessageV2 } from "@/session/message-v2"
@@ -912,6 +921,15 @@ export async function dispatch(input: {
   isVision: boolean
   isAgent: boolean
   modelId: string
+  /**
+   * Optional parent thread model id. When the caller is a spawned
+   * sub-agent this pairs with `modelId` to drive the model-tier-aware
+   * subagent routing decision (mirrors Rust
+   * `thread_manager_fork.rs::resolve_account_lease`). When omitted the
+   * dispatcher falls back to the `isAgent` boolean for backward
+   * compatibility.
+   */
+  parentModelId?: string
 }): Promise<Response> {
   const info = await input.getAuth()
   if (info.type !== "oauth") return fetch(input.request, input.init)
@@ -960,6 +978,7 @@ export async function dispatch(input: {
     providerID: input.providerID,
     key: live.key,
     isAgent: input.isAgent,
+    parentModelId: input.parentModelId,
   })
   // `leaseRef` is updated in-place when an atomic `reassign` happens on 429;
   // the closure below reads from it so `release()` frees the *current* lease.
@@ -1173,12 +1192,27 @@ async function reserveSlot(input: {
   providerID?: string
   key: string
   isAgent: boolean
+  /**
+   * Parent thread's model id, when the current dispatch is a spawned
+   * sub-agent.  When provided, combines with {@link shouldPreferSecondarySubagentAccounts}
+   * to mirror Rust's model-tier-aware subagent routing decision
+   * (`thread_manager_fork.rs::resolve_account_lease`): only route spawns
+   * to backup accounts when the requested model is {@link ModelTier.Secondary}
+   * *and* differs from the parent.  When omitted the dispatcher falls back
+   * to the boolean `isAgent` signal derived from the message payload.
+   */
+  parentModelId?: string
 }): Promise<{ lease: Lease | undefined; fallbackRelease?: () => void }> {
   if (input.pool) {
+    // Mirror Rust `should_prefer_secondary_subagent_accounts` when we have
+    // both signals; otherwise fall back to the message-payload-derived
+    // `isAgent` boolean so legacy callers keep the old routing behaviour.
+    const tierAware = shouldPreferSecondarySubagentAccounts(input.modelId, input.parentModelId)
+    const preferSecondary = input.parentModelId ? tierAware : input.isAgent
     try {
-      const lease = input.isAgent
-        ? await input.pool.acquirePreferSecondary(input.key, { timeoutMs: 5 * 60 * 1000 })
-        : await input.pool.acquire(input.key, { timeoutMs: 5 * 60 * 1000 })
+      const lease = preferSecondary
+        ? await input.pool.acquirePreferSecondary(input.key, { timeoutMs: ACQUIRE_TIMEOUT_MS })
+        : await input.pool.acquire(input.key, { timeoutMs: ACQUIRE_TIMEOUT_MS })
       return { lease }
     } catch {
       // fall through to the legacy reservation path so we never deadlock the
