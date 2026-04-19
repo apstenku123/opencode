@@ -796,6 +796,50 @@ export function poolAllowedTestModels(_pool: PoolId): string[] {
   return ["gpt-4.1", "gpt-5-mini-xhigh"]
 }
 
+/**
+ * Shared budget for the parallel quota + `/models` fan-out.  Mirrors the Rust
+ * CLI's `discover_copilot_accounts` + `models_manager::fetch_all_accounts`
+ * deadline. With `Promise.allSettled` every account probe runs concurrently,
+ * so the total wall-clock time for N accounts is `max(per-account)` rather
+ * than `sum(per-account)` — lifting this ceiling from the previous 8s keeps
+ * slow upstreams (edu + enterprise pool, 11+ accounts) inside budget while
+ * still guarding against a hung single connection blocking the CLI.
+ */
+export const PROBE_DEADLINE_MS = 15_000
+
+/**
+ * Race a probe promise against the shared deadline. On timeout the returned
+ * promise resolves with `{ timedOut: true }` — the caller records a probe
+ * error for that account rather than hanging on a dangling request.
+ */
+function withDeadline<T>(run: () => Promise<T>, deadlineMs: number): Promise<{ ok: true; value: T } | { ok: false; timedOut: true }> {
+  return new Promise((resolve) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      resolve({ ok: false, timedOut: true })
+    }, deadlineMs)
+    run().then(
+      (value) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve({ ok: true, value })
+      },
+      (_err) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        // Surface the rejection to the caller as a normal Promise rejection
+        // (propagated via a rejected inner promise) so the outer try/catch
+        // path stays untouched.
+        resolve(Promise.reject(_err) as never)
+      },
+    )
+  })
+}
+
 export async function loadAccountStatuses() {
   const DBG = process.env.OPENCODE_DEBUG_PROVIDERS === "1"
   const log = (m: string) => DBG && process.stderr.write(`[providers] ${m}\n`)
@@ -809,8 +853,37 @@ export async function loadAccountStatuses() {
   let state = await readConnections()
   log(`connections loaded (${Object.keys(state.connections).length})`)
   const newlyDeactivated = new Set<string>()
-  const items = await Promise.all(
-    accounts.map(async ([key, info]) => {
+  const probeEnabled = process.env.OPENCODE_PROBE_DISCOVERY !== "0"
+  const { discover } = await import("../../plugin/github-copilot/connections")
+  const { base, proxyHeaders } = await import("../../plugin/github-copilot/copilot")
+  // Unified per-account probe task: `/copilot_internal/user` then `/models`
+  // (serial within one task because `/models` needs the `api_base_url` from
+  // `/copilot_internal/user`). ALL accounts run concurrently via
+  // `Promise.allSettled` under one shared PROBE_DEADLINE_MS ceiling per
+  // upstream call. Mirrors codex_git's
+  // `fetch_account_model_catalog_with_discovery_via_proxy` fanned out over
+  // `discover_copilot_accounts`. Total wall-clock is
+  // `max(per-account(quota + /models))` instead of the previous two-stage
+  // layout where the `/models` fan-out waited for the slowest quota probe.
+  type ProbeUpdate = {
+    key: string
+    ids: string[] | null
+    err?: string
+    apiBase: string
+    plan?: string
+    login?: string
+  }
+  type FannedOutResult = {
+    key: string
+    info: (typeof accounts)[number][1]
+    proxy: { url?: string; token?: string; envelope?: boolean } | undefined
+    quota: Awaited<ReturnType<typeof fetchQuota>> | undefined
+    quotaError?: string
+    probeUpdate?: ProbeUpdate
+  }
+  const started = Date.now()
+  const settledResults = await Promise.allSettled(
+    accounts.map(async ([key, info]): Promise<FannedOutResult> => {
       const proxy = state.connections[key]?.proxyUrl
         ? {
             url: state.connections[key]?.proxyUrl,
@@ -818,45 +891,139 @@ export async function loadAccountStatuses() {
             envelope: state.connections[key]?.envelope,
           }
         : undefined
-      try {
-        log(`fetchQuota ${key} start`)
-        const quota = await fetchQuota(info.refresh || "", info.enterpriseUrl, proxy)
-        log(`fetchQuota ${key} ok`)
-        return {
-          info,
-          quota,
-          proxy,
-          status: accountStatus({ key, state, quota }),
-          premium: quota.premium ? formatQuotaBar(quota.premium, quota.resetDate) : "no quota info available",
-          ghe: info.enterpriseUrl ?? null,
-        }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
+      log(`fetchQuota ${key} start`)
+      const quotaOutcome = await withDeadline(
+        () => fetchQuota(info.refresh || "", info.enterpriseUrl, proxy),
+        PROBE_DEADLINE_MS,
+      ).catch((err) => ({ ok: false as const, err: err instanceof Error ? err.message : String(err) }))
+      if (!("ok" in quotaOutcome) || quotaOutcome.ok !== true) {
+        const msg =
+          "err" in quotaOutcome
+            ? quotaOutcome.err
+            : "timedOut" in quotaOutcome
+              ? `Probe deadline ${PROBE_DEADLINE_MS}ms exceeded`
+              : "unknown probe error"
         log(`fetchQuota ${key} err: ${msg}`)
-        // Detect suspended/deactivated accounts (401/403 from upstream).
-        // Mark persistently so routing skips them and a subsequent
-        // `providers accounts` display filters them out by default.
-        const match = msg.match(/Failed to fetch quota: (\d{3})/)
-        const statusCode = match ? Number(match[1]) : undefined
-        if (statusCode === 401 || statusCode === 403) {
-          newlyDeactivated.add(key)
-        }
+        return { key, info, proxy, quota: undefined, quotaError: msg }
+      }
+      const quota = quotaOutcome.value
+      log(`fetchQuota ${key} ok`)
+      // Skip discovery when disabled, when already discovered successfully
+      // (dedup), or when there's no refresh token to use.
+      if (!probeEnabled) return { key, info, proxy, quota }
+      const conn = state.connections[key]
+      if (conn?.discovery?.at && conn.discovery.ok !== false) {
+        log(`probe: ${key} already discovered, skip`)
+        return { key, info, proxy, quota }
+      }
+      const refresh = info.refresh || ""
+      if (!refresh) {
+        log(`probe: ${key} no refresh token, skip`)
+        return { key, info, proxy, quota }
+      }
+      const apiBase = quota.api ?? base(info.enterpriseUrl)
+      log(`probe: ${key} GET ${apiBase}/models start`)
+      const probeOutcome = await withDeadline(
+        () =>
+          CopilotModels.get(
+            apiBase,
+            {
+              Authorization: `Bearer ${refresh}`,
+              "User-Agent": `opencode/providers-cli`,
+              ...proxyHeaders(proxy?.token),
+            },
+            {},
+            proxy?.url,
+            quota.plan,
+            { token: proxy?.token, envelope: proxy?.envelope },
+          ),
+        PROBE_DEADLINE_MS,
+      ).catch((err) => ({ ok: false as const, err: err instanceof Error ? err.message : String(err) }))
+      if ("ok" in probeOutcome && probeOutcome.ok === true) {
+        const ids = Object.values(probeOutcome.value).map((m) => m.api.id)
+        log(`probe: ${key} ok, ${ids.length} models`)
         return {
+          key,
           info,
-          quota: undefined,
           proxy,
-          status: accountStatus({ key, state, quotaError: msg }),
-          premium: undefined,
-          ghe: info.enterpriseUrl ?? null,
+          quota,
+          probeUpdate: { key, ids, apiBase, plan: quota.plan, login: quota.login },
         }
+      }
+      const probeMsg =
+        "err" in probeOutcome
+          ? probeOutcome.err
+          : "timedOut" in probeOutcome
+            ? `Probe deadline ${PROBE_DEADLINE_MS}ms exceeded`
+            : "unknown probe error"
+      log(`probe: ${key} err: ${probeMsg}`)
+      return {
+        key,
+        info,
+        proxy,
+        quota,
+        probeUpdate: { key, ids: null, err: probeMsg, apiBase, plan: quota.plan, login: quota.login },
       }
     }),
   )
+  log(`fan-out settled in ${Date.now() - started}ms`)
+  const probeUpdates: ProbeUpdate[] = []
+  const items = settledResults.map((settled, idx) => {
+    const [key, info] = accounts[idx]!
+    if (settled.status === "rejected") {
+      // Should not happen — the inner promise swallows errors into the
+      // result shape. Guard anyway so a surprise rejection doesn't collapse
+      // the whole fan-out.
+      const msg = settled.reason instanceof Error ? settled.reason.message : String(settled.reason)
+      return {
+        info,
+        quota: undefined,
+        proxy: undefined,
+        status: accountStatus({ key, state, quotaError: msg }),
+        premium: undefined,
+        ghe: info.enterpriseUrl ?? null,
+      }
+    }
+    const r = settled.value
+    if (r.probeUpdate) probeUpdates.push(r.probeUpdate)
+    if (r.quota) {
+      return {
+        info,
+        quota: r.quota,
+        proxy: r.proxy,
+        status: accountStatus({ key, state, quota: r.quota }),
+        premium: r.quota.premium ? formatQuotaBar(r.quota.premium, r.quota.resetDate) : "no quota info available",
+        ghe: info.enterpriseUrl ?? null,
+      }
+    }
+    const msg = r.quotaError ?? "unknown quota error"
+    const match = msg.match(/Failed to fetch quota: (\d{3})/)
+    const statusCode = match ? Number(match[1]) : undefined
+    if (statusCode === 401 || statusCode === 403) newlyDeactivated.add(key)
+    return {
+      info,
+      quota: undefined,
+      proxy: r.proxy,
+      status: accountStatus({ key, state, quotaError: msg }),
+      premium: undefined,
+      ghe: info.enterpriseUrl ?? null,
+    }
+  })
   log(`items resolved (${items.length})`)
-  // Persist any 401/403-triggered deactivations + surface them in status
-  // so the pool routing layer (connections.ts::next) skips them on the
-  // next dispatch. Suspended/revoked accounts stay on disk until the user
-  // re-authenticates via `providers login`.
+  // Apply probe updates into the in-memory state before persisting.
+  for (const u of probeUpdates) {
+    state = discover(state, u.key, {
+      models: u.ids ?? [],
+      api: u.apiBase,
+      plan: u.plan,
+      login: u.login,
+      ok: !u.err,
+      err: u.err,
+    })
+  }
+  // Deactivation pass: persist any 401/403-triggered deactivations + surface
+  // them in status so the pool routing layer (connections.ts::next) skips
+  // them on the next dispatch.
   if (newlyDeactivated.size > 0) {
     const { markDeactivated } = await import("../../plugin/github-copilot/connections")
     for (const key of newlyDeactivated) {
@@ -867,89 +1034,34 @@ export async function loadAccountStatuses() {
         hit.status.error = hit.status.error ?? "account suspended / token revoked (401/403)"
       }
     }
-    try {
-      await Bun.write(connectionFile, JSON.stringify(state, null, 2))
-    } catch {
-      // non-fatal
-    }
     log(`marked deactivated: ${[...newlyDeactivated].join(", ")}`)
   }
-  // Lazy discovery probe: populate Conn.discovery for accounts that haven't
-  // yet been routed through a real provider dispatch. Default on; disable via
-  // OPENCODE_PROBE_DISCOVERY=0. Hard-capped at 8 s so a hanging upstream can
-  // never block the CLI — the display falls back to "Discovery: unknown".
-  const probeEnabled = process.env.OPENCODE_PROBE_DISCOVERY !== "0"
-  if (probeEnabled) {
-    log("probe: discovery start")
-    const { discover } = await import("../../plugin/github-copilot/connections")
-    const { base, proxyHeaders } = await import("../../plugin/github-copilot/copilot")
-    const updates: Array<[string, string[] | null, string | undefined, string, string | undefined, string | undefined]> = []
-    const probeDeadline = new Promise<void>((resolve) => setTimeout(resolve, 8_000))
-    const probePromise = Promise.all(
-      items.map(async (item) => {
-        const key = item.status.key
-        const conn = state.connections[key]
-        if (conn?.discovery?.at && conn.discovery.ok !== false) {
-          log(`probe: ${key} already discovered, skip`)
-          return
-        }
-        if (!item.quota) {
-          log(`probe: ${key} no quota, skip`)
-          return
-        }
-        const refresh = item.info.refresh || ""
-        if (!refresh) {
-          log(`probe: ${key} no refresh token, skip`)
-          return
-        }
-        const apiBase = item.quota.api ?? base(item.info.enterpriseUrl)
-        try {
-          log(`probe: ${key} GET ${apiBase}/models start`)
-          const models = await CopilotModels.get(
-            apiBase,
-            {
-              Authorization: `Bearer ${refresh}`,
-              "User-Agent": `opencode/providers-cli`,
-              ...proxyHeaders(item.proxy?.token),
-            },
-            {},
-            item.proxy?.url,
-            item.quota.plan,
-            { token: item.proxy?.token, envelope: item.proxy?.envelope },
-          )
-          const ids = Object.values(models).map((m) => m.api.id)
-          log(`probe: ${key} ok, ${ids.length} models`)
-          updates.push([key, ids, undefined, apiBase, item.quota.plan, item.quota.login])
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          log(`probe: ${key} err: ${msg}`)
-          updates.push([key, null, msg, apiBase, item.quota.plan, item.quota.login])
-        }
-      }),
-    )
-    await Promise.race([probePromise, probeDeadline])
-    for (const [key, ids, err, apiBase, plan, login] of updates) {
-      state = discover(state, key, { models: ids ?? [], api: apiBase, plan, login, ok: !err, err })
+  // Single batched write for both deactivation + probe updates. Mirrors
+  // Rust's one-writer-at-end pattern instead of per-account writes racing
+  // on the same file.
+  const needsWrite = newlyDeactivated.size > 0 || probeUpdates.length > 0
+  if (needsWrite) {
+    try {
+      log("persist: writing copilot-connections.json")
+      await Bun.write(connectionFile, JSON.stringify(state, null, 2))
+      log("persist: ok")
+    } catch (err) {
+      log(`persist: err: ${err instanceof Error ? err.message : String(err)}`)
     }
-    if (updates.length > 0) {
-      try {
-        log("probe: persisting connections.json")
-        await Bun.write(connectionFile, JSON.stringify(state, null, 2))
-        log("probe: persisted")
-      } catch (err) {
-        log(`probe: persist err: ${err instanceof Error ? err.message : String(err)}`)
-      }
-      for (const item of items) {
-        item.status = accountStatus({
-          key: item.status.key,
-          state,
-          quota: item.quota,
-          quotaError: item.status.error && !item.quota ? item.status.error : undefined,
-        })
-      }
-    }
-    log("probe: done")
   }
+  // Re-render each account status from the freshly-updated state so
+  // downstream consumers see discovery/login/plan metadata.
+  if (probeUpdates.length > 0) {
+    for (const item of items) {
+      item.status = accountStatus({
+        key: item.status.key,
+        state,
+        quota: item.quota,
+        quotaError: item.status.error && !item.quota ? item.status.error : undefined,
+      })
+    }
+  }
+  log("loadAccountStatuses: done")
   return { accounts, state, items }
 }
 
@@ -2448,6 +2560,12 @@ export const COPILOT_ENV_VARS: ReadonlyArray<{
     name: "OPENCODE_PROBE_DISCOVERY",
     description:
       "Set to `0` to disable the lazy /models discovery probe that runs on first dispatch for each account. Default: enabled.",
+    defaultValue: "1",
+  },
+  {
+    name: "OPENCODE_EAGER_COPILOT_DISCOVERY",
+    description:
+      "When `1` (default), `CopilotAuthPlugin` boot kicks off a parallel quota + /models fan-out (Promise.allSettled across all Copilot accounts) so the first `/turn/start` hits warmed discovery caches. Set to `0` to defer discovery until a request path triggers it (mirrors the pre-fan-out lazy behavior).",
     defaultValue: "1",
   },
   {

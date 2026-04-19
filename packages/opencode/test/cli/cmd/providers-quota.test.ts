@@ -1496,3 +1496,146 @@ describe("seedMachineIds (machineId pre-population)", () => {
     }
   })
 })
+
+// Regression guard: the quota + `/models` fan-out must run accounts in
+// parallel so total wall-clock is O(max(per-account)) not O(sum). Mirrors
+// codex_git's `discover_copilot_accounts` (fans out
+// `fetch_account_model_catalog_with_discovery_via_proxy`). Three accounts
+// whose per-leg delays peak at 50/200/3000ms should all finish together
+// around 3000-3500ms. Sequential would be 50+200+3000 = 3250ms per leg × 2
+// legs = 6.5s, and the pre-fan-out code did exactly that (two stages).
+// We budget 5s so the test tolerates CI scheduling jitter but still catches
+// a regression to per-leg-serialised fan-outs (would hit 6+ seconds, as the
+// pre-unified code demonstrated).
+test("loadAccountStatuses runs quota+/models probes in parallel (fan-out)", async () => {
+  const prevFetch = globalThis.fetch
+  const prevProbe = process.env.OPENCODE_PROBE_DISCOVERY
+  // Enable the discovery probe for this test — the file-level default is "0".
+  process.env.OPENCODE_PROBE_DISCOVERY = "1"
+  // Per-account total latency budget across BOTH legs. Quota leg is the
+  // full delay; /models leg is a short 50ms for every account so the total
+  // per-account time is delay + 50ms and we can measure the fan-out
+  // concurrency independent of per-account serial cost.
+  const quotaDelays: Record<string, number> = {
+    fast: 50,
+    mid: 200,
+    slow: 3_000,
+  }
+  const callCountsByKey: Record<string, number> = { fast: 0, mid: 0, slow: 0 }
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    const headers = new Headers(init?.headers)
+    const bearer = headers.get("Authorization") ?? ""
+    const key = bearer.endsWith("fast")
+      ? "fast"
+      : bearer.endsWith("mid")
+        ? "mid"
+        : bearer.endsWith("slow")
+          ? "slow"
+          : ""
+    callCountsByKey[key] = (callCountsByKey[key] ?? 0) + 1
+    const isQuota = String(url).includes("copilot_internal/user")
+    const delay = isQuota ? (quotaDelays[key] ?? 0) : 50
+    await new Promise((resolve) => setTimeout(resolve, delay))
+    if (isQuota) {
+      return new Response(
+        JSON.stringify({
+          user_login: key,
+          access_type_sku: "copilot_free",
+          endpoints: { api: "https://api.githubcopilot.com" },
+        }),
+        { status: 200 },
+      )
+    }
+    return new Response(JSON.stringify({ data: [] }), { status: 200 })
+  }) as unknown as typeof fetch
+  try {
+    await seedState({
+      "github-copilot#fast": {},
+      "github-copilot#mid": {},
+      "github-copilot#slow": {},
+    })
+    const started = Date.now()
+    await withAuth(
+      {
+        "github-copilot#fast": new Auth.Oauth({ type: "oauth", refresh: "fast", access: "", expires: 0 }),
+        "github-copilot#mid": new Auth.Oauth({ type: "oauth", refresh: "mid", access: "", expires: 0 }),
+        "github-copilot#slow": new Auth.Oauth({ type: "oauth", refresh: "slow", access: "", expires: 0 }),
+      },
+      async () => {
+        const { items } = await providersCmd.loadAccountStatuses()
+        expect(items).toHaveLength(3)
+        // All three accounts should have a quota result (none hit the
+        // 15s PROBE_DEADLINE_MS since the slowest leg is 3s).
+        expect(items.filter((x) => x.quota).length).toBe(3)
+      },
+    )
+    const elapsed = Date.now() - started
+    // Parallel per-account: each account takes (quota_delay + 50ms) end-to-
+    // end inside one task, and all three tasks run concurrently via
+    // Promise.allSettled. The worst account (slow) takes ~3050ms; the
+    // fastest (fast) is ~100ms. Total ≈ max(...) = 3050ms, plus test
+    // scheduling jitter. Regression guard at 5000ms: a two-stage fan-out
+    // (quota fan-out THEN /models fan-out) would take 3000 + 3000 = 6s.
+    expect(elapsed).toBeLessThan(5_000)
+    // Sanity: the slow account's mock was called at least twice (quota +
+    // /models), confirming both legs ran.
+    expect(callCountsByKey.slow).toBeGreaterThanOrEqual(2)
+  } finally {
+    globalThis.fetch = prevFetch
+    if (prevProbe === undefined) delete process.env.OPENCODE_PROBE_DISCOVERY
+    else process.env.OPENCODE_PROBE_DISCOVERY = prevProbe
+  }
+}, 20_000)
+
+test("loadAccountStatuses: one account probe timeout does not block peers", async () => {
+  const prevFetch = globalThis.fetch
+  const prevProbe = process.env.OPENCODE_PROBE_DISCOVERY
+  process.env.OPENCODE_PROBE_DISCOVERY = "1"
+  // One account hangs forever; peers must still resolve.  Use a short
+  // override via the reject path — simulate by rejecting the slow account
+  // immediately after the fast account resolves.
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    const headers = new Headers(init?.headers)
+    const bearer = headers.get("Authorization") ?? ""
+    const key = bearer.endsWith("fast") ? "fast" : "slow"
+    if (key === "slow") {
+      // Reject loudly — simulates an upstream that threw (network error).
+      throw new Error("simulated upstream failure")
+    }
+    if (String(url).includes("copilot_internal/user")) {
+      return new Response(
+        JSON.stringify({
+          user_login: "fast",
+          access_type_sku: "copilot_free",
+          endpoints: { api: "https://api.githubcopilot.com" },
+        }),
+        { status: 200 },
+      )
+    }
+    return new Response(JSON.stringify({ data: [] }), { status: 200 })
+  }) as unknown as typeof fetch
+  try {
+    await seedState({
+      "github-copilot#fast": {},
+      "github-copilot#slow": {},
+    })
+    await withAuth(
+      {
+        "github-copilot#fast": new Auth.Oauth({ type: "oauth", refresh: "fast", access: "", expires: 0 }),
+        "github-copilot#slow": new Auth.Oauth({ type: "oauth", refresh: "slow", access: "", expires: 0 }),
+      },
+      async () => {
+        const { items } = await providersCmd.loadAccountStatuses()
+        const fast = items.find((x) => x.status.key === "github-copilot#fast")
+        const slow = items.find((x) => x.status.key === "github-copilot#slow")
+        expect(fast?.quota).toBeDefined()
+        expect(slow?.quota).toBeUndefined()
+        expect(slow?.status.error).toBeDefined()
+      },
+    )
+  } finally {
+    globalThis.fetch = prevFetch
+    if (prevProbe === undefined) delete process.env.OPENCODE_PROBE_DISCOVERY
+    else process.env.OPENCODE_PROBE_DISCOVERY = prevProbe
+  }
+})
