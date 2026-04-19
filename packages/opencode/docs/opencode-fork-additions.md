@@ -23,6 +23,7 @@ All paths below are relative to the repository root unless an absolute path is g
 12. [Testing surface](#testing-surface)
 13. [Known technical debt](#known-technical-debt)
 14. [Migration notes](#migration-notes)
+15. [Round 8 — Copilot auth discovery, pool routing, envelope proxy, providers CLI](#round-8--copilot-auth-discovery-pool-routing-envelope-proxy-providers-cli)
 
 ---
 
@@ -1129,5 +1130,522 @@ Auto-updater queries `https://api.github.com/repos/apstenku123/opencode/releases
 | **R7 (hook integration + connector runtime + replay bridge)** | **3258** |
 
 Pre-push hook (`bun turbo typecheck`) passes across all 13 packages without `--no-verify` at HEAD.
+
+---
+
+## Round 8 — Copilot auth discovery, pool routing, envelope proxy, providers CLI
+
+Round 8 expands the GitHub Copilot surface to cover the full codex_git feature parity
+around multi-source credential discovery, explicit edu/prod pool routing, the
+Rust-compatible `POST {proxy}/fetch` GCP envelope protocol, and a richly instrumented
+`providers accounts` display. All work lives under
+`packages/opencode/src/plugin/github-copilot/` and `packages/opencode/src/cli/cmd/providers.ts`;
+no server-instance Copilot routes ship in this round (those are being added under a
+parallel effort).
+
+### 8.1 Multi-source auth discovery
+
+On every `allAuth()` invocation (CLI boot, `providers login`, `providers accounts`,
+`providers quota`) the plugin drains a cascade of on-disk credential stores via
+`CopilotAuth.migrate()` (`packages/opencode/src/plugin/github-copilot/auth.ts:282`).
+Credentials are deduped by final account `key` *and* by raw `refresh` token so the same
+OAuth token can never register under two slot names.
+
+| Source | Path | Import gate | Parser |
+| ------ | ---- | ----------- | ------ |
+| Legacy CLI credential | `~/.copilot/auth/credential.json` | always | `legacy()` (flat `{token, login, proxy_url?, proxy_token?}` or keyed `{host: {...}}`) |
+| macOS Application Support store | `~/Library/Application Support/opencode/auth.json` | always (macOS) | `opencodeNative()` — keyed `{"github-copilot#edu-N": {type, refresh, access, proxy_url?, ...}}` |
+| VS Code / Neovim multiplexer | `~/.config/github-copilot/apps.json` | `OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1` | `apps()` — each `"<host>:<githubAppId>"` slot becomes `github-copilot#app-<slug>` |
+| Copilot CLI oauth store | `~/.config/github-copilot/oauth.json` | `OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1` | `oauth()` — each `{host: [{accessToken, account}]}` session becomes `github-copilot#oauth-<slug>` |
+| Forge CLI credentials | `~/forge/.credentials.json` | `OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1` | `forge()` — `id: "github_copilot"` entries become `github-copilot#forge-<slug>` |
+| Codedash profile | `~/.codedash/github-profile.json` | `OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1` | `codedash()` — single `{username, token}` becomes `github-copilot#codedash-<user>` |
+| Env-provided test tokens | `OPENCODE_TEST_COPILOT_TOKENS` env var | always | `testTokensFromEnv()` — comma-separated tokens become `github-copilot#edu-N` slots |
+| Config test accounts | `[copilot.testAccounts]` section | always | `testAccountsFromConfig()` — see 8.6 |
+
+Cascade precedence: macOS Application Support wins over `~/.copilot/auth/credential.json`
+for the same key because primary sources are listed in that order in `allFound`
+(`auth.ts:301-304`). All six on-disk sources plus env + config tokens are merged, then
+filtered to drop any key that already exists in `Auth.Service.all()` — re-runs are
+idempotent and no duplicate will be imported.
+
+Path constants live in `packages/opencode/src/plugin/github-copilot/paths.ts`. The
+migration marker is recorded at `~/.local/share/opencode/copilot-migration.json`
+(`migrationFile`) with `{version, migratedAt, source, keys, skipped}`; subsequent
+boots respect this marker.
+
+**Proxy imports.** When a parsed credential carries `proxy_url` (legacy /
+opencode-native) or `proxy_token` the value is stashed in the transient
+`proxyImports` map (`auth.ts:280`). Call sites (`providers.ts:85-101`) drain this into
+`copilot-connections.json`, forcing `envelope: true` for those accounts — the Rust CLI
+always envelopes through the GCP fetch-proxy.
+
+**Configure.** No opencode.json key gates the legacy migration — it always runs.
+To enable import from VS Code / Forge / Codedash stores:
+
+```bash
+# Opt in to secondary IDE / tool stores
+export OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1
+
+# Supply test tokens inline (comma-separated)
+export OPENCODE_TEST_COPILOT_TOKENS='ghu_test1,ghu_test2,ghu_test3'
+
+# Allow test accounts (otherwise `github-copilot#edu-*` keys are
+# filtered out of production routing)
+export OPENCODE_ALLOW_TEST_ACCOUNTS=1
+```
+
+### 8.2 Pool routing (edu vs prod)
+
+`packages/opencode/src/plugin/github-copilot/pool-routing.ts` introduces an explicit
+account-pool policy. Two pools:
+
+- `edu` — free / unlimited / individual / `github-copilot#edu-*` test slots.
+- `prod` — pro / enterprise / business / team.
+
+Model → pool mapping is explicit rather than substring-matched. `DEFAULT_POOL_RULES`
+(`pool-routing.ts:53`):
+
+```ts
+{
+  "codex-5.3":              "edu",
+  "codex-5.3-xhigh":        "edu",
+  "gpt-5.4":                "prod",
+  "gpt-5.4-xhigh":          "prod",
+  "claude-4.7-opus-high":   "prod",
+  "claude-sonnet-4.7":      "prod",
+}
+```
+
+`gateModel(modelId, cfg)` (`pool-routing.ts:111`) performs two checks:
+
+1. `xhighOnly` gate — for families listed in `DEFAULT_XHIGH_ONLY`
+   (default `["gpt-5.4", "codex-5.3"]`), only the `-xhigh` variant is permitted.
+   Non-xhigh requests return `{allow: false, reason: "only xhigh variants permitted
+   for <family>"}`.
+2. Pool lookup — `poolFor(modelId, cfg)` returns `"edu" | "prod" | undefined`.
+   When undefined the dispatcher falls back to legacy `policyPlan` substring
+   behaviour so `gpt-5-enterprise` / `gpt-4.1-edu` aliases still work.
+
+`poolForAccount({key, plan, cfg})` (`pool-routing.ts:134`) classifies a given account:
+
+- Explicit `cfg.pools.edu` / `cfg.pools.prod` membership wins.
+- Keys matching `github-copilot#edu-*` always classify as `edu` regardless of plan
+  (mirrors codex_git `connections.rs:217`).
+- Plan `edu` / `free` / `individual` → `edu` pool.
+- Plan `enterprise` / `pro` / `business` / `team` → `prod` pool.
+- Otherwise `undefined`.
+
+`copilot.ts::dispatch()` resolves the pool via `getPoolRoutingConfig()` (module-level
+seed set by `CopilotAuthPlugin` boot, `copilot.ts:60-68`) and narrows the routing pool
+via `preferPlan` + `preferPolicy`.
+
+#### `[copilot.poolRouting]` config section
+
+```jsonc
+// ~/.config/opencode/opencode.json
+{
+  "copilot": {
+    "poolRouting": {
+      // Pin specific account keys to a pool, overriding plan-derived defaults.
+      "pools": {
+        "edu":  ["github-copilot#codedash-alice"],
+        "prod": ["github-copilot#work-team"]
+      },
+      // Extend or override the default model → pool map.
+      "models": {
+        "gpt-5.4-xhigh":        "edu",   // pilot an enterprise model on edu accounts
+        "custom-preview-model": "prod"
+      },
+      // Only accept -xhigh variants for these family prefixes.
+      "xhighOnly": ["gpt-5.4", "codex-5.3"]
+    }
+  }
+}
+```
+
+Schema defined in `packages/opencode/src/config/config.ts:255-285`.
+
+#### `[copilot.testAccounts]` config section
+
+Mirrors codex_git's `[test_accounts]` TOML section (`codex-rs/core/src/config/types.rs::TestAccountsToml`).
+Synthesises `github-copilot#edu-<slug>` slots from config rather than env.
+
+```jsonc
+{
+  "copilot": {
+    "testAccounts": {
+      "tokens":          ["ghu_xxx1", "ghu_xxx2"],
+      "labels":          ["pilot-a", "pilot-b"],
+      "supportedModels": ["gpt-4.1", "gpt-5-mini-xhigh"],
+      "proxyUrls": [
+        "https://us-central1-project.run.app",
+        "https://us-east1-project.run.app"
+      ]
+    }
+  }
+}
+```
+
+`testAccountsFromConfig(section)` is resolved in
+`packages/opencode/src/cli/cmd/providers.ts:60-84` from
+`Config.Service.use((c) => c.getGlobal())` — note `getGlobal()` skips project-level
+`opencode.json` overlays, so test tokens must live in `~/.config/opencode/opencode.json`.
+
+Each `proxyUrls[i]` is paired with `tokens[i]` (and enables envelope protocol).
+Labels are index-matched; missing labels default to the synthetic `edu-<N>` form.
+Schema: `config.ts:334-360`.
+
+**Operator gating.**
+
+| Env var | Purpose |
+| ------- | ------- |
+| `OPENCODE_TEST_COPILOT_TOKENS` | Comma-separated tokens registered as `github-copilot#edu-N` slots (env-driven equivalent of `[copilot.testAccounts].tokens`). |
+| `OPENCODE_ALLOW_TEST_ACCOUNTS=1` | Include `github-copilot#edu-*` accounts in routing (pool.ts::`filterTestAccounts`). Otherwise they are hidden from production dispatch. |
+| `OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1` | Enable import of VS Code apps.json, Copilot oauth.json, Forge, Codedash stores. |
+
+### 8.3 GCP envelope proxy (`POST {proxy}/fetch`)
+
+The Rust CLI routes Copilot traffic through a Cloud-Run / regional fetch-proxy that
+speaks a JSON envelope protocol. The TS fork ships a compatible implementation so the
+same per-account GCP proxies keep working.
+
+- `envelopeEnabled(cfg)` (`copilot.ts:727`) — `true` when `cfg.envelope === true`
+  OR env `OPENCODE_COPILOT_PROXY_ENVELOPE=1`.
+- `envelopeFetch(request, init, {url, token})` (`copilot.ts:774`) — `POST {proxy}/fetch`
+  with JSON body `{url, method, headers, body, timeout_ms}`. Proxy response is
+  `{status_code, headers, body}`; callers receive a normal `Response` reconstructed from
+  the envelope.
+- `routedFetch(request, init, cfg)` (`copilot.ts:828`) — dispatches through envelope
+  when `cfg?.envelope`, otherwise legacy URL-rewrite.
+- `ENVELOPE_STRIP_HEADERS = {content-length, host}` filters headers that would be
+  wrong if forwarded verbatim (`copilot.ts:738`).
+- Timeout advertised in the envelope: `PROXY_FETCH_TIMEOUT_SEC = 120` (matches Rust
+  `http_get_via_proxy`).
+
+**Per-account regional proxies.** `Conn.proxyUrl` (`connections.ts:28`) is a free-form
+URL so operators can pin each Copilot account to a distinct regional Cloud-Run
+fetch-proxy for IP rotation / geo-affinity:
+
+```
+https://us-central1-project.a.run.app
+https://us-east1-project.a.run.app
+https://europe-west1-project.a.run.app
+https://asia-northeast1-project.a.run.app
+```
+
+`Conn.envelope: true` forces the envelope protocol for that account. Set automatically
+when credentials are drained from `~/.copilot/auth/credential.json` (the Rust CLI
+always envelopes) or injected via `[copilot.testAccounts].proxyUrls`.
+
+Coverage in `/copilot_internal/user` (quota.ts:88-132), `/models` discovery
+(`models.ts:321-330`), chat/completions dispatch (`copilot.ts:828-870`), and
+BlackBird (`blackbird.ts:158-200`).
+
+**Env override.** `OPENCODE_COPILOT_PROXY_ENVELOPE=1` opts every proxy into envelope
+mode regardless of `Conn.envelope`.
+
+**Configure.**
+
+```bash
+# Opt every Copilot proxy into envelope protocol
+export OPENCODE_COPILOT_PROXY_ENVELOPE=1
+```
+
+```bash
+# Per-account: set proxy via CLI
+opencode providers proxy --provider github-copilot#edu-1 \
+  --url https://us-central1-project.a.run.app --token "$GCP_TOKEN"
+```
+
+Direct edit of `~/.local/share/opencode/copilot-connections.json`:
+
+```jsonc
+{
+  "version": 1,
+  "connections": {
+    "github-copilot#edu-1": {
+      "proxyUrl":   "https://us-central1-project.a.run.app",
+      "proxyToken": "…",
+      "envelope":   true
+    },
+    "github-copilot#edu-2": {
+      "proxyUrl":   "https://asia-northeast1-project.a.run.app",
+      "proxyToken": "…",
+      "envelope":   true
+    }
+  }
+}
+```
+
+### 8.4 `providers accounts` display
+
+`ProvidersAccountsCommand` (`providers.ts:1422`) renders a per-account card backed by
+`renderAccountStatus()` (`providers.ts:641`) with the following new fields:
+
+- `Pool: edu|prod|<none>` — resolved via `accountPoolLabel(key, plan)`
+  (pool-routing config honoured).
+- `Machine ID: <uuid>` — stable per-account machine id from `Conn.machineId`.
+- `Proxy: <url> (envelope)` — shows `proxyUrl`; appends `(envelope)` when
+  `envelope === true`.
+- `Allowed (prod): …` — comma-separated models the pool is allowed to dispatch for
+  production traffic, derived from `poolAllowedProdModels(pool)`.
+- `Allowed (test-only): …` — models routed only when the account is consumed as a
+  test slot, from `poolAllowedTestModels(pool)`.
+- `best <model>` — on the following line per account; reflects the pool-routing
+  default, NOT the raw `/models` discovery cache.
+  Implementation: `renderBestPerVendor(state)` (`providers.ts:1013`) — when a pool
+  is assigned, `best` is the first entry of `poolAllowedProdModels(pool)`. Unpooled
+  accounts fall back to vendor-grouped picks from `CopilotModels.bestPerVendor`.
+- Migration banner (`Migration: <text>`, `Migration source: <path>`, `Migration at: <ISO>`)
+  sourced from `resolveMigrationSummary()`.
+
+**Auto-deactivation.** In `loadAccountStatuses()` (`providers.ts:712`) any Copilot
+account that returns 401 / 403 from `/copilot_internal/user` is added to
+`newlyDeactivated` and persisted via `markDeactivated(state, key)`
+(`connections.ts`). The next `providers accounts` run filters these out by default
+(`providers.ts:1436-1441`); pass `--all` to include them. The footer reads
+`N accounts (K deactivated hidden — pass --all to show)`.
+
+#### Example output
+
+```
+◇  Migration: migrated 4 legacy Copilot accounts
+│  Migration source: /Users/dave/.copilot/auth/credential.json
+│  Migration at: 2026-04-18T12:34:56.789Z
+│
+◇  Primary proxy on, pool=prod, discovery fresh
+│    Login: dave-github
+│    Plan: pro
+│    Machine ID: 5a3c9d2e-1e2f-4b7a-9d6e-1f2a3b4c5d6e
+│    Proxy: https://us-central1-project.a.run.app (envelope)
+│    Health: ok
+│    Discovery: ok, 23 picker-enabled models
+│    Allowed (prod):      gpt-5.4-xhigh, claude-4.7-opus-high
+│    Allowed (test-only): gpt-4.1, gpt-5-mini-xhigh
+│    Premium: premium 120 / 500 (resets 2026-05-01)
+│
+◇  edu-1 proxy on, pool=edu, discovery fresh
+│    Login: alice
+│    Plan: edu
+│    Machine ID: 7b4d1a0c-aa22-4c33-bb44-55d66e77f88a
+│    Proxy: https://asia-northeast1-project.a.run.app (envelope)
+│    Health: ok
+│    Discovery: ok, 18 picker-enabled models
+│    Allowed (prod):      codex-5.3-xhigh
+│    Allowed (test-only): gpt-4.1, gpt-5-mini-xhigh
+│
+◇  Primary   best gpt-5.4-xhigh (option: claude-4.7-opus-high)
+│  edu-1     best codex-5.3-xhigh
+│
+└  2 accounts (1 deactivated hidden — pass --all to show)
+```
+
+The `--json` output embeds the same shape under a stable envelope:
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "migration": { "migrated": 4, "text": "…", "source": "…", "migratedAt": 1700000000000, "skipped": false },
+  "health":    [ /* checkAccountStatuses() triage */ ],
+  "bestPerVendor": { "github-copilot": [ /* per-vendor picks */ ] },
+  "items": [
+    {
+      "schemaVersion": 1,
+      "info":   { "refresh": "…", "enterpriseUrl": null },
+      "quota":  { /* Quota */ },
+      "proxy":  { "url": "…", "token": "…", "envelope": true },
+      "status": {
+        "schemaVersion": 1,
+        "key":                "github-copilot",
+        "label":              "Primary",
+        "pool":               "prod",
+        "proxyUrl":           "https://us-central1-project.a.run.app",
+        "envelope":           true,
+        "machineId":          "5a3c9d2e-…",
+        "allowedProdModels":  ["gpt-5.4-xhigh", "claude-4.7-opus-high"],
+        "allowedTestModels":  ["gpt-4.1", "gpt-5-mini-xhigh"],
+        "health":             "ok",
+        "quota":              { /* … */ },
+        "discovery":          { "ok": true, "models": ["…"] },
+        "route":              { "discovery": 3, "penalty": 0, "load": 0, "cooldown": false, "routeReason": ["lane:prod"] }
+      },
+      "triage": { "health": "healthy", "premium": { /* … */ } }
+    }
+  ]
+}
+```
+
+Schema version `ACCOUNT_STATUS_SCHEMA_VERSION = 1` (`providers.ts:378`).
+
+### 8.5 CLI commands
+
+Full `opencode providers` command tree (`packages/opencode/src/cli/cmd/providers.ts:987`):
+
+| Command | Description |
+| ------- | ----------- |
+| `opencode providers list` / `ls` | List providers + credentials + cached per-account "best" pick. |
+| `opencode providers login [url] [--provider <id>] [--method <label>]` | Interactive OAuth / API-key login. `--provider` skips the select picker; `--method` skips the method picker. |
+| `opencode providers logout` | Remove a credential (select from list). |
+| `opencode providers quota [--json]` | Print per-account quota (`formatQuotaBar`). `--json` emits stable schema envelope. |
+| `opencode providers accounts [--json] [--all]` | Rich per-account status card (see 8.4). `--all` includes deactivated accounts. |
+| `opencode providers route-debug [model] [--provider <id>] [--account <key>] [--all-accounts] [--all-models] [--summary-only] [--json]` | Show routing candidates, lane, discovery rank, penalty, selected/rejected reasons. Defaults to `gpt-5-mini`. `--all-models` iterates `{gpt-5-mini, gpt-4.1, gpt-5-enterprise, gpt-4.1-edu}` and emits a summary with win rates + rejection breakdown by lane/penalty/discovery. |
+| `opencode providers proxy [--provider <key>] [--url <url>] [--token <token>] [--list]` | Configure per-account proxy URL + token. `--list` prints the current proxy map. Omitting `--url` clears the proxy; omitting `--token` leaves it unset. Writes to `copilot-connections.json`. |
+| `opencode providers export [--out <path>] [--plain\|--base64] [--redact-tokens] [--exported-by <label>]` | Emit portable JSON bundle (version 1) with every Copilot OAuth credential + connection metadata. `--redact-tokens` strips `refresh`/`proxyToken` (sets `redacted: true` in envelope). `--base64` wraps for clipboard-safe sharing. Write to stdout by default, or `--out <path>`. |
+| `opencode providers import <path>\|- [--merge\|--replace] [--dry-run] [--json]` | Import a bundle (base64 envelope auto-detected). `--merge` (default) upserts by `account.key`; `--replace` wipes existing `github-copilot*` accounts + connection state first; `--dry-run` reports without writing; `--json` emits machine-readable result. Version mismatch rejected by `parseBundle`. |
+
+The root command accepts both `opencode providers …` and its alias `opencode auth …`.
+Each command registers `--help` text via yargs' `describe` / option `describe` strings
+above. Full command source: `packages/opencode/src/cli/cmd/providers.ts`.
+
+**`route-debug` summary shape.** With `--all-models --json`:
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "summary": {
+    "wins":            { "github-copilot": 3, "github-copilot#edu-1": 1 },
+    "topWinner":       "github-copilot",
+    "topWinRate":      0.75,
+    "topLoser":        "github-copilot#enterprise",
+    "rejectionRate":   0.25,
+    "modelCount":      4,
+    "selectedCount":   3,
+    "selectedRate":    0.75,
+    "rejectedByLane":      2,
+    "rejectedByPenalty":   1,
+    "rejectedByDiscovery": 0,
+    "byModel": {
+      "gpt-5-mini":      { "selected": "github-copilot",          "winnerReason": ["lane:prod"], … },
+      "gpt-4.1-edu":     { "selected": "github-copilot#edu-1",    "winnerReason": ["lane:edu"], … },
+      "gpt-5-enterprise":{ "selected": null,                      "winnerReason": [], "rejectedByLane": 2, … }
+    }
+  },
+  "models": [ /* per-model RouteDebugJSON */ ]
+}
+```
+
+### 8.6 HTTP endpoints (status)
+
+No Copilot-specific HTTP routes are mounted on `InstanceRoutes` at this commit — the
+existing surface remains:
+
+- `GET /session/:id/autobest`, `POST /session/:id/autobest*` — see
+  [Server instance modifications](#server-instance-modifications).
+- `GET /timer`, `GET /session/:id/timer`, lifecycle — see [Timer subsystem](#timer-subsystem).
+- `/thread`, `/turn` aliases — see [Thread and Turn HTTP routes](#thread-and-turn-http-routes).
+
+A parallel effort is adding `/copilot/accounts`, `/copilot/route-debug`, and
+`/copilot/proxy` routes under `packages/opencode/src/server/instance/` that share the
+shape of `providers accounts --json` / `providers route-debug --json` emit. Until those
+land, clients should shell out to the CLI (`opencode providers accounts --json`) or
+import the plugin helpers directly from
+`@/cli/cmd/providers` (`loadAccountStatuses`, `loadRouteExplain`, `loadAccountHealth`)
+for programmatic access.
+
+### 8.7 Source cross-reference
+
+| Feature | File(s) |
+| ------- | ------- |
+| Auth discovery cascade | `packages/opencode/src/plugin/github-copilot/auth.ts:282-376`, `paths.ts` |
+| Source parsers | `auth.ts::legacy/apps/oauth/opencodeNative/forge/codedash/testTokensFromEnv/testAccountsFromConfig` |
+| Pool routing policy | `packages/opencode/src/plugin/github-copilot/pool-routing.ts` |
+| Pool-routing config binding | `packages/opencode/src/plugin/github-copilot/copilot.ts:60-72` (`setPoolRoutingConfig`, `getPoolRoutingConfig`, `resolveAccountPool`) |
+| Config schema | `packages/opencode/src/config/config.ts:253-360` |
+| Envelope proxy protocol | `packages/opencode/src/plugin/github-copilot/copilot.ts:710-870` (`envelopeEnabled`, `envelopeFetch`, `routedFetch`) |
+| Envelope for quota / models / blackbird | `quota.ts:88-132`, `models.ts:321-330`, `blackbird.ts:158-200` |
+| Account health triage | `packages/opencode/src/plugin/github-copilot/health.ts` |
+| Providers CLI | `packages/opencode/src/cli/cmd/providers.ts` |
+| Account display helpers | `providers.ts::renderAccountStatus/renderBestPerVendor/poolAllowedProdModels/poolAllowedTestModels` |
+| JSON status envelope | `providers.ts::jsonStatus/jsonMigration` (`ACCOUNT_STATUS_SCHEMA_VERSION = 1`) |
+| Auto-deactivation | `providers.ts:724-788` + `connections.ts::markDeactivated` |
+| Test coverage | `test/cli/cmd/providers-quota.test.ts`, `test/plugin/github-copilot-auth.test.ts`, `test/plugin/github-copilot-connections.test.ts` |
+
+### 8.8 Environment variables summary (Round 8)
+
+| Env | Source | Effect |
+| --- | ------ | ------ |
+| `OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1` | `auth.ts:311` | Opt in to importing secondary IDE / tool credential stores (apps.json, oauth.json, Forge, Codedash). |
+| `OPENCODE_TEST_COPILOT_TOKENS=tok1,tok2,…` | `auth.ts:297` | Register synthetic `github-copilot#edu-N` slots from comma-separated tokens. |
+| `OPENCODE_ALLOW_TEST_ACCOUNTS=1` | `connections.ts:70` | Include `github-copilot#edu-*` keys in routing (otherwise hidden). |
+| `OPENCODE_COPILOT_PROXY_ENVELOPE=1` | `copilot.ts:729`, `quota.ts:104`, `models.ts:328` | Force the Rust-compatible `POST {proxy}/fetch` envelope protocol for every configured proxy. |
+| `OPENCODE_PROBE_DISCOVERY=0` | `providers.ts:794` | Disable the lazy `/models` discovery probe inside `providers accounts` (keeps the display purely from cached state; used by unit tests). |
+| `OPENCODE_DEBUG_PROVIDERS=1` | `providers.ts:713` | Emit stderr trace lines from `loadAccountStatuses()` — useful when an account hangs mid-discovery. |
+
+### 8.9 Full `opencode.json` snippet
+
+```jsonc
+// ~/.config/opencode/opencode.json — Copilot multi-account + pool routing +
+// test accounts + per-account GCP envelope proxies.
+{
+  "copilot": {
+    "poolRouting": {
+      "pools": {
+        "prod": ["github-copilot"],
+        "edu":  ["github-copilot#edu-primary"]
+      },
+      "models": {
+        "gpt-5.4-xhigh":       "prod",
+        "claude-4.7-opus-high":"prod",
+        "codex-5.3-xhigh":     "edu"
+      },
+      "xhighOnly": ["gpt-5.4", "codex-5.3"]
+    },
+    "testAccounts": {
+      "tokens": ["ghu_pilotA", "ghu_pilotB"],
+      "labels": ["pilot-a",    "pilot-b"],
+      "supportedModels": ["gpt-4.1", "gpt-5-mini-xhigh"],
+      "proxyUrls": [
+        "https://us-central1-project.a.run.app",
+        "https://europe-west1-project.a.run.app"
+      ]
+    },
+    "rateLimiter": {
+      "enabled":         true,
+      "maxConcurrent":   7,
+      "threshold":       0.2,
+      "slidingWindowMs": 600000,
+      "cleanWindowMs":   300000
+    }
+  },
+  "provider": {
+    "github-copilot": {
+      "options": {
+        "runtimeLimit":         1,
+        "runtimeMinIntervalMs": 0
+      }
+    }
+  }
+}
+```
+
+Shell configuration for a typical multi-account operator:
+
+```bash
+# Enable extended auth discovery
+export OPENCODE_IMPORT_ALL_COPILOT_TOKENS=1
+
+# Enable test accounts (if any are configured)
+export OPENCODE_ALLOW_TEST_ACCOUNTS=1
+
+# Force the GCP envelope proxy protocol globally
+export OPENCODE_COPILOT_PROXY_ENVELOPE=1
+```
+
+Then at runtime:
+
+```bash
+# Review discovered accounts + their pool assignment
+opencode providers accounts
+
+# Review routing for a specific model
+opencode providers route-debug gpt-5.4-xhigh --all-accounts
+
+# Export a portable bundle (redacted, for sharing proxy/plan config)
+opencode providers export --redact-tokens --out copilot-config.json
+
+# On a second machine — import (dry-run first)
+opencode providers import copilot-config.json --dry-run
+opencode providers import copilot-config.json --merge
+```
 
 ---
