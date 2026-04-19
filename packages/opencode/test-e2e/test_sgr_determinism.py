@@ -39,15 +39,17 @@ structure is correct by construction.
 
 Provider / model choice
 -----------------------
-Default: ``opencode / gpt-5-nano`` (via ``harness.sgr.SGR_DEFAULT_MODEL``).
-Verified on this build to honour ``format={type: "json_schema"}``, call
-the injected ``StructuredOutput`` tool, and land the validated payload
-on ``info.structured`` inside ~15-30s per turn for simple prompts.
-``github-copilot`` providers can't be the baseline: the current
-``/chat/completions`` envelope returns ``"request body is not valid JSON"``
-on every turn (structured or not) on this build — same failure surface
-as the ~27 xfail'd cases elsewhere in ``test-e2e/``. Overridable via
-``OPENCODE_E2E_SGR_PROVIDER`` / ``OPENCODE_E2E_SGR_MODEL``.
+Default: ``github-copilot#personal / gpt-4.1`` (see
+``SGR_DETERMINISM_MODEL`` below). This matches the verified pair used
+by every other SGR-consuming suite (``test_autobest``, ``test_subagent``,
+``test_hooks``) since commit 83f667341 "switch default model
+gpt-5-mini → gpt-4.1 for reliability" — 6-15s per turn end-to-end.
+
+The harness-level ``SGR_DEFAULT_MODEL`` (``opencode / gpt-5-nano``)
+targets a Zen endpoint that is not configured on this workstation; it's
+kept only as a reference for callers of ``harness.sgr`` that explicitly
+want the Zen backend. Overridable via ``OPENCODE_E2E_SGR_PROVIDER`` /
+``OPENCODE_E2E_SGR_MODEL``.
 
 Prompt choice
 -------------
@@ -82,17 +84,36 @@ import pytest
 from pydantic import BaseModel, Field
 
 from harness import OpencodeClient, OpencodeServer
-from harness.sgr import SGR_DEFAULT_MODEL, run_sgr_or_skip
+from harness.sgr import run_sgr_or_skip
 
 
-# Per-test live-turn budget. Simple arithmetic-style SGR turns normally
-# finish in 15-30s on opencode/gpt-5-nano but the Zen-hosted endpoint's
-# tail latency occasionally spikes to 200+ seconds on back-to-back
-# requests. 300s of headroom keeps the suite reliable under that
-# drift; pytest-timeout gets a generous multiple so fixture teardown
-# always has room to run.
-LIVE_TURN_TIMEOUT_S = 300.0
-pytestmark = [pytest.mark.live, pytest.mark.timeout(900)]
+# Verified-reliable SGR model for this workstation.
+#
+# The harness-level ``SGR_DEFAULT_MODEL`` (``opencode/gpt-5-nano``) targets
+# a Zen-hosted endpoint that is not configured on this machine — every
+# turn stalls in upstream DNS/connect for the full poll budget, producing
+# the "Assistant turn did not complete within Ns" skip ladder. Meanwhile
+# the sibling SGR-consuming suites (test_autobest, test_subagent,
+# test_hooks) default to ``github-copilot#personal/gpt-4.1`` (see commit
+# 83f667341 "test(e2e sgr): switch default model gpt-5-mini → gpt-4.1
+# for reliability") and finish each turn in 6-15s under real load.
+#
+# We pin the same pair here so the determinism suite matches its
+# siblings' runtime profile — ~15s per test × 5 tests fits trivially
+# inside the 300s pytest-timeout with tons of headroom.
+SGR_DETERMINISM_MODEL = {
+    "providerID": "github-copilot#personal",
+    "modelID": "gpt-4.1",
+}
+
+
+# Per-test live-turn budget. With the verified model above, simple
+# arithmetic-style SGR turns finish in 6-15s. 180s of headroom covers
+# cold-start latency spikes without letting stalls blow through the
+# wall-clock budget — a turn that stalls for 3 min on gpt-4.1 is
+# upstream-broken, not provider-drift we want to tolerate.
+LIVE_TURN_TIMEOUT_S = 180.0
+pytestmark = [pytest.mark.live, pytest.mark.timeout(300)]
 
 
 # ---------------------------------------------------------------------------
@@ -189,17 +210,23 @@ def sgr_server(sgr_server_root) -> "tuple[OpencodeServer, OpencodeClient]":
 
 @pytest.fixture(scope="session")
 def sgr_model() -> dict[str, str]:
-    """Provider/model pair for SGR tests — overridable via env."""
+    """Provider/model pair for SGR tests — overridable via env.
+
+    Default pinned to ``github-copilot#personal/gpt-4.1`` (see
+    ``SGR_DETERMINISM_MODEL`` above for rationale). The harness-level
+    ``SGR_DEFAULT_MODEL`` is deliberately NOT used — it points at a Zen
+    endpoint that stalls every turn on this workstation.
+    """
     return {
         "providerID": (
             os.environ.get("OPENCODE_E2E_SGR_PROVIDER")
             or os.environ.get("OPENCODE_E2E_PROVIDER")
-            or SGR_DEFAULT_MODEL["providerID"]
+            or SGR_DETERMINISM_MODEL["providerID"]
         ),
         "modelID": (
             os.environ.get("OPENCODE_E2E_SGR_MODEL")
             or os.environ.get("OPENCODE_E2E_MODEL")
-            or SGR_DEFAULT_MODEL["modelID"]
+            or SGR_DETERMINISM_MODEL["modelID"]
         ),
     }
 
