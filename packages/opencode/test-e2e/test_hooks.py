@@ -1470,75 +1470,111 @@ def test_subagent_stop_cancelled_on_interrupt(
 
 
 @pytest.mark.live
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 @_skip_if_live_disabled
 def test_permission_denied_source_reject(
     hook_log_dir: Path,
 ) -> None:
-    """No preapproved rule for bash; user replies ``reject`` → a
-    PermissionDenied hook must fire with ``source: "reject"``.
+    """No preapproved rule for bash; user replies ``reject`` →
+    PermissionDenied fires with ``source: "reject"`` — via SGR auto-dispatch.
+
+    Setup: ``{"bash": "ask"}`` forces bash through ``Permission.Service``.
+    The SGR auto-dispatch fires bash synchronously; bash calls
+    ``ctx.ask`` → ``permission.asked`` SSE event fires. The test races
+    a ``/permission/:id/reply {reply:"reject"}`` request, which makes
+    the Deferred reject → ``PermissionDenied`` fires with
+    ``source: "reject"``.
     """
+    import threading as _threading
+
     hooks = {
         "PermissionDenied": [_hook_entry("PermissionDenied", hook_log_dir)],
     }
     # Force bash through the permission system.
-    server = _spawn_live_with_permission_overrides(
-        hook_log_dir, hooks, {"bash": "ask"}
+    server = _spawn_sgr_hooks_server(
+        hook_log_dir, hooks, permission={"bash": "ask"}
     )
-    with server:
+    try:
         _skip_if_no_instance_routes(server)
-        try:
-            with _live_client(server) as client:
-                session = client.create_session()
-                import threading
 
-                def _fire() -> None:
-                    try:
-                        client.send_message(
-                            session["id"],
-                            "Run `echo hi` via the bash tool. Stop.",
-                            providerID=TOOL_MODEL["providerID"],
-                            modelID=TOOL_MODEL["modelID"],
-                        )
-                    except Exception:
-                        pass
+        # Background event watcher — when ``permission.asked`` fires,
+        # issue the reject reply so the pending Deferred resolves.
+        reject_done = _threading.Event()
+        rejected_req_id: list[str] = []
 
-                t = threading.Thread(target=_fire, daemon=True)
-                t.start()
-
-                asked = None
-                deadline = time.monotonic() + 150.0
-                with client.events(timeout_s=180.0) as stream:
+        def _watch_and_reject() -> None:
+            reply_client = OpencodeClient(
+                server.base_url,
+                project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
+                timeout_s=600.0,
+            )
+            try:
+                with reply_client.events(timeout_s=600.0) as stream:
                     for ev in stream:
-                        if ev.type == "permission.asked":
-                            asked = ev
-                            break
-                        if time.monotonic() >= deadline:
-                            break
-                if asked is None:
-                    pytest.skip(
-                        "no permission.asked event within 150s — model did "
-                        "not invoke bash"
-                    )
-                req_id = asked.properties.get("id")
-                assert isinstance(req_id, str)
-                r = client._http.post(
-                    f"/permission/{req_id}/reply", json={"reply": "reject"}
-                )
-                r.raise_for_status()
+                        if ev.type != "permission.asked":
+                            if reject_done.is_set():
+                                return
+                            continue
+                        req_id = ev.properties.get("id")
+                        if not isinstance(req_id, str):
+                            continue
+                        try:
+                            r = reply_client._http.post(
+                                f"/permission/{req_id}/reply",
+                                json={"reply": "reject"},
+                            )
+                            r.raise_for_status()
+                            rejected_req_id.append(req_id)
+                        except Exception:
+                            pass
+                        return
+            except Exception:
+                pass
+            finally:
+                reply_client.close()
 
-                payload = _read_hook_log(
-                    hook_log_dir, "PermissionDenied", timeout_s=90.0
+        watcher = _threading.Thread(target=_watch_and_reject, daemon=True)
+        watcher.start()
+
+        # Fire SGR dispatch on a background thread so the test can wait
+        # on the hook log without being blocked by the synchronous
+        # `/turn/start` call (which stays open until the rejected
+        # permission resolves + the tool-error part lands).
+        dispatch_done = _threading.Event()
+
+        def _dispatch() -> None:
+            try:
+                _dispatch_bash_via_sgr(
+                    server,
+                    command_hint="echo hi",
+                    description_hint="Echo hi for PermissionDenied reject test",
+                    timeout_s=600.0,
+                    retries=0,
                 )
-                assert payload["hook_event_name"] == "PermissionDenied"
-                assert payload.get("source") == "reject"
-                t.join(timeout=30.0)
-                try:
-                    client.delete_session(session["id"])
-                except Exception:
-                    pass
+            except BaseException:
+                pass
+            finally:
+                dispatch_done.set()
+
+        dispatcher = _threading.Thread(target=_dispatch, daemon=True)
+        dispatcher.start()
+
+        try:
+            payload = _read_hook_log(
+                hook_log_dir, "PermissionDenied", timeout_s=300.0
+            )
+            assert payload["hook_event_name"] == "PermissionDenied"
+            assert payload.get("source") == "reject", (
+                f"expected source=reject; got source={payload.get('source')!r}"
+            )
+            assert rejected_req_id, "watcher did not reject any permission"
         finally:
-            _cleanup_live_server(server)
+            reject_done.set()
+            watcher.join(timeout=5.0)
+            dispatcher.join(timeout=15.0)
+    finally:
+        server.stop()
+        _cleanup_live_server(server)
 
 
 # ---- 10. PermissionGranted(source=hook) — hook short-circuits prompt ----
