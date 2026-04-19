@@ -1997,6 +1997,49 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 handle.message.structured = structured
                 handle.message.finish = handle.message.finish ?? "stop"
                 yield* sessions.updateMessage(handle.message)
+                // ---- SGR synthetic-render bridge ---------------------------
+                // A handful of downstream observers (notably
+                // `SessionAutobestObserver`) consume assistant *text* parts
+                // to drive their state machine — they never look at
+                // `info.structured`. To keep those observers working under
+                // SGR, when the captured payload contains a well-known
+                // list-shaped field (`bullets: string[]` today; easy to
+                // extend to `commands`, `items`, etc.), we render it back
+                // as a synthetic "- item" bullet list attached to the
+                // assistant message. The part is flagged `synthetic: true`
+                // so provider-facing code paths (history replay, model
+                // message assembly) can filter it out — observers that
+                // want it pick it up via the plain `type === "text"` scan.
+                if (structured && typeof structured === "object") {
+                  const payload = structured as Record<string, unknown>
+                  const listFields: Array<{ key: string; prefix: string }> = [
+                    { key: "bullets", prefix: "- " },
+                    { key: "commands", prefix: "- " },
+                    { key: "items", prefix: "- " },
+                  ]
+                  for (const { key, prefix } of listFields) {
+                    const value = payload[key]
+                    if (!Array.isArray(value) || value.length === 0) continue
+                    const lines: string[] = []
+                    for (const item of value) {
+                      if (typeof item !== "string") continue
+                      const trimmed = item.trim()
+                      if (!trimmed) continue
+                      lines.push(`${prefix}${trimmed}`)
+                    }
+                    if (lines.length === 0) continue
+                    yield* sessions.updatePart({
+                      id: PartID.ascending(),
+                      messageID: handle.message.id,
+                      sessionID: handle.message.sessionID,
+                      type: "text",
+                      text: lines.join("\n"),
+                      synthetic: true,
+                      time: { start: Date.now(), end: Date.now() },
+                    } satisfies MessageV2.TextPart)
+                    break
+                  }
+                }
                 // ---- SGR auto-dispatch ------------------------------------
                 // When the requested schema carries an `x-opencode-dispatch`
                 // hint, the server extracts `{tool, args_from, args}` from
@@ -2014,96 +2057,144 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   if (hint) {
                     const payload =
                       structured && typeof structured === "object" ? (structured as Record<string, any>) : {}
-                    const baseArgs: Record<string, any> =
-                      hint.args_from && hint.args_from in payload
-                        ? { [hint.args_from]: payload[hint.args_from] }
-                        : { ...payload }
-                    const dispatchArgs: Record<string, any> = { ...baseArgs, ...(hint.args ?? {}) }
-                    const callID = ulid()
-                    let part: MessageV2.ToolPart = yield* sessions.updatePart({
-                      id: PartID.ascending(),
-                      messageID: handle.message.id,
-                      sessionID: handle.message.sessionID,
-                      type: "tool",
-                      callID,
-                      tool: hint.tool,
-                      state: {
-                        status: "running",
-                        input: dispatchArgs,
-                        time: { start: Date.now() },
-                      },
-                    } satisfies MessageV2.ToolPart)
-                    const dispatchAbort = new AbortController()
-                    const dispatchCtx: Tool.Context = {
-                      sessionID,
-                      messageID: handle.message.id,
-                      agent: agent.name,
-                      abort: dispatchAbort.signal,
-                      callID,
-                      extra: { model, bypassAgentCheck: true },
-                      messages: yield* sessions.messages({ sessionID }),
-                      metadata: (val) =>
-                        Effect.gen(function* () {
-                          if (part.state.status !== "running") return
-                          part = yield* sessions.updatePart({
-                            ...part,
-                            state: {
-                              ...part.state,
-                              ...(val.title !== undefined ? { title: val.title } : {}),
-                              ...(val.metadata !== undefined ? { metadata: val.metadata } : {}),
-                            },
-                          } satisfies MessageV2.ToolPart)
-                        }),
-                      ask: (req) =>
-                        permission
-                          .ask({
-                            ...req,
-                            sessionID,
-                            tool: { messageID: handle.message.id, callID },
-                            ruleset: Permission.merge(agent.permission, session.permission ?? []),
-                          })
-                          .pipe(Effect.orDie),
+                    // Compute the dispatch-arg sequence: a single args
+                    // dictionary when `each_from` is unset, or one entry
+                    // per element of the payload array when it is. This
+                    // lets a single SGR turn fan out to N tool calls
+                    // (e.g. run bash 3 times, once per element of
+                    // `commands: string[]`).
+                    const buildArgsFromValue = (value: any): Record<string, any> => {
+                      if (hint.args_from) {
+                        return { [hint.args_from]: value }
+                      }
+                      if (value && typeof value === "object" && !Array.isArray(value)) {
+                        return { ...(value as Record<string, any>) }
+                      }
+                      return { value }
                     }
-                    const dispatchStartTime =
-                      part.state.status === "running" ? part.state.time.start : Date.now()
-                    yield* Effect.logInfo("sgr.dispatch.start", { tool: hint.tool, callID }).pipe(Effect.ignore)
-                    const exit = yield* Effect.exit(registry.dispatchByName(hint.tool, dispatchArgs, dispatchCtx))
-                    if (Exit.isSuccess(exit)) {
-                      const output = exit.value
-                      yield* sessions.updatePart({
-                        ...part,
-                        state: {
-                          status: "completed",
-                          input: dispatchArgs,
-                          output: output.output,
-                          title: output.title ?? hint.tool,
-                          metadata: output.metadata ?? {},
-                          time: { start: dispatchStartTime, end: Date.now() },
-                          attachments: output.attachments?.map((a) => ({
-                            ...a,
-                            id: PartID.ascending(),
-                            sessionID,
-                            messageID: handle.message.id,
-                          })),
-                        },
-                      } satisfies MessageV2.ToolPart)
+                    const argsSeq: Array<Record<string, any>> = []
+                    if (hint.each_from && Array.isArray(payload[hint.each_from])) {
+                      const eachArr = payload[hint.each_from] as any[]
+                      for (const element of eachArr) {
+                        let argsForElement: Record<string, any>
+                        if (
+                          hint.each_args_from &&
+                          element &&
+                          typeof element === "object" &&
+                          !Array.isArray(element) &&
+                          hint.each_args_from in (element as Record<string, any>)
+                        ) {
+                          argsForElement = buildArgsFromValue(
+                            (element as Record<string, any>)[hint.each_args_from],
+                          )
+                        } else if (typeof element === "string" || typeof element === "number" || typeof element === "boolean") {
+                          argsForElement = buildArgsFromValue(element)
+                        } else if (element && typeof element === "object" && !Array.isArray(element)) {
+                          argsForElement = { ...(element as Record<string, any>) }
+                        } else {
+                          argsForElement = buildArgsFromValue(element)
+                        }
+                        argsSeq.push({ ...argsForElement, ...(hint.args ?? {}) })
+                      }
                     } else {
-                      const squashed = Cause.squash(exit.cause)
-                      const errMsg =
-                        squashed instanceof Error
-                          ? squashed.message
-                          : typeof squashed === "string"
-                            ? squashed
-                            : String(squashed)
-                      yield* sessions.updatePart({
-                        ...part,
+                      const baseArgs: Record<string, any> =
+                        hint.args_from && hint.args_from in payload
+                          ? { [hint.args_from]: payload[hint.args_from] }
+                          : { ...payload }
+                      argsSeq.push({ ...baseArgs, ...(hint.args ?? {}) })
+                    }
+
+                    // Fire one dispatch per entry in `argsSeq`, sequentially,
+                    // so hook observers (PreToolUse + PostToolUse) see each
+                    // call in order, just as a provider-driven multi-tool
+                    // turn would emit them.
+                    for (const dispatchArgs of argsSeq) {
+                      const callID = ulid()
+                      let part: MessageV2.ToolPart = yield* sessions.updatePart({
+                        id: PartID.ascending(),
+                        messageID: handle.message.id,
+                        sessionID: handle.message.sessionID,
+                        type: "tool",
+                        callID,
+                        tool: hint.tool,
                         state: {
-                          status: "error",
+                          status: "running",
                           input: dispatchArgs,
-                          error: errMsg,
-                          time: { start: dispatchStartTime, end: Date.now() },
+                          time: { start: Date.now() },
                         },
                       } satisfies MessageV2.ToolPart)
+                      const dispatchAbort = new AbortController()
+                      const dispatchCtx: Tool.Context = {
+                        sessionID,
+                        messageID: handle.message.id,
+                        agent: agent.name,
+                        abort: dispatchAbort.signal,
+                        callID,
+                        extra: { model, bypassAgentCheck: true },
+                        messages: yield* sessions.messages({ sessionID }),
+                        metadata: (val) =>
+                          Effect.gen(function* () {
+                            if (part.state.status !== "running") return
+                            part = yield* sessions.updatePart({
+                              ...part,
+                              state: {
+                                ...part.state,
+                                ...(val.title !== undefined ? { title: val.title } : {}),
+                                ...(val.metadata !== undefined ? { metadata: val.metadata } : {}),
+                              },
+                            } satisfies MessageV2.ToolPart)
+                          }),
+                        ask: (req) =>
+                          permission
+                            .ask({
+                              ...req,
+                              sessionID,
+                              tool: { messageID: handle.message.id, callID },
+                              ruleset: Permission.merge(agent.permission, session.permission ?? []),
+                            })
+                            .pipe(Effect.orDie),
+                      }
+                      const dispatchStartTime =
+                        part.state.status === "running" ? part.state.time.start : Date.now()
+                      yield* Effect.logInfo("sgr.dispatch.start", { tool: hint.tool, callID }).pipe(Effect.ignore)
+                      const exit = yield* Effect.exit(registry.dispatchByName(hint.tool, dispatchArgs, dispatchCtx))
+                      if (Exit.isSuccess(exit)) {
+                        const output = exit.value
+                        yield* sessions.updatePart({
+                          ...part,
+                          state: {
+                            status: "completed",
+                            input: dispatchArgs,
+                            output: output.output,
+                            title: output.title ?? hint.tool,
+                            metadata: output.metadata ?? {},
+                            time: { start: dispatchStartTime, end: Date.now() },
+                            attachments: output.attachments?.map((a) => ({
+                              ...a,
+                              id: PartID.ascending(),
+                              sessionID,
+                              messageID: handle.message.id,
+                            })),
+                          },
+                        } satisfies MessageV2.ToolPart)
+                      } else {
+                        const squashed = Cause.squash(exit.cause)
+                        const errMsg =
+                          squashed instanceof Error
+                            ? squashed.message
+                            : typeof squashed === "string"
+                              ? squashed
+                              : String(squashed)
+                        yield* sessions.updatePart({
+                          ...part,
+                          state: {
+                            status: "error",
+                            input: dispatchArgs,
+                            error: errMsg,
+                            time: { start: dispatchStartTime, end: Date.now() },
+                          },
+                        } satisfies MessageV2.ToolPart)
+                      }
                     }
                   }
                 }

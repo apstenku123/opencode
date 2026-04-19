@@ -93,6 +93,19 @@ export namespace MessageV2 {
    *   - `auto_dispatch`: default `true`. Set to `false` to register the
    *                    hint without triggering dispatch (useful for
    *                    schemas shared across code paths).
+   *   - `each_from`:   when set, points at a payload field of shape
+   *                    `string[] | object[]`. The runtime iterates the
+   *                    array and fires one dispatch per element — each
+   *                    element replaces `args_from`'s singular input
+   *                    (or the whole payload, when `args_from` is
+   *                    absent) for that iteration. Pairs with `args` /
+   *                    `args_from` normally; enables "run bash N times"
+   *                    / "call edit for each file in the list" shapes.
+   *   - `each_args_from`: when iterating an object-element array, the
+   *                    field on each element whose value becomes the
+   *                    `args_from` input (otherwise the entire element
+   *                    is spread onto the args). Ignored for string
+   *                    element arrays.
    */
   export const StructuredDispatchHint = z
     .object({
@@ -100,6 +113,8 @@ export namespace MessageV2 {
       args_from: z.string().optional(),
       args: z.record(z.string(), z.any()).optional(),
       auto_dispatch: z.boolean().default(true),
+      each_from: z.string().optional(),
+      each_args_from: z.string().optional(),
     })
     .meta({
       ref: "StructuredDispatchHint",

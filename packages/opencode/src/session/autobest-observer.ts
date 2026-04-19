@@ -245,6 +245,47 @@ export namespace SessionAutobestObserver {
             state.iteration = iteration + 1
             const activeKey = result?.decision.active?.key ?? candidates[0]?.key
             if (!activeKey) return AdaptiveHooks.Continue
+            // Stop-pattern short-circuit — when the most-recent
+            // *non-synthetic* user message contains one of
+            // `STOP_PATTERNS`, the observer has still captured the
+            // candidates (so `active.key` is available for the UI) but
+            // must not inject a follow-up synthetic user turn. Matches
+            // the TUI's user-typed-`/stop` behaviour: the active pick
+            // persists, but the auto-loop stops here. We scan user
+            // messages in reverse chronological order (via
+            // `MessageV2.stream`) and filter out synthetic injections
+            // so a previous-iteration self-inject cannot hide a freshly
+            // typed "stop autobest".
+            const lastUserText = yield* session
+              .findMessage(args.sessionID, (m) => {
+                if (m.info.role !== "user") return false
+                for (const p of m.parts ?? []) {
+                  if (p.type === "text" && !p.synthetic && !p.ignored && (p.text ?? "").trim()) {
+                    return true
+                  }
+                }
+                return false
+              })
+              .pipe(
+                Effect.match({
+                  onFailure: () => "",
+                  onSuccess: (v: any) => {
+                    if (!v || v._tag === "None" || !v.value) return ""
+                    const parts = v.value.parts ?? []
+                    return parts
+                      .filter((p: any) => p.type === "text" && !p.synthetic && !p.ignored)
+                      .map((p: any) => (p.text ?? "").trim())
+                      .filter(Boolean)
+                      .join("\n")
+                      .toLowerCase()
+                  },
+                }),
+              )
+            for (const pat of STOP_PATTERNS) {
+              if (lastUserText.includes(pat)) {
+                return AdaptiveHooks.Continue
+              }
+            }
             return AdaptiveHooks.Inject({
               text: activeKey,
               source: "autobest:step-a",

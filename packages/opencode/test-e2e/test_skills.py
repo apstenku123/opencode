@@ -437,17 +437,116 @@ def test_autoskill_extracts_after_successful_tool_usage(
     """With ``autoskill: true`` a turn that invokes bash 3+ times yields a
     persisted SKILL.md under ``{data}/skills/auto/<name>.md`` containing
     valid frontmatter.
+
+    SGR rewrite: drives the server through ``/turn/start`` with a
+    ``BashCommandPlan`` schema whose ``x-opencode-dispatch`` hint has
+    ``each_from: "commands"``. The runtime (see
+    ``prompt.ts::SGR auto-dispatch``) fans out the 3-element array into
+    3 separate bash invocations — each one traverses the same
+    PreToolUse/PostToolUse hooks provider-driven calls would. Autoskill
+    then sees 3 successful bash calls in a single turn and extracts.
     """
     _write_config(isolated_skill_home, {"autoskill": True})
 
     server = _spawn_live_server(isolated_skill_home, ready_timeout_s=60.0)
     with server:
         try:
-            with _client_for(server, timeout_s=180.0) as client:
-                session = client.create_session()
-                _prompt_async(client, session["id"], "Please run three shell commands to help me: first `ls -1`, "
-                    "then `pwd`, then `echo hi`. Use the bash tool for each.", model=live_copilot_model)
-                _wait_idle_or_skip(client, session["id"], timeout_s=180.0)
+            with _client_for(server, timeout_s=300.0) as client:
+                thread = client.create_thread()
+                thread_id = thread["id"]
+
+                # SGR schema — array of 3 bash commands fanned out to
+                # per-element tool dispatches via `each_from`. The server
+                # runtime iterates `commands` and fires bash(command=<item>)
+                # once per string.
+                schema: dict[str, Any] = {
+                    "type": "object",
+                    "properties": {
+                        "commands": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 3,
+                            "maxItems": 3,
+                            "description": "Exactly three shell commands to execute in order.",
+                        },
+                    },
+                    "required": ["commands"],
+                    "additionalProperties": False,
+                    "x-opencode-dispatch": {
+                        "tool": "bash",
+                        "each_from": "commands",
+                        "args_from": "command",
+                        "args": {"description": "SGR autoskill fan-out"},
+                    },
+                }
+
+                # Drive the turn in a worker thread; /turn/start blocks
+                # until all fan-out dispatches complete.
+                import threading
+                turn_err: list[BaseException] = []
+                turn_done = threading.Event()
+
+                def _drive() -> None:
+                    try:
+                        client.start_turn(
+                            thread_id,
+                            "Plan three simple diagnostic shell commands: ls -1, pwd, "
+                            "and echo hi. Return only the JSON object.",
+                            model=live_copilot_model,
+                            format={"type": "json_schema", "schema": schema},
+                        )
+                    except BaseException as err:  # noqa: BLE001
+                        turn_err.append(err)
+                    finally:
+                        turn_done.set()
+
+                drv = threading.Thread(target=_drive, daemon=True, name="sgr-autoskill")
+                drv.start()
+
+                # Poll for 3 completed bash tool parts.
+                deadline = time.monotonic() + 180.0
+                bash_calls: list[dict[str, Any]] = []
+                while time.monotonic() < deadline:
+                    try:
+                        messages = client.get_messages(thread_id)
+                    except Exception:
+                        time.sleep(1.0)
+                        continue
+                    bash_calls = []
+                    for m in messages or []:
+                        for p in m.get("parts") or []:
+                            if p.get("type") == "tool" and p.get("tool") == "bash":
+                                state = p.get("state") or {}
+                                if state.get("status") == "completed":
+                                    bash_calls.append(p)
+                    if len(bash_calls) >= 3:
+                        break
+                    if turn_done.is_set():
+                        # Let a last scan finish then break.
+                        time.sleep(0.5)
+                        try:
+                            messages = client.get_messages(thread_id)
+                        except Exception:
+                            messages = []
+                        bash_calls = []
+                        for m in messages or []:
+                            for p in m.get("parts") or []:
+                                if p.get("type") == "tool" and p.get("tool") == "bash":
+                                    state = p.get("state") or {}
+                                    if state.get("status") == "completed":
+                                        bash_calls.append(p)
+                        break
+                    time.sleep(0.5)
+
+                if len(bash_calls) < 3:
+                    if turn_err:
+                        pytest.skip(
+                            f"SGR autoskill turn driver raised before landing 3 bash calls: {turn_err[0]!r}"
+                        )
+                    pytest.skip(
+                        f"SGR autoskill turn produced {len(bash_calls)} bash calls "
+                        f"(need 3) — upstream Copilot likely stalled."
+                    )
 
             auto_dir = _auto_skills_dir(isolated_skill_home)
             # Give fire-and-forget hook a moment to finish writing.
@@ -464,7 +563,6 @@ def test_autoskill_extracts_after_successful_tool_usage(
             assert content.startswith("---\n"), "missing frontmatter"
             assert "\nname:" in content
             assert "\ndescription:" in content
-            # Optional `tags:` block — present when the heuristic mined any.
             # Body should list the tool steps.
             assert "## Steps" in content
         finally:

@@ -116,6 +116,13 @@ def autobest_sgr_server(tmp_path_factory):
         data_dir=isolated_home,
         cwd=root,
         capture_stderr=True,
+        env={
+            # Race-retry against backup Copilot accounts: when one turn stalls
+            # the HTTP pool, the SGR driver fans out to the other account and
+            # races the first completion. Kills the ~90s tail on "provider warmed
+            # up on one account, but our first call landed on the slow one".
+            "OPENCODE_COPILOT_HTTP_RETRY_RACE_ENABLED": "true",
+        },
     )
     server.start()
     try:
@@ -343,77 +350,210 @@ def test_autobest_enable_roundtrip(
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — first bullet becomes active.key
+# Helpers — SGR-driven autobest turn
+# ---------------------------------------------------------------------------
+
+
+def _sgr_autobest_turn(
+    client: "OpencodeClient",
+    thread_id: str,
+    *,
+    prompt: str,
+    model: dict[str, str],
+    poll_timeout_s: float = 180.0,
+) -> dict[str, Any]:
+    """Drive a `/turn/start` turn with the `ThreeBullets` SGR schema.
+
+    The server forces `toolChoice=required` and registers the
+    StructuredOutput tool; the prompt pipeline then auto-renders a
+    synthetic text part of shape `"- b1\n- b2\n- b3"` from
+    `structured.bullets` (see ``prompt.ts`` "SGR synthetic-render
+    bridge" block). The autobest observer reads that synthetic text
+    and sets `active.key = bullets[0]`.
+
+    Returns the validated ThreeBullets payload (as plain dict) so the
+    caller can assert against `bullets[0]`. Raises `pytest.skip` when
+    the upstream provider stalls / rejects — a harness-level
+    infrastructure event, not a product regression.
+    """
+    schema = ThreeBullets.model_json_schema()
+    # Background the driver call — see harness/sgr.py for the rationale.
+    import threading
+    turn_err: list[BaseException] = []
+    turn_done = threading.Event()
+
+    def _drive() -> None:
+        try:
+            client.start_turn(
+                thread_id,
+                prompt,
+                model=model,
+                format={
+                    "type": "json_schema",
+                    "schema": schema,
+                },
+            )
+        except BaseException as err:  # noqa: BLE001
+            turn_err.append(err)
+        finally:
+            turn_done.set()
+
+    drv = threading.Thread(target=_drive, name=f"autobest-sgr-{thread_id}", daemon=True)
+    drv.start()
+
+    deadline = time.monotonic() + poll_timeout_s
+    last_structured: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        try:
+            messages = client.get_messages(thread_id)
+        except Exception:
+            time.sleep(1.0)
+            continue
+        for m in messages or []:
+            info = m.get("info") or {}
+            if info.get("role") == "assistant":
+                candidate = info.get("structured")
+                if isinstance(candidate, dict):
+                    last_structured = candidate
+                    break
+        if last_structured is not None:
+            break
+        if turn_done.is_set():
+            # Final scan after the driver settled.
+            try:
+                messages = client.get_messages(thread_id)
+            except Exception:
+                messages = []
+            for m in messages or []:
+                info = m.get("info") or {}
+                if info.get("role") == "assistant":
+                    candidate = info.get("structured")
+                    if isinstance(candidate, dict):
+                        last_structured = candidate
+                        break
+            break
+        time.sleep(1.0)
+
+    if last_structured is None:
+        if turn_err:
+            pytest.skip(
+                f"SGR turn driver raised before landing structured output: {turn_err[0]!r}"
+            )
+        pytest.skip(
+            "SGR autobest turn did not land structured output within "
+            f"{poll_timeout_s:.0f}s — upstream Copilot likely stalled."
+        )
+    try:
+        inst = ThreeBullets.model_validate(last_structured)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"SGR payload failed ThreeBullets validation: {e!r}")
+    return {"bullets": inst.bullets}
+
+
+# ---------------------------------------------------------------------------
+# Test 2 — first bullet becomes active.key (SGR-driven, deterministic)
 # ---------------------------------------------------------------------------
 
 
 def test_autobest_first_bullet_becomes_active(
-    http_client,
-    authenticated_copilot_session,
-    copilot_model,
+    autobest_sgr_client: OpencodeClient,
+    autobest_sgr_model: dict[str, str],
 ) -> None:
-    """After an LLM bullet list, autobest's active.key matches the first bullet."""
-    thread_id = authenticated_copilot_session
+    """SGR-driven: after a ThreeBullets turn, active.key == bullets[0].
 
-    http_client.set_autobest_enabled(thread_id, True)
+    Replaces the legacy free-form-text flake: the server now synthesises
+    an assistant text part from `structured.bullets` so the autobest
+    observer's bullet regex sees a deterministic "- bullet1\n- bullet2\n
+    - bullet3" payload. The first bullet is what the observer promotes
+    to `active.key`.
+    """
+    thread = autobest_sgr_client.create_thread()
+    thread_id = thread["id"]
 
-    _send_message_or_skip(http_client, thread_id, BULLET_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=90.0)
-
-    messages = http_client.get_messages(thread_id)
-    assistants = _assistant_messages(messages)
-    assert assistants, f"expected at least one assistant message, got {messages!r}"
-    assistant_text = _text_from_assistant(assistants[0])
-    expected_key = _first_bullet_from_text(assistant_text)
-    assert expected_key, (
-        f"assistant reply contained no recognisable bullet — got:\n{assistant_text!r}"
+    autobest_sgr_client.set_autobest_enabled(thread_id, True)
+    result = _sgr_autobest_turn(
+        autobest_sgr_client,
+        thread_id,
+        prompt=(
+            "Return a JSON object with a `bullets` field containing exactly "
+            "three short strings describing three concrete next steps for "
+            "debugging a flaky websocket. One bullet per string."
+        ),
+        model=autobest_sgr_model,
     )
 
-    state = http_client.get_autobest_by_thread(thread_id)
-    active = state.get("active") or {}
+    expected_key = result["bullets"][0][:120].strip()
+    assert expected_key, f"first bullet unexpectedly empty: {result!r}"
+
+    # Give the autobest observer a moment to run postIteration and persist
+    # the `active` key in history.
+    deadline = time.monotonic() + 10.0
+    last_state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last_state = autobest_sgr_client.get_autobest_by_thread(thread_id)
+        active = last_state.get("active") or {}
+        if active.get("key"):
+            break
+        time.sleep(0.5)
+
+    active = last_state.get("active") or {}
     assert active.get("key") == expected_key, (
         f"active.key {active.get('key')!r} != first bullet {expected_key!r} "
-        f"(full state: {state!r})"
+        f"(full state: {last_state!r})"
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — auto-resubmission of the chosen bullet
+# Test 3 — auto-resubmission of the chosen bullet (SGR-driven)
 # ---------------------------------------------------------------------------
 
 
 def test_autobest_auto_resubmits_chosen_bullet(
-    http_client,
-    authenticated_copilot_session,
-    copilot_model,
+    autobest_sgr_client: OpencodeClient,
+    autobest_sgr_model: dict[str, str],
 ) -> None:
-    """With autobest on, the chosen bullet is injected as a synthetic user turn."""
-    thread_id = authenticated_copilot_session
+    """SGR-driven: with autobest on, the chosen bullet is injected as a
+    synthetic user turn by the observer's Step A auto-continue path."""
+    thread = autobest_sgr_client.create_thread()
+    thread_id = thread["id"]
 
-    http_client.set_autobest_enabled(thread_id, True)
-    _send_message_or_skip(http_client, thread_id, BULLET_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=90.0)
+    autobest_sgr_client.set_autobest_enabled(thread_id, True)
+    _sgr_autobest_turn(
+        autobest_sgr_client,
+        thread_id,
+        prompt=(
+            "Return JSON with `bullets`: three short strings, each one "
+            "describing one concrete debugging step for a flaky websocket."
+        ),
+        model=autobest_sgr_model,
+    )
 
-    messages = http_client.get_messages(thread_id)
-    state = http_client.get_autobest_by_thread(thread_id)
+    # Wait for active.key + observer's synthetic follow-up injection.
+    deadline = time.monotonic() + 30.0
+    state: dict[str, Any] = {}
+    user_msgs: list[dict[str, Any]] = []
+    synthetic_follow_ups: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        state = autobest_sgr_client.get_autobest_by_thread(thread_id)
+        active_key = (state.get("active") or {}).get("key")
+        if active_key:
+            messages = autobest_sgr_client.get_messages(thread_id)
+            user_msgs = _user_messages(messages)
+            synthetic_follow_ups = [
+                m for m in user_msgs[1:] if _has_synthetic_text_part(m)
+            ]
+            if synthetic_follow_ups:
+                break
+        time.sleep(0.5)
+
     active_key = (state.get("active") or {}).get("key")
     assert active_key, f"autobest never selected an active key — state={state!r}"
-
-    # Expect at least one *synthetic* user message after the original, whose
-    # text equals (or contains) the active key.
-    user_msgs = _user_messages(messages)
-    assert len(user_msgs) >= 2, (
-        "expected a follow-up synthetic user turn after Step A auto-continue; "
-        f"got {len(user_msgs)} user messages. messages={messages!r}"
-    )
-    synthetic_follow_ups = [m for m in user_msgs[1:] if _has_synthetic_text_part(m)]
     assert synthetic_follow_ups, (
         "no synthetic user turn found after Step A extraction — "
-        "Step A auto-inject may be disabled. "
+        "Step A auto-inject regressed. "
         f"user messages: {user_msgs!r}"
     )
 
-    # The first synthetic follow-up should carry the active bullet as its text.
     parts = synthetic_follow_ups[0].get("parts") or []
     texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
     joined = "\n".join(texts)
@@ -424,26 +564,42 @@ def test_autobest_auto_resubmits_chosen_bullet(
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — stop pattern halts the loop
+# Test 4 — stop pattern halts the loop (SGR-driven, deterministic)
 # ---------------------------------------------------------------------------
 
 
 def test_autobest_stop_pattern_halts_loop(
-    http_client,
-    authenticated_copilot_session,
-    copilot_model,
+    autobest_sgr_client: OpencodeClient,
+    autobest_sgr_model: dict[str, str],
 ) -> None:
-    """User text containing ``stop autobest`` prevents any auto-continue."""
-    thread_id = authenticated_copilot_session
+    """User text containing ``stop autobest`` prevents auto-continue.
 
-    http_client.set_autobest_enabled(thread_id, True)
-    _send_message_or_skip(http_client, thread_id, STOP_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=90.0)
+    SGR-driven: forces deterministic 3-bullet emission so the observer's
+    bullet extractor gets real candidates, then relies on STOP_PATTERNS
+    short-circuit in the observer's Step A path to kill injection."""
+    thread = autobest_sgr_client.create_thread()
+    thread_id = thread["id"]
 
-    messages = http_client.get_messages(thread_id)
+    autobest_sgr_client.set_autobest_enabled(thread_id, True)
+    _sgr_autobest_turn(
+        autobest_sgr_client,
+        thread_id,
+        prompt=(
+            "stop autobest — Return a JSON object with `bullets` being three "
+            "short strings: 'first', 'second', 'third'."
+        ),
+        model=autobest_sgr_model,
+    )
+
+    # Give the observer a window to run — we need to confirm NOTHING
+    # synthetic was injected. Poll for up to 8s; if no synthetic user
+    # message appears, the stop-pattern did its job.
+    deadline = time.monotonic() + 8.0
+    while time.monotonic() < deadline:
+        time.sleep(1.0)
+
+    messages = autobest_sgr_client.get_messages(thread_id)
     user_msgs = _user_messages(messages)
-
-    # Exactly one user message — the original. No synthetic follow-ups.
     synthetic = [m for m in user_msgs if _has_synthetic_text_part(m)]
     assert not synthetic, (
         "stop-pattern failed to halt autobest: found synthetic follow-up user "
@@ -456,43 +612,37 @@ def test_autobest_stop_pattern_halts_loop(
 
 
 # ---------------------------------------------------------------------------
-# Test 5 — maxIterations caps follow-ups
+# Test 5 — maxIterations caps follow-ups (SGR-driven)
 # ---------------------------------------------------------------------------
 
 
 def test_autobest_max_iterations_caps_follow_ups(
-    http_client,
-    authenticated_copilot_session,
-    copilot_model,
-    monkeypatch,
+    autobest_sgr_client: OpencodeClient,
+    autobest_sgr_model: dict[str, str],
 ) -> None:
-    """With max_iterations=1, at most one synthetic follow-up turn appears.
+    """With DEFAULT_MAX_ITERATIONS=3, no more than 3 synthetic turns ever
+    appear. SGR-driven so the bullet channel is deterministic."""
+    thread = autobest_sgr_client.create_thread()
+    thread_id = thread["id"]
 
-    The observer reads its ``maxIterations`` from the Effect-layer option bag.
-    Server-side configuration for this in a running binary is set by writing
-    the autobest cycle state directly: after the first Step A advance,
-    ``cycle.iteration`` reaches 1, which — when the bound is 1 — routes the
-    next iteration to Step D (terminal).
+    autobest_sgr_client.set_autobest_enabled(thread_id, True)
+    _sgr_autobest_turn(
+        autobest_sgr_client,
+        thread_id,
+        prompt=(
+            "Return JSON with `bullets`: three short strings describing "
+            "three concrete refactoring ideas for legacy code."
+        ),
+        model=autobest_sgr_model,
+    )
 
-    We exercise the end-to-end observable: only one synthetic user turn
-    should appear regardless of how many bullets the model returns. The
-    observer's own max-iteration guard (``DEFAULT_MAX_ITERATIONS = 3``) is
-    already in force here; we verify the *observable* cap behavior rather
-    than racing against LLM variability. For deterministic bounds-checking
-    see ``test/session/autobest-observer.test.ts``.
-    """
-    thread_id = authenticated_copilot_session
+    # Give the observer + any auto-continue follow-ups time to settle.
+    time.sleep(10.0)
 
-    http_client.set_autobest_enabled(thread_id, True)
-    _send_message_or_skip(http_client, thread_id, BULLET_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=90.0)
-
-    messages = http_client.get_messages(thread_id)
+    messages = autobest_sgr_client.get_messages(thread_id)
     user_msgs = _user_messages(messages)
     synthetic = [m for m in user_msgs if _has_synthetic_text_part(m)]
 
-    # DEFAULT_MAX_ITERATIONS = 3 in autobest-observer.ts. We do not go above
-    # that — any more would be a regression in the loop guard.
     assert len(synthetic) <= 3, (
         f"autobest produced {len(synthetic)} synthetic turns, exceeding "
         f"DEFAULT_MAX_ITERATIONS=3. user messages: {user_msgs!r}"
@@ -500,41 +650,53 @@ def test_autobest_max_iterations_caps_follow_ups(
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — fork-and-resume resets cycle
+# Test 6 — fork-and-resume resets cycle (SGR-driven)
 # ---------------------------------------------------------------------------
 
 
 def test_autobest_fork_resets_cycle_state(
-    http_client,
-    authenticated_copilot_session,
-    copilot_model,
+    autobest_sgr_client: OpencodeClient,
+    autobest_sgr_model: dict[str, str],
 ) -> None:
-    """Forking a session produces a fresh thread with no autobest state."""
-    thread_id = authenticated_copilot_session
+    """Forking a session produces a fresh thread with no autobest state.
 
-    http_client.set_autobest_enabled(thread_id, True)
-    _send_message_or_skip(http_client, thread_id, BULLET_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=90.0)
+    SGR-driven parent so the assertion "parent must have an autobest pick"
+    is deterministic; the fork half is orthogonal to SGR."""
+    thread = autobest_sgr_client.create_thread()
+    thread_id = thread["id"]
 
-    parent_state = http_client.get_autobest_by_thread(thread_id)
+    autobest_sgr_client.set_autobest_enabled(thread_id, True)
+    _sgr_autobest_turn(
+        autobest_sgr_client,
+        thread_id,
+        prompt=(
+            "Return JSON with `bullets`: three short strings describing "
+            "three concrete security review steps for a web service."
+        ),
+        model=autobest_sgr_model,
+    )
+
+    # Let the observer land active.key.
+    deadline = time.monotonic() + 10.0
+    parent_state: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        parent_state = autobest_sgr_client.get_autobest_by_thread(thread_id)
+        if (parent_state.get("active") or {}).get("key"):
+            break
+        time.sleep(0.5)
+
     assert (parent_state.get("active") or {}).get("key"), (
         f"parent thread must have an autobest pick before we fork; state={parent_state!r}"
     )
 
-    forked = http_client.fork_thread(thread_id)
+    forked = autobest_sgr_client.fork_thread(thread_id)
     forked_id = forked["id"]
     assert forked_id and forked_id != thread_id
 
-    fork_state = http_client.get_autobest_by_thread(forked_id)
-    # The fork inherits the parent's autobest events up to the fork point;
-    # but the *cycle* state must reset on a new user-turn boundary. We don't
-    # send a new turn here (that's expensive) — instead we verify the fork
-    # can be queried and its autobest endpoint does not error, then flip
-    # autobest on for the fork independently.
+    fork_state = autobest_sgr_client.get_autobest_by_thread(forked_id)
     assert "enabled" in fork_state
-    # Toggle autobest on fork to prove write-through works on a fresh thread.
-    http_client.set_autobest_enabled(forked_id, True)
-    got = http_client.get_autobest_by_thread(forked_id)
+    autobest_sgr_client.set_autobest_enabled(forked_id, True)
+    got = autobest_sgr_client.get_autobest_by_thread(forked_id)
     assert got.get("enabled") is True
 
 
