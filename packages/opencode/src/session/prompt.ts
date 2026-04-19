@@ -2227,7 +2227,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     modelResponse: autoskillModelResponse,
                     parts: autoskillParts,
                     isSubAgent: autoskillIsSubAgent,
-                  }).pipe(Effect.ignore, Effect.forkIn(scope))
+                  }).pipe(
+                    Effect.ignore,
+                    Effect.provideService(Config.Service, config),
+                    Effect.provideService(Bus.Service, bus),
+                    Effect.provideService(Skill.Service, skill),
+                    Effect.provideService(Session.Service, sessions),
+                    Effect.forkIn(scope),
+                  )
                 }
                 return "break" as const
               }
