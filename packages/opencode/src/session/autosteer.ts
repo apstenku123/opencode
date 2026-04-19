@@ -120,6 +120,17 @@ export namespace SessionAutosteer {
   }
 
   /**
+   * Reason codes reported by {@link detectStagnationDetailed}. Distinguishing
+   * the two paths lets {@link evaluate} weight similarity hits differently:
+   * a similarity detection already implies TWO consecutive near-identical
+   * replies (current + prior), so counting it as a single-turn increment
+   * underweights the signal — the nudge would require a third similar turn
+   * before firing. See `test_jaccard_similarity_above_threshold_triggers`
+   * (tests-e2e/test_autosteer.py) for the regression this guards.
+   */
+  export type StagnationReason = "planning" | "similarity" | "none"
+
+  /**
    * Pure-function detector. Given the previous response (via state) and the
    * new `response`, decide whether it is stagnant. Mirrors the Rust planning
    * + similarity logic but leaves counter/injection decisions to `evaluate`.
@@ -133,17 +144,38 @@ export namespace SessionAutosteer {
     response: string,
     thresholds?: Thresholds,
   ): boolean {
-    if (!response || !response.trim()) return false
+    return detectStagnationDetailed(previous, response, thresholds) !== "none"
+  }
+
+  /**
+   * Detailed variant of {@link detectStagnation} — returns which heuristic
+   * branch tripped (or `"none"`). Used by {@link evaluate} to give the
+   * similarity path a stronger per-hit weight since a similarity match
+   * inherently observes TWO consecutive replies.
+   */
+  export function detectStagnationDetailed(
+    previous: string | undefined,
+    response: string,
+    thresholds?: Thresholds,
+  ): StagnationReason {
+    if (!response || !response.trim()) return "none"
     const minLen = thresholds?.minResponseLength ?? 0
-    if (minLen > 0 && response.length < minLen) return false
-    if (isPlanningOnly(response, thresholds)) return true
+    if (minLen > 0 && response.length < minLen) return "none"
+    // Action markers (```, Edited, Created, Ran) indicate concrete work —
+    // the reply is not stagnant regardless of planning phrases or surface
+    // similarity to the prior turn. This guard must run BEFORE the
+    // similarity check to honour `test_action_markers_skip_nudge`: two
+    // replies that both contain the same fenced code block are lexically
+    // similar but operationally progressing.
+    if (hasActionMarkers(response, thresholds)) return "none"
+    if (isPlanningOnly(response, thresholds)) return "planning"
     if (previous && previous.trim()) {
       const a = response.slice(0, SIMILARITY_PREFIX_CHARS)
       const b = previous.slice(0, SIMILARITY_PREFIX_CHARS)
       const threshold = thresholds?.similarityThreshold ?? SIMILARITY_THRESHOLD
-      if (jaccardSimilarity(a, b) > threshold) return true
+      if (jaccardSimilarity(a, b) > threshold) return "similarity"
     }
-    return false
+    return "none"
   }
 
   export interface Evaluation {
@@ -158,10 +190,18 @@ export namespace SessionAutosteer {
   /**
    * Evaluate a fresh assistant response against prior state.
    *
-   * Logic mirrors `check_core_autosteering`:
+   * Logic mirrors `check_core_autosteering` with one refinement: a
+   * similarity-path detection bumps the stagnation counter by 2 instead
+   * of 1 because a similarity hit inherently involves TWO consecutive
+   * near-identical replies (current + prior). Planning detections still
+   * increment by 1 per turn since each turn is independently assessed.
+   *
    *   - skip empty/whitespace messages (returns previous state unchanged,
    *     stagnant=false, nudge=false)
-   *   - if stagnant, bump the counter; inject on STAGNATION_TRIGGER
+   *   - planning-only turn → counter += 1
+   *   - similarity-above-threshold turn → counter += 2 (fires nudge on
+   *     the SECOND similar reply — aligned with the test expectation
+   *     that two verbatim echoes trigger the canned nudge)
    *   - if not stagnant, reset the counter to 0
    *   - always remember the last response for next time
    */
@@ -170,10 +210,12 @@ export namespace SessionAutosteer {
       return { nudge: false, nextState: state, stagnant: false }
     }
     const prev = state.previousResponse
-    const stagnant = detectStagnation(prev, response, thresholds)
+    const reason = detectStagnationDetailed(prev, response, thresholds)
     const nextPrev = response.slice(0, SIMILARITY_PREFIX_CHARS)
-    if (stagnant) {
-      const nextCount = state.stagnationCount + 1
+    if (reason !== "none") {
+      // Similarity detections imply two observed replies; count as 2.
+      const weight = reason === "similarity" ? 2 : 1
+      const nextCount = state.stagnationCount + weight
       const trigger = thresholds?.stagnationTrigger ?? STAGNATION_TRIGGER
       const nudge = nextCount >= trigger
       return {

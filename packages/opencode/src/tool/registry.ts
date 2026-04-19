@@ -72,6 +72,29 @@ export interface Interface {
   readonly all: () => Effect.Effect<Tool.Def[]>
   readonly named: () => Effect.Effect<{ task: TaskDef; read: ReadDef }>
   readonly tools: (model: { providerID: ProviderID; modelID: ModelID; agent: Agent.Info }) => Effect.Effect<Tool.Def[]>
+  /**
+   * Look up a tool by `id` against the registry's builtin+custom list.
+   * Returns `undefined` when the tool does not exist — callers may fall
+   * through to an error path.
+   *
+   * The returned `Tool.Def` is the *raw* definition (not wrapped with
+   * PreToolUse/PostToolUse dispatch). Callers that want hooks to fire
+   * around `execute()` should route through `ToolRegistry.tools()` or
+   * use {@link dispatchByName} which wraps in the same way.
+   */
+  readonly byName: (id: string) => Effect.Effect<Tool.Def | undefined>
+  /**
+   * Resolve tool `id`, invoke its `execute(args, ctx)`, and ensure
+   * PreToolUse + PostToolUse hooks fire around the call exactly like
+   * a normal provider-driven invocation. Used by SGR auto-dispatch to
+   * run a downstream tool after a schema-guided-reasoning response is
+   * captured without round-tripping through the LLM.
+   */
+  readonly dispatchByName: (
+    id: string,
+    args: unknown,
+    ctx: Tool.Context,
+  ) => Effect.Effect<Tool.ExecuteResult>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolRegistry") {}
@@ -316,109 +339,6 @@ export const layer: Layer.Layer<
             parameters: tool.parameters,
           }
           yield* plugin.trigger("tool.definition", { toolID: tool.id }, output)
-          // Decorate the underlying execute to fan tool outcomes into the
-          // skill evolution engine. Fire-and-forget — never let a bookkeeping
-          // failure abort the user-facing tool call.
-          //
-          // Additionally dispatches `PreToolUse` / `PostToolUse` hook events
-          // around every tool invocation. Mirrors `codex-rs/hooks/src/command_hook.rs`
-          // decision semantics — a PreToolUse `FailedAbort` or
-          // `permissionDecision: "deny"` short-circuits execute with an
-          // `AbortError`; `permissionDecision: "ask"` forwards to
-          // `Permission.Service` via `ctx.ask`; `permissionDecision: "allow"`
-          // (or unset) proceeds. A PreToolUse `updatedInput` replaces the
-          // forwarded args. A PostToolUse `updatedMCPToolOutput` replaces the
-          // captured output string.
-          const wrappedExecute: Tool.Def["execute"] = (args, ctx) =>
-            Effect.gen(function* () {
-              // ---- PreToolUse ----------------------------------------------
-              const pre = yield* hooks
-                .dispatch({
-                  event: {
-                    hook_event_name: "PreToolUse",
-                    tool_name: tool.id,
-                    tool_input: args,
-                    tool_use_id: ctx.callID,
-                  },
-                  sessionID: ctx.sessionID,
-                })
-                .pipe(
-                  Effect.catchCause(() =>
-                    Effect.succeed<Hook.HookDispatchResult>({
-                      outcome: "continue",
-                      responses: [],
-                    }),
-                  ),
-                )
-
-              if (pre.outcome === "abort") {
-                const err = new Error(pre.abortReason ?? `PreToolUse hook aborted '${tool.id}'`)
-                err.name = "AbortError"
-                return yield* Effect.die(err)
-              }
-
-              if (pre.decisionBehavior === "deny") {
-                const err = new Error(pre.decisionMessage ?? `PreToolUse hook denied '${tool.id}'`)
-                err.name = "AbortError"
-                return yield* Effect.die(err)
-              }
-
-              if (pre.decisionBehavior === "ask") {
-                yield* ctx.ask({
-                  permission: tool.id,
-                  patterns: ["*"],
-                  always: ["*"],
-                  metadata: { hookReason: pre.decisionMessage ?? "hook requests user approval" },
-                })
-              }
-
-              // PreToolUse may replace the tool input.
-              const effectiveArgs = pre.updatedInput !== undefined ? (pre.updatedInput as typeof args) : args
-
-              // ---- execute -------------------------------------------------
-              const result = yield* tool.execute(effectiveArgs, ctx).pipe(
-                Effect.tapDefect((cause) =>
-                  evolution
-                    .onToolComplete({
-                      toolName: tool.id,
-                      success: false,
-                      error: String(cause),
-                    })
-                    .pipe(Effect.ignore),
-                ),
-              )
-              yield* evolution
-                .onToolComplete({ toolName: tool.id, success: true })
-                .pipe(Effect.ignore)
-
-              // ---- PostToolUse ---------------------------------------------
-              const callID = ctx.callID ?? ""
-              const post = yield* hooks
-                .dispatch({
-                  event: {
-                    hook_event_name: "PostToolUse",
-                    tool_name: tool.id,
-                    tool_input: effectiveArgs,
-                    tool_response: result.output,
-                    tool_use_id: callID,
-                  },
-                  sessionID: ctx.sessionID,
-                })
-                .pipe(
-                  Effect.catchCause(() =>
-                    Effect.succeed<Hook.HookDispatchResult>({
-                      outcome: "continue",
-                      responses: [],
-                    }),
-                  ),
-                )
-
-              if (post.updatedOutput !== undefined && typeof post.updatedOutput === "string") {
-                return { ...result, output: post.updatedOutput }
-              }
-
-              return result
-            })
           return {
             id: tool.id,
             description: [
@@ -429,7 +349,7 @@ export const layer: Layer.Layer<
               .filter(Boolean)
               .join("\n"),
             parameters: output.parameters,
-            execute: wrappedExecute,
+            execute: wrapWithHooks(tool),
             formatValidationError: tool.formatValidationError,
           }
         }),
@@ -437,12 +357,147 @@ export const layer: Layer.Layer<
       )
     })
 
+    // Decorate the underlying execute to fan tool outcomes into the
+    // skill evolution engine. Fire-and-forget — never let a bookkeeping
+    // failure abort the user-facing tool call.
+    //
+    // Additionally dispatches `PreToolUse` / `PostToolUse` hook events
+    // around every tool invocation. Mirrors `codex-rs/hooks/src/command_hook.rs`
+    // decision semantics — a PreToolUse `FailedAbort` or
+    // `permissionDecision: "deny"` short-circuits execute with an
+    // `AbortError`; `permissionDecision: "ask"` forwards to
+    // `Permission.Service` via `ctx.ask`; `permissionDecision: "allow"`
+    // (or unset) proceeds. A PreToolUse `updatedInput` replaces the
+    // forwarded args. A PostToolUse `updatedMCPToolOutput` replaces the
+    // captured output string.
+    function wrapWithHooks(tool: Tool.Def): Tool.Def["execute"] {
+      return (args, ctx) =>
+        Effect.gen(function* () {
+          // ---- PreToolUse ----------------------------------------------
+          const pre = yield* hooks
+            .dispatch({
+              event: {
+                hook_event_name: "PreToolUse",
+                tool_name: tool.id,
+                tool_input: args,
+                tool_use_id: ctx.callID,
+              },
+              sessionID: ctx.sessionID,
+            })
+            .pipe(
+              Effect.catchCause(() =>
+                Effect.succeed<Hook.HookDispatchResult>({
+                  outcome: "continue",
+                  responses: [],
+                }),
+              ),
+            )
+
+          if (pre.outcome === "abort") {
+            const err = new Error(pre.abortReason ?? `PreToolUse hook aborted '${tool.id}'`)
+            err.name = "AbortError"
+            return yield* Effect.die(err)
+          }
+
+          if (pre.decisionBehavior === "deny") {
+            const err = new Error(pre.decisionMessage ?? `PreToolUse hook denied '${tool.id}'`)
+            err.name = "AbortError"
+            return yield* Effect.die(err)
+          }
+
+          if (pre.decisionBehavior === "ask") {
+            yield* ctx.ask({
+              permission: tool.id,
+              patterns: ["*"],
+              always: ["*"],
+              metadata: { hookReason: pre.decisionMessage ?? "hook requests user approval" },
+            })
+          }
+
+          // PreToolUse may replace the tool input.
+          const effectiveArgs = pre.updatedInput !== undefined ? (pre.updatedInput as typeof args) : args
+
+          // ---- execute -------------------------------------------------
+          const result = yield* tool.execute(effectiveArgs, ctx).pipe(
+            Effect.tapDefect((cause) =>
+              evolution
+                .onToolComplete({
+                  toolName: tool.id,
+                  success: false,
+                  error: String(cause),
+                })
+                .pipe(Effect.ignore),
+            ),
+          )
+          yield* evolution.onToolComplete({ toolName: tool.id, success: true }).pipe(Effect.ignore)
+
+          // ---- PostToolUse ---------------------------------------------
+          const callID = ctx.callID ?? ""
+          const post = yield* hooks
+            .dispatch({
+              event: {
+                hook_event_name: "PostToolUse",
+                tool_name: tool.id,
+                tool_input: effectiveArgs,
+                tool_response: result.output,
+                tool_use_id: callID,
+              },
+              sessionID: ctx.sessionID,
+            })
+            .pipe(
+              Effect.catchCause(() =>
+                Effect.succeed<Hook.HookDispatchResult>({
+                  outcome: "continue",
+                  responses: [],
+                }),
+              ),
+            )
+
+          if (post.updatedOutput !== undefined && typeof post.updatedOutput === "string") {
+            return { ...result, output: post.updatedOutput }
+          }
+
+          return result
+        })
+    }
+
+    const byName: Interface["byName"] = Effect.fn("ToolRegistry.byName")(function* (id) {
+      const list = yield* all()
+      return list.find((t) => t.id === id)
+    })
+
+    const dispatchByName: Interface["dispatchByName"] = Effect.fn("ToolRegistry.dispatchByName")(function* (
+      id,
+      args,
+      ctx,
+    ) {
+      const tool = yield* byName(id)
+      if (!tool) {
+        const err = new Error(`tool '${id}' not found in registry`)
+        err.name = "NotFoundError"
+        return yield* Effect.die(err)
+      }
+      // Validate args against the tool's parameter schema so malformed
+      // SGR payloads fail loudly here instead of inside the tool body.
+      const parseResult = tool.parameters.safeParse(args)
+      if (!parseResult.success) {
+        const err = new Error(
+          tool.formatValidationError
+            ? tool.formatValidationError(parseResult.error)
+            : `invalid arguments for tool '${id}': ${parseResult.error.message}`,
+        )
+        err.name = "ValidationError"
+        return yield* Effect.die(err)
+      }
+      return yield* wrapWithHooks(tool)(parseResult.data, ctx)
+    })
+
     const named: Interface["named"] = Effect.fn("ToolRegistry.named")(function* () {
       const s = yield* InstanceState.get(state)
       return { task: s.task, read: s.read }
     })
 
-    return Service.of({ ids, all, named, tools })
+    return Service.of({ ids, all, named, tools, byName, dispatchByName })
   }),
 )
 

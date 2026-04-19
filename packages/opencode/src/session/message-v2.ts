@@ -72,6 +72,40 @@ export namespace MessageV2 {
       ref: "OutputFormatText",
     })
 
+  /**
+   * Extension field honoured by the SGR auto-dispatch runtime (see
+   * `SessionPrompt.runLoop`). When the JSON schema passed to
+   * {@link OutputFormatJsonSchema.shape.schema} carries an
+   * `x-opencode-dispatch` field, the server reads the captured
+   * structured output and automatically invokes the referenced tool
+   * through the normal PreToolUse/PostToolUse hook chain — no
+   * additional LLM round-trip required.
+   *
+   * Shape:
+   *   - `tool`:        tool id registered in {@link ToolRegistry.Service}
+   *                    (e.g. "bash", "read", "edit").
+   *   - `args_from`:   when set, the payload field whose value becomes
+   *                    the singular input of the tool (e.g. "command"
+   *                    for bash). When omitted the full payload is
+   *                    passed as-is. Mutually exclusive with `args`.
+   *   - `args`:        optional pass-through literal overrides merged
+   *                    on top of the payload-derived args.
+   *   - `auto_dispatch`: default `true`. Set to `false` to register the
+   *                    hint without triggering dispatch (useful for
+   *                    schemas shared across code paths).
+   */
+  export const StructuredDispatchHint = z
+    .object({
+      tool: z.string(),
+      args_from: z.string().optional(),
+      args: z.record(z.string(), z.any()).optional(),
+      auto_dispatch: z.boolean().default(true),
+    })
+    .meta({
+      ref: "StructuredDispatchHint",
+    })
+  export type StructuredDispatchHint = z.infer<typeof StructuredDispatchHint>
+
   export const OutputFormatJsonSchema = z
     .object({
       type: z.literal("json_schema"),
@@ -81,6 +115,23 @@ export namespace MessageV2 {
     .meta({
       ref: "OutputFormatJsonSchema",
     })
+
+  /**
+   * Read a {@link StructuredDispatchHint} from a JSON schema's
+   * `x-opencode-dispatch` extension field. Returns `undefined` when the
+   * field is absent or invalid; the SGR auto-dispatch runtime treats
+   * that as "no dispatch" (identical to the pre-auto-dispatch
+   * behaviour of emitting only the structured payload).
+   */
+  export function readDispatchHint(schema: Record<string, unknown> | undefined): StructuredDispatchHint | undefined {
+    if (!schema) return undefined
+    const raw = schema["x-opencode-dispatch"]
+    if (!raw || typeof raw !== "object") return undefined
+    const parsed = StructuredDispatchHint.safeParse(raw)
+    if (!parsed.success) return undefined
+    if (parsed.data.auto_dispatch === false) return undefined
+    return parsed.data
+  }
 
   export const Format = z.discriminatedUnion("type", [OutputFormatText, OutputFormatJsonSchema]).meta({
     ref: "OutputFormat",

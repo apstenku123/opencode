@@ -1997,6 +1997,116 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 handle.message.structured = structured
                 handle.message.finish = handle.message.finish ?? "stop"
                 yield* sessions.updateMessage(handle.message)
+                // ---- SGR auto-dispatch ------------------------------------
+                // When the requested schema carries an `x-opencode-dispatch`
+                // hint, the server extracts `{tool, args_from, args}` from
+                // the structured payload and synthetically fires the named
+                // tool through `ToolRegistry.dispatchByName`. The tool runs
+                // under the same PreToolUse + PostToolUse hook chain the
+                // provider-driven tool flow uses — so hook-based tests can
+                // observe auto-dispatched calls identically to user-driven
+                // ones. Failures in the dispatch path surface as an error
+                // tool part but never propagate out of the runLoop: the
+                // SGR payload is already captured, and aborting here would
+                // lose it.
+                if (format.type === "json_schema") {
+                  const hint = MessageV2.readDispatchHint(format.schema)
+                  if (hint) {
+                    const payload =
+                      structured && typeof structured === "object" ? (structured as Record<string, any>) : {}
+                    const baseArgs: Record<string, any> =
+                      hint.args_from && hint.args_from in payload
+                        ? { [hint.args_from]: payload[hint.args_from] }
+                        : { ...payload }
+                    const dispatchArgs: Record<string, any> = { ...baseArgs, ...(hint.args ?? {}) }
+                    const callID = ulid()
+                    let part: MessageV2.ToolPart = yield* sessions.updatePart({
+                      id: PartID.ascending(),
+                      messageID: handle.message.id,
+                      sessionID: handle.message.sessionID,
+                      type: "tool",
+                      callID,
+                      tool: hint.tool,
+                      state: {
+                        status: "running",
+                        input: dispatchArgs,
+                        time: { start: Date.now() },
+                      },
+                    } satisfies MessageV2.ToolPart)
+                    const dispatchAbort = new AbortController()
+                    const dispatchCtx: Tool.Context = {
+                      sessionID,
+                      messageID: handle.message.id,
+                      agent: agent.name,
+                      abort: dispatchAbort.signal,
+                      callID,
+                      extra: { model, bypassAgentCheck: true },
+                      messages: yield* sessions.messages({ sessionID }),
+                      metadata: (val) =>
+                        Effect.gen(function* () {
+                          if (part.state.status !== "running") return
+                          part = yield* sessions.updatePart({
+                            ...part,
+                            state: {
+                              ...part.state,
+                              ...(val.title !== undefined ? { title: val.title } : {}),
+                              ...(val.metadata !== undefined ? { metadata: val.metadata } : {}),
+                            },
+                          } satisfies MessageV2.ToolPart)
+                        }),
+                      ask: (req) =>
+                        permission
+                          .ask({
+                            ...req,
+                            sessionID,
+                            tool: { messageID: handle.message.id, callID },
+                            ruleset: Permission.merge(agent.permission, session.permission ?? []),
+                          })
+                          .pipe(Effect.orDie),
+                    }
+                    const dispatchStartTime =
+                      part.state.status === "running" ? part.state.time.start : Date.now()
+                    yield* Effect.logInfo("sgr.dispatch.start", { tool: hint.tool, callID }).pipe(Effect.ignore)
+                    const exit = yield* Effect.exit(registry.dispatchByName(hint.tool, dispatchArgs, dispatchCtx))
+                    if (Exit.isSuccess(exit)) {
+                      const output = exit.value
+                      yield* sessions.updatePart({
+                        ...part,
+                        state: {
+                          status: "completed",
+                          input: dispatchArgs,
+                          output: output.output,
+                          title: output.title ?? hint.tool,
+                          metadata: output.metadata ?? {},
+                          time: { start: dispatchStartTime, end: Date.now() },
+                          attachments: output.attachments?.map((a) => ({
+                            ...a,
+                            id: PartID.ascending(),
+                            sessionID,
+                            messageID: handle.message.id,
+                          })),
+                        },
+                      } satisfies MessageV2.ToolPart)
+                    } else {
+                      const squashed = Cause.squash(exit.cause)
+                      const errMsg =
+                        squashed instanceof Error
+                          ? squashed.message
+                          : typeof squashed === "string"
+                            ? squashed
+                            : String(squashed)
+                      yield* sessions.updatePart({
+                        ...part,
+                        state: {
+                          status: "error",
+                          input: dispatchArgs,
+                          error: errMsg,
+                          time: { start: dispatchStartTime, end: Date.now() },
+                        },
+                      } satisfies MessageV2.ToolPart)
+                    }
+                  }
+                }
                 return "break" as const
               }
 

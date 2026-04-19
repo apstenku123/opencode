@@ -185,7 +185,7 @@ def _send(
     text: str,
     model: dict[str, str],
     *,
-    timeout_s: float = 120.0,
+    timeout_s: float = 240.0,
 ) -> dict[str, Any]:
     """Fire a user turn and return the resulting assistant message.
 
@@ -196,6 +196,13 @@ def _send(
     Before sending, we count existing assistant messages so ``_wait_turn_complete``
     can target the NEW one (turns are additive — the nth turn produces the
     (n-1)th assistant message).
+
+    ``timeout_s`` bounds BOTH the HTTP POST (the server returns only when
+    the full turn completes) AND the ``_wait_turn_complete`` poll. A nudge
+    injection causes the server to run additional iterations on top of
+    the user-initiated turn — each extra iteration is another LLM call
+    (~10-30s on Copilot) so we default to 240s to absorb up to one
+    autosteer-triggered nudge + one follow-up iteration.
     """
     prior_messages = client.get_messages(thread_id)
     prior_count = len(_assistant_messages(prior_messages))
@@ -204,6 +211,7 @@ def _send(
         text,
         providerID=model["providerID"],
         modelID=model["modelID"],
+        timeout=timeout_s,
     )
     _wait_turn_complete(
         client,

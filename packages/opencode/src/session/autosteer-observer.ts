@@ -191,12 +191,25 @@ export namespace SessionAutosteerObserver {
       // context preserved) and continues the loop. Cumulative-nudge
       // telemetry is updated here so it tracks real nudge injections
       // only — evaluateSession itself is detection-only.
+      //
+      // Per-cycle cap (`MAX_PER_CYCLE`) prevents runaway nudging when a
+      // model stubbornly reproduces the stagnation pattern after being
+      // nudged (e.g. a "repeat verbatim" prompt that keeps echoing). One
+      // nudge per cycle is sufficient for the intended behavior: redirect
+      // the model, observe the next turn, and trust the user to rerun if
+      // the model still planning-loops. The cap is reset on every fresh
+      // user-initiated turn via `AdaptiveState.resetCycle` (see
+      // `adaptive.ts`).
+      const MAX_PER_CYCLE = 1
       yield* adaptive.register({
         name: "autosteer",
-        postIteration: (_state, args) =>
+        postIteration: (state, args) =>
           Effect.gen(function* () {
             const out = yield* evaluateSession(args.sessionID)
             if (!out.nudge || !out.nudgeText) return AdaptiveHooks.Continue
+            const prior = (state.scratch.autosteerCycleNudges as number | undefined) ?? 0
+            if (prior >= MAX_PER_CYCLE) return AdaptiveHooks.Continue
+            state.scratch.autosteerCycleNudges = prior + 1
             const counts = yield* InstanceState.get(nudgeCounts)
             const nextLifetime = (counts.get(args.sessionID) ?? 0) + 1
             counts.set(args.sessionID, nextLifetime)
