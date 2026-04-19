@@ -1035,17 +1035,16 @@ def subagent_sgr_client(subagent_sgr_server):
 def subagent_sgr_model() -> dict[str, str]:
     """Provider/model pair for SGR subagent tests.
 
-    Defaults to ``github-copilot#personal / gpt-5-mini`` (verified in
-    ``test_sgr_determinism.py`` + ``test_autobest.py`` to honour
-    ``format=json_schema`` and land ``info.structured`` in ~15-30s).
-    Overridable via ``OPENCODE_E2E_SGR_PROVIDER`` /
-    ``OPENCODE_E2E_SGR_MODEL``.
+    Defaults to ``github-copilot#personal / gpt-4.1`` — see
+    ``test_autobest.py::autobest_sgr_model`` docstring for the model
+    selection rationale. Overridable via ``OPENCODE_E2E_SGR_PROVIDER``
+    / ``OPENCODE_E2E_SGR_MODEL``.
     """
     return {
         "providerID": os.environ.get(
             "OPENCODE_E2E_SGR_PROVIDER", "github-copilot#personal"
         ),
-        "modelID": os.environ.get("OPENCODE_E2E_SGR_MODEL", "gpt-5-mini"),
+        "modelID": os.environ.get("OPENCODE_E2E_SGR_MODEL", "gpt-4.1"),
     }
 
 
