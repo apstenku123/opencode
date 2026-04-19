@@ -45,9 +45,22 @@ from harness import resolve_opencode_binary  # noqa: E402
 # ---------------------------------------------------------------------------
 
 PRIMARY_KEY = "github-copilot"
+# Resolved dynamically by the accounts fixture — defaults to legacy key.
 SECONDARY_KEY = "github-copilot#second"
+# The secondary (pitermusic) account has been filed under two different
+# keys across opencode versions: `#second` (legacy XDG migration) and
+# `#piter` (macOS Application Support auth.json). Accept either so the
+# tests don't skip when the environment uses the newer key.
+SECONDARY_KEY_CANDIDATES = ("github-copilot#second", "github-copilot#piter")
 PRIMARY_LOGIN = "jeweldave"
 SECONDARY_LOGIN = "pitermusic"
+
+
+def _resolve_secondary_key(accounts: dict[str, Any]) -> str | None:
+    for k in SECONDARY_KEY_CANDIDATES:
+        if k in accounts:
+            return k
+    return None
 
 
 def _run_cli(*args: str, timeout_s: float = 60.0, retries: int = 2) -> tuple[int, str, str]:
@@ -106,7 +119,7 @@ def _require_copilot_accounts() -> dict[str, dict[str, Any]]:
     assert rc == 0, f"providers accounts --json failed rc={rc}\n{stdout}"
     data = _parse_cli_json(stdout)
     items_by_key = {item["status"]["key"]: item for item in data.get("items", [])}
-    if PRIMARY_KEY not in items_by_key or SECONDARY_KEY not in items_by_key:
+    if PRIMARY_KEY not in items_by_key or _resolve_secondary_key(items_by_key) is None:
         pytest.skip(
             f"requires both {PRIMARY_KEY} + {SECONDARY_KEY} accounts configured "
             f"(found: {sorted(items_by_key)})"
@@ -213,11 +226,13 @@ def test_accounts_reports_both_copilot_accounts(accounts: dict[str, dict[str, An
     assert PRIMARY_KEY in accounts, (
         f"{PRIMARY_KEY} missing from providers accounts output; got {sorted(accounts)}"
     )
-    assert SECONDARY_KEY in accounts, (
-        f"{SECONDARY_KEY} missing from providers accounts output; got {sorted(accounts)}"
+    _secondary = next((k for k in SECONDARY_KEY_CANDIDATES if k in accounts), None)
+    assert _secondary is not None, (
+        f"secondary account missing from providers accounts output (looked for {SECONDARY_KEY_CANDIDATES}); "
+        f"got {sorted(accounts)}"
     )
 
-    for key in (PRIMARY_KEY, SECONDARY_KEY):
+    for key in (PRIMARY_KEY, _secondary):
         item = accounts[key]
         status = item["status"]
         assert status["plan"], f"{key}: plan is empty ({status['plan']!r})"
@@ -237,8 +252,10 @@ def test_accounts_have_distinct_logins(accounts: dict[str, dict[str, Any]]) -> N
     Catches regressions where both aliases end up pointing at the same
     refresh token (e.g. a buggy import/merge or alias collision).
     """
+    _secondary = next((k for k in SECONDARY_KEY_CANDIDATES if k in accounts), None)
+    assert _secondary is not None, f"no secondary account found; keys={sorted(accounts)}"
     primary_login = accounts[PRIMARY_KEY]["status"]["login"]
-    secondary_login = accounts[SECONDARY_KEY]["status"]["login"]
+    secondary_login = accounts[_secondary]["status"]["login"]
     assert primary_login == PRIMARY_LOGIN, f"primary login mismatch: {primary_login!r}"
     assert secondary_login == SECONDARY_LOGIN, f"secondary login mismatch: {secondary_login!r}"
     assert primary_login != secondary_login
@@ -257,8 +274,9 @@ def test_quota_bars_for_both_accounts(accounts: dict[str, dict[str, Any]]) -> No
     items = data.get("items", [])
     assert len(items) >= 2, f"expected >= 2 accounts, got {len(items)}"
 
+    _allowed = {PRIMARY_KEY, *SECONDARY_KEY_CANDIDATES}
     for item in items:
-        if item["status"]["key"] not in (PRIMARY_KEY, SECONDARY_KEY):
+        if item["status"]["key"] not in _allowed:
             continue
         bar = item.get("premium")
         assert isinstance(bar, str) and bar.strip(), (
@@ -289,7 +307,8 @@ def test_route_debug_returns_sorted_candidates(
     assert data["schemaVersion"] == 1
     candidates = data["candidates"]
     keys = [c["key"] for c in candidates]
-    assert PRIMARY_KEY in keys and SECONDARY_KEY in keys, (
+    _secondary = next((k for k in SECONDARY_KEY_CANDIDATES if k in keys), None)
+    assert PRIMARY_KEY in keys and _secondary is not None, (
         f"expected both accounts in candidates, got {keys}"
     )
 
@@ -406,7 +425,8 @@ def test_export_import_roundtrip_redacted(accounts: dict[str, dict[str, Any]]) -
         assert body.get("redacted") is True
         assert isinstance(body["accounts"], list) and len(body["accounts"]) >= 2
         keys = {a["key"] for a in body["accounts"]}
-        assert {PRIMARY_KEY, SECONDARY_KEY}.issubset(keys), (
+        _secondary = next((k for k in SECONDARY_KEY_CANDIDATES if k in keys), None)
+        assert PRIMARY_KEY in keys and _secondary is not None, (
             f"bundle missing expected accounts: got {keys}"
         )
         # Redacted => no refresh tokens present.
@@ -434,7 +454,8 @@ def test_export_import_roundtrip_redacted(accounts: dict[str, dict[str, Any]]) -
         assert result["updated"] == [], f"dry-run updated: {result['updated']}"
         assert result["removed"] == [], f"dry-run removed: {result['removed']}"
         skipped = set(result["skipped"])
-        assert {PRIMARY_KEY, SECONDARY_KEY}.issubset(skipped), (
+        _secondary = next((k for k in SECONDARY_KEY_CANDIDATES if k in skipped), None)
+        assert PRIMARY_KEY in skipped and _secondary is not None, (
             f"dry-run did not skip both redacted accounts: {result['skipped']}"
         )
 
@@ -454,7 +475,8 @@ def test_export_bundle_contains_tokens_when_not_redacted(
         body = json.loads(bundle_path.read_text())
         # Non-redacted => every account carries a refresh token (non-empty).
         by_key = {a["key"]: a for a in body["accounts"]}
-        for key in (PRIMARY_KEY, SECONDARY_KEY):
+        _secondary = next((k for k in SECONDARY_KEY_CANDIDATES if k in by_key), SECONDARY_KEY_CANDIDATES[0])
+        for key in (PRIMARY_KEY, _secondary):
             assert key in by_key, f"bundle missing {key}"
             tok = by_key[key].get("refresh")
             assert isinstance(tok, str) and tok.startswith("gho_"), (
