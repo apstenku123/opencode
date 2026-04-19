@@ -3,22 +3,39 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test"
 import {
   accountStatus,
   ACCOUNT_STATUS_SCHEMA_VERSION,
+  addTestAccountConfig,
   emptyDiscovery,
+  globalConfigPath,
   jsonMigration,
   jsonStatus,
+  listTestAccountsConfig,
   loadAccountHealth,
+  mutateConnections,
   ProvidersAccountsCommand,
+  ProvidersActivateCommand,
+  ProvidersAllowedModelsCommand,
+  ProvidersDeactivateCommand,
   ProvidersListCommand,
+  ProvidersPoolCommand,
   ProvidersQuotaCommand,
+  ProvidersRotateMachineIdCommand,
+  ProvidersRotateProxyCommand,
   ProvidersRouteDebugCommand,
+  ProvidersTestAccountsCommand,
+  readGlobalConfigRaw,
+  removeTestAccountConfig,
   renderAccountStatus,
   renderBestPerVendor,
+  rotateMachineId,
+  rotateProxyConfig,
+  setPoolOverrideConfig,
   applyProxy,
   copilotAliasLabel,
   copilotAliasName,
   proxyList,
   quotaAccounts,
   saveProxy,
+  writeGlobalConfigRaw,
 } from "@/cli/cmd/providers"
 import { connectionFile } from "@/plugin/github-copilot/paths"
 import { Auth } from "@/auth"
@@ -34,6 +51,7 @@ process.env.OPENCODE_PROBE_DISCOVERY = "0"
 
 afterEach(async () => {
   await rm(connectionFile, { force: true }).catch(() => undefined)
+  await rm(globalConfigPath(), { force: true }).catch(() => undefined)
 })
 
 async function seedState(connections: Record<string, object>) {
@@ -964,3 +982,254 @@ test("ProvidersAccountsCommand --json includes health triage and bestPerVendor",
 // + Instance services to be active (ModelsDev.get hits a Service.use).
 // We exercise the new behaviour via `renderBestPerVendor` above.
 void ProvidersListCommand
+
+describe("ProvidersDeactivate/Activate", () => {
+  test("deactivate marks the account and persists", async () => {
+    await seedState({ "github-copilot#edu": {} })
+    await ProvidersDeactivateCommand.handler({ key: "github-copilot#edu" } as never)
+    const raw = JSON.parse(await readFile(connectionFile, "utf8"))
+    expect(raw.connections["github-copilot#edu"].deactivated).toBe(true)
+  })
+
+  test("activate clears the deactivated flag", async () => {
+    await seedState({ "github-copilot#edu": { deactivated: true } })
+    await ProvidersActivateCommand.handler({ key: "github-copilot#edu" } as never)
+    const raw = JSON.parse(await readFile(connectionFile, "utf8"))
+    // JSON.stringify drops `undefined`, so the flag disappears entirely.
+    expect(raw.connections["github-copilot#edu"].deactivated).toBeUndefined()
+  })
+})
+
+describe("ProvidersRotateMachineId", () => {
+  test("rotateMachineId helper strips machineId in place", () => {
+    const state = {
+      version: 1 as const,
+      connections: { "github-copilot": { machineId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" } },
+    }
+    const next = rotateMachineId(state, "github-copilot")
+    expect(next.connections["github-copilot"].machineId).toBeUndefined()
+  })
+
+  test("command persists an empty machineId so next dispatch mints a new one", async () => {
+    await seedState({
+      "github-copilot": { machineId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", plan: "free" },
+    })
+    await ProvidersRotateMachineIdCommand.handler({ key: "github-copilot" } as never)
+    const raw = JSON.parse(await readFile(connectionFile, "utf8"))
+    expect(raw.connections["github-copilot"].machineId).toBeUndefined()
+    // Unrelated fields are preserved — the rotation is surgical.
+    expect(raw.connections["github-copilot"].plan).toBe("free")
+  })
+})
+
+describe("ProvidersRotateProxy", () => {
+  test("rotateProxyConfig writes url/token/envelope", () => {
+    const next = rotateProxyConfig(
+      { version: 1 as const, connections: {} },
+      "github-copilot#edu",
+      { url: "https://gcp.example", token: "tok", envelope: true },
+    )
+    expect(next.connections["github-copilot#edu"]).toEqual({
+      proxyUrl: "https://gcp.example",
+      proxyToken: "tok",
+      envelope: true,
+    })
+  })
+
+  test("command persists proxy config to the connection store", async () => {
+    await seedState({ "github-copilot#edu": {} })
+    await ProvidersRotateProxyCommand.handler({
+      key: "github-copilot#edu",
+      url: "https://gcp.example",
+      token: "ptok",
+      envelope: true,
+    } as never)
+    const raw = JSON.parse(await readFile(connectionFile, "utf8"))
+    expect(raw.connections["github-copilot#edu"]).toEqual({
+      proxyUrl: "https://gcp.example",
+      proxyToken: "ptok",
+      envelope: true,
+    })
+  })
+
+  test("command with empty url clears proxy", async () => {
+    await seedState({
+      "github-copilot#edu": {
+        proxyUrl: "https://gcp.example",
+        proxyToken: "ptok",
+        envelope: true,
+      },
+    })
+    await ProvidersRotateProxyCommand.handler({ key: "github-copilot#edu", url: "" } as never)
+    const raw = JSON.parse(await readFile(connectionFile, "utf8"))
+    expect(raw.connections["github-copilot#edu"]).toEqual({})
+  })
+})
+
+describe("ProvidersPool", () => {
+  test("setPoolOverrideConfig pins account to a pool and preserves siblings", () => {
+    const cfg = { copilot: { poolRouting: { pools: { prod: ["github-copilot"] } } } }
+    const next = setPoolOverrideConfig(cfg, "github-copilot#edu", "edu")
+    expect(next.copilot.poolRouting.pools).toEqual({
+      edu: ["github-copilot#edu"],
+      prod: ["github-copilot"],
+    })
+  })
+
+  test("setPoolOverrideConfig with 'none' clears the override and collapses empty blocks", () => {
+    const cfg = { copilot: { poolRouting: { pools: { edu: ["github-copilot#edu"] } } } }
+    const next = setPoolOverrideConfig(cfg, "github-copilot#edu", "none")
+    expect(next).toEqual({})
+  })
+
+  test("command persists pool pin to ~/.config/opencode/opencode.json", async () => {
+    await ProvidersPoolCommand.handler({ key: "github-copilot#edu-1", pool: "edu" } as never)
+    const cfg = await readGlobalConfigRaw()
+    expect(cfg.copilot.poolRouting.pools.edu).toEqual(["github-copilot#edu-1"])
+  })
+
+  test("command with 'none' removes the account from both pools", async () => {
+    await writeGlobalConfigRaw({
+      copilot: { poolRouting: { pools: { edu: ["github-copilot#edu-1"] } } },
+    })
+    await ProvidersPoolCommand.handler({ key: "github-copilot#edu-1", pool: "none" } as never)
+    const cfg = await readGlobalConfigRaw()
+    expect(cfg).toEqual({})
+  })
+})
+
+describe("ProvidersAllowedModels", () => {
+  test("emits prod + test model lists per pool in json mode", async () => {
+    const prevWrite = process.stdout.write
+    const out: Array<string | Uint8Array> = []
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
+      return true
+    }) as never
+    try {
+      await ProvidersAllowedModelsCommand.handler({ json: true } as never)
+      const data = JSON.parse(out.join(""))
+      expect(data.edu.prod).toEqual(["codex-5.3-xhigh"])
+      expect(data.prod.prod).toEqual(["gpt-5.4-xhigh", "claude-4.7-opus-high"])
+      expect(data.edu.test).toEqual(["gpt-4.1", "gpt-5-mini-xhigh"])
+    } finally {
+      process.stdout.write = prevWrite
+    }
+  })
+
+  test("restricts output to the pool of a specific account key", async () => {
+    const prevWrite = process.stdout.write
+    const out: Array<string | Uint8Array> = []
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      out.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"))
+      return true
+    }) as never
+    try {
+      await seedState({ "github-copilot#edu-1": { plan: "edu" } })
+      await ProvidersAllowedModelsCommand.handler({ key: "github-copilot#edu-1", json: true } as never)
+      const data = JSON.parse(out.join(""))
+      expect(Object.keys(data)).toEqual(["edu"])
+      expect(data.edu.prod).toEqual(["codex-5.3-xhigh"])
+    } finally {
+      process.stdout.write = prevWrite
+    }
+  })
+})
+
+describe("ProvidersTestAccounts", () => {
+  test("addTestAccountConfig appends a slot across all three arrays", () => {
+    const next = addTestAccountConfig({}, { label: "student-1", token: "ghu_abc", proxy: "https://p.example" })
+    expect(next.copilot.testAccounts).toEqual({
+      tokens: ["ghu_abc"],
+      labels: ["student-1"],
+      proxyUrls: ["https://p.example"],
+    })
+  })
+
+  test("addTestAccountConfig rejects duplicate labels", () => {
+    const cfg = addTestAccountConfig({}, { label: "student-1", token: "ghu_abc" })
+    expect(() => addTestAccountConfig(cfg, { label: "student-1", token: "ghu_xyz" })).toThrow(
+      /already exists/,
+    )
+  })
+
+  test("removeTestAccountConfig removes the matching slot", () => {
+    let cfg: Record<string, any> = {}
+    cfg = addTestAccountConfig(cfg, { label: "a", token: "tok-a" })
+    cfg = addTestAccountConfig(cfg, { label: "b", token: "tok-b" })
+    const next = removeTestAccountConfig(cfg, "a")
+    expect(listTestAccountsConfig(next)).toEqual([{ label: "b", token: "tok-b", proxy: null }])
+  })
+
+  test("removeTestAccountConfig is a no-op when label is unknown", () => {
+    const cfg = addTestAccountConfig({}, { label: "a", token: "tok-a" })
+    const next = removeTestAccountConfig(cfg, "missing")
+    expect(next).toBe(cfg)
+  })
+
+  test("listTestAccountsConfig surfaces the raw token so the CLI layer can mask it", () => {
+    const cfg = addTestAccountConfig({}, { label: "student-1", token: "ghu_abcdefghij" })
+    const items = listTestAccountsConfig(cfg)
+    expect(items).toEqual([{ label: "student-1", token: "ghu_abcdefghij", proxy: null }])
+  })
+
+  test("add/remove round trip via helpers persists to the global config", async () => {
+    // Exercise the handlers end-to-end via the pure helpers so the test
+    // doesn't need to drive yargs' sub-command routing.
+    const cfg0 = await readGlobalConfigRaw()
+    const afterAdd = addTestAccountConfig(cfg0, {
+      label: "student-1",
+      token: "ghu_abc",
+      proxy: "https://p.example",
+    })
+    await writeGlobalConfigRaw(afterAdd)
+    const persisted = await readGlobalConfigRaw()
+    expect(persisted.copilot.testAccounts.tokens).toEqual(["ghu_abc"])
+    expect(persisted.copilot.testAccounts.labels).toEqual(["student-1"])
+    expect(persisted.copilot.testAccounts.proxyUrls).toEqual(["https://p.example"])
+    const afterRemove = removeTestAccountConfig(persisted, "student-1")
+    await writeGlobalConfigRaw(afterRemove)
+    expect(await readGlobalConfigRaw()).toEqual({})
+  })
+})
+
+describe("ProvidersCommand wiring", () => {
+  test("each new sub-command is registered and exposes a --help string", () => {
+    expect(ProvidersDeactivateCommand.command).toBe("deactivate <key>")
+    expect(ProvidersDeactivateCommand.describe).toBeTruthy()
+    expect(ProvidersActivateCommand.command).toBe("activate <key>")
+    expect(ProvidersActivateCommand.describe).toBeTruthy()
+    expect(ProvidersRotateMachineIdCommand.command).toBe("rotate-machine-id <key>")
+    expect(ProvidersRotateMachineIdCommand.describe).toBeTruthy()
+    expect(ProvidersRotateProxyCommand.command).toBe("rotate-proxy <key>")
+    expect(ProvidersRotateProxyCommand.describe).toBeTruthy()
+    expect(ProvidersPoolCommand.command).toBe("pool <key> <pool>")
+    expect(ProvidersPoolCommand.describe).toBeTruthy()
+    expect(ProvidersAllowedModelsCommand.command).toBe("allowed-models [key]")
+    expect(ProvidersAllowedModelsCommand.describe).toBeTruthy()
+    expect(ProvidersTestAccountsCommand.command).toBe("test-accounts <action>")
+    expect(ProvidersTestAccountsCommand.describe).toBeTruthy()
+  })
+})
+
+describe("mutateConnections", () => {
+  test("reads, transforms, and persists state atomically", async () => {
+    await seedState({ "github-copilot": {} })
+    const next = await mutateConnections((state) => ({
+      ...state,
+      connections: {
+        ...state.connections,
+        "github-copilot": { ...state.connections["github-copilot"], label: "hello" },
+      },
+    }))
+    expect(next.connections["github-copilot"].label).toBe("hello")
+    const raw = JSON.parse(await readFile(connectionFile, "utf8"))
+    expect(raw.connections["github-copilot"].label).toBe("hello")
+  })
+
+  test("starts from empty() when no file exists", async () => {
+    await rm(connectionFile, { force: true }).catch(() => undefined)
+    const next = await mutateConnections((state) => state)
+    expect(next).toEqual(empty())
+  })
+})

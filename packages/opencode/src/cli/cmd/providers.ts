@@ -8,7 +8,13 @@ import { migrate, proxyImports, summarizeMigration, testAccountsFromConfig } fro
 import { connectionFile } from "../../plugin/github-copilot/paths"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { Effect } from "effect"
-import { Store, upsert } from "../../plugin/github-copilot/connections"
+import {
+  clearDeactivated as clearDeactivatedConn,
+  machine,
+  markDeactivated as markDeactivatedConn,
+  Store,
+  upsert,
+} from "../../plugin/github-copilot/connections"
 import {
   CopilotRuntimeState,
   getPoolRoutingConfig,
@@ -28,6 +34,13 @@ import {
   parseBundle,
 } from "../../plugin/github-copilot/transfer"
 import { checkAccountStatuses, type AccountStatusInfo } from "../../plugin/github-copilot/health"
+import {
+  CopilotStats,
+  loadPersistedRateRows,
+  parseDuration,
+  renderStatsText,
+  type AggregateStats,
+} from "../../plugin/github-copilot/stats"
 import { map, pipe, sortBy, values } from "remeda"
 import path from "path"
 import os from "os"
@@ -68,6 +81,10 @@ export async function allAuth() {
         Effect.gen(function* () {
           const auth = yield* Auth.Service
           const existing = yield* auth.all()
+          const fs = yield* AppFileSystem.Service
+          const store = new Store(fs)
+          let state = yield* store.read()
+          let changed = false
           for (const item of synthesised) {
             if (existing[item.key]) continue
             yield* auth.set(item.key, {
@@ -78,7 +95,15 @@ export async function allAuth() {
               accountId: item.key,
             })
             if (item.proxyUrl) proxyImports.set(item.key, { url: item.proxyUrl })
+            // Fresh test account — mint machineId right now at add-time
+            // so the UA-identity is stable for the life of the credential.
+            const existingConn = state.connections[item.key]
+            if (!existingConn?.machineId) {
+              state = upsert(state, item.key, { machineId: crypto.randomUUID().toLowerCase() })
+              changed = true
+            }
           }
+          if (changed) yield* store.write(state)
         }),
       ).catch(() => undefined)
     }
@@ -91,17 +116,79 @@ export async function allAuth() {
           let changed = false
           for (const [key, item] of proxyImports) {
             const conn = state.connections[key]
-            if (conn?.proxyUrl === item.url && conn?.proxyToken === item.token && conn?.envelope === true) continue
-            state = upsert(state, key, { proxyUrl: item.url, proxyToken: item.token, envelope: true })
+            const proxyAlreadyUp =
+              conn?.proxyUrl === item.url && conn?.proxyToken === item.token && conn?.envelope === true
+            // Mint machineId the FIRST time we upsert this connection
+            // (i.e. no prior entry), then leave it alone on subsequent
+            // runs. If the entry already exists with a machineId, we
+            // only update the proxy triple if something changed.
+            const firstTime = !conn
+            if (proxyAlreadyUp && !firstTime) continue
+            const patch: {
+              proxyUrl?: string
+              proxyToken?: string
+              envelope?: boolean
+              machineId?: string
+            } = {}
+            if (!proxyAlreadyUp) {
+              patch.proxyUrl = item.url
+              patch.proxyToken = item.token
+              patch.envelope = true
+            }
+            if (firstTime) patch.machineId = crypto.randomUUID().toLowerCase()
+            state = upsert(state, key, patch)
             changed = true
           }
           if (changed) yield* store.write(state)
         }),
       ).catch(() => undefined)
     }
+    // NOTE: deliberately NO unconditional `seedMachineIds()` call here.
+    // machineId is minted exactly once at account-add-time — inside
+    // `migrate()` for imported credentials and inside the testAccounts /
+    // proxyImports loops above for synthesised + proxy-imported entries.
+    // Once persisted, it must stay stable across restarts; iterating every
+    // live account on every boot would be a bug.
   }
   return AppRuntime.runPromise(Auth.Service.use((svc) => svc.all()))
 }
+
+/**
+ * Add-time helper: assign a fresh `crypto.randomUUID()` to every
+ * github-copilot oauth account that does NOT yet carry a `machineId`.
+ * Idempotent — a second call is a no-op for keys already minted. Under
+ * normal operation machineId is seeded inline during `migrate()` /
+ * test-account injection / proxy-import drain, so this function is only
+ * exported for unit tests + as a defensive backfill for legacy
+ * connections.json files written before the per-add seeding existed.
+ *
+ * Crucially this is NOT called from `allAuth()` on every startup any
+ * more — machineId must be stable across restarts, and regenerating
+ * "missing" ids unconditionally was a bug. Callers that do invoke this
+ * (e.g. a one-shot migration command) must understand it only acts on
+ * accounts still missing a machineId.
+ */
+export const seedMachineIds = () =>
+  Effect.gen(function* () {
+    const auth = yield* Auth.Service
+    const all = yield* auth.all()
+    const keys = Object.entries(all)
+      .filter(([key, info]) => key.startsWith("github-copilot") && (info as { type?: string }).type === "oauth")
+      .map(([key]) => key)
+    if (keys.length === 0) return { assigned: [] as string[] }
+    const fs = yield* AppFileSystem.Service
+    const store = new Store(fs)
+    let state = yield* store.read()
+    const assigned: string[] = []
+    for (const key of keys) {
+      if (state.connections[key]?.machineId) continue
+      const [nextState] = machine(state, key)
+      state = nextState
+      assigned.push(key)
+    }
+    if (assigned.length > 0) yield* store.write(state)
+    return { assigned }
+  })
 
 async function readConnections(): Promise<State> {
   const raw = await Bun.file(connectionFile)
@@ -984,6 +1071,485 @@ export async function saveProxy(key: string, proxyUrl?: string, proxyToken?: str
   return next
 }
 
+/**
+ * Path of the global opencode config used by `providers pool` and
+ * `providers test-accounts …` to persist pool overrides + injected
+ * test-account slots. Mirrors the file loaded by
+ * `Config.Service.getGlobal` (`config/config.ts` — `Global.Path.config`).
+ */
+export function globalConfigPath(): string {
+  return path.join(Global.Path.config, "opencode.json")
+}
+
+/**
+ * Read the global `opencode.json` as an unconstrained record. Missing
+ * or malformed files yield `{}` so callers can treat "no config yet"
+ * and "empty config" identically.
+ */
+export async function readGlobalConfigRaw(): Promise<Record<string, any>> {
+  try {
+    const raw = (await Bun.file(globalConfigPath()).json()) as unknown
+    return raw && typeof raw === "object" ? (raw as Record<string, any>) : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Pretty-print the config to `~/.config/opencode/opencode.json`. Keeps a
+ * trailing newline so existing editors that hard-wrap on load don't
+ * re-wrap the last object on save.
+ */
+export async function writeGlobalConfigRaw(cfg: Record<string, any>): Promise<void> {
+  await Bun.write(globalConfigPath(), JSON.stringify(cfg, null, 2) + "\n")
+}
+
+/**
+ * Produce a new config record with the given account pinned to `pool`.
+ * `pool === "none"` removes the account from both pools (reverting to
+ * plan-derived defaults). Preserves unrelated `copilot.poolRouting.pools`
+ * members (e.g. other accounts pinned to edu/prod). Does not touch
+ * `copilot.testAccounts`.
+ */
+export function setPoolOverrideConfig(
+  cfg: Record<string, any>,
+  key: string,
+  pool: "edu" | "prod" | "none",
+): Record<string, any> {
+  const next = { ...cfg }
+  const copilot = { ...(next.copilot ?? {}) }
+  const poolRouting = { ...(copilot.poolRouting ?? {}) }
+  const pools = { ...(poolRouting.pools ?? {}) } as { edu?: string[]; prod?: string[] }
+  const stripped = {
+    edu: (pools.edu ?? []).filter((k: string) => k !== key),
+    prod: (pools.prod ?? []).filter((k: string) => k !== key),
+  }
+  if (pool !== "none") {
+    const current = new Set<string>(stripped[pool])
+    current.add(key)
+    stripped[pool] = [...current].sort()
+  }
+  // Drop empty arrays to keep the JSON tidy; the pools object collapses
+  // to `{}` when no overrides remain and then the whole poolRouting
+  // block is dropped below.
+  const cleaned: { edu?: string[]; prod?: string[] } = {}
+  if (stripped.edu.length > 0) cleaned.edu = stripped.edu
+  if (stripped.prod.length > 0) cleaned.prod = stripped.prod
+  if (Object.keys(cleaned).length > 0) {
+    poolRouting.pools = cleaned
+  } else {
+    delete poolRouting.pools
+  }
+  if (Object.keys(poolRouting).length > 0) {
+    copilot.poolRouting = poolRouting
+  } else {
+    delete copilot.poolRouting
+  }
+  if (Object.keys(copilot).length > 0) {
+    next.copilot = copilot
+  } else {
+    delete next.copilot
+  }
+  return next
+}
+
+/**
+ * Append a test-account slot to `copilot.testAccounts`. Mutates all
+ * three parallel arrays (tokens/labels/proxyUrls) in lockstep so the
+ * synth key `github-copilot#edu-<slug>` stays stable across list /
+ * remove cycles. Throws if the `label` is already in use.
+ */
+export function addTestAccountConfig(
+  cfg: Record<string, any>,
+  input: { label: string; token: string; proxy?: string },
+): Record<string, any> {
+  const next = { ...cfg }
+  const copilot = { ...(next.copilot ?? {}) }
+  const testAccounts = { ...(copilot.testAccounts ?? {}) }
+  const tokens = [...(testAccounts.tokens ?? [])] as string[]
+  const labels = [...(testAccounts.labels ?? [])] as string[]
+  const proxyUrls = [...(testAccounts.proxyUrls ?? [])] as string[]
+  if (labels.includes(input.label)) {
+    throw new Error(`test account with label "${input.label}" already exists`)
+  }
+  tokens.push(input.token)
+  labels.push(input.label)
+  // Keep proxyUrls index-matched even when the caller didn't set one, so
+  // `proxyUrls[i]` lines up with `tokens[i]` / `labels[i]`.
+  proxyUrls.push(input.proxy ?? "")
+  testAccounts.tokens = tokens
+  testAccounts.labels = labels
+  testAccounts.proxyUrls = proxyUrls
+  copilot.testAccounts = testAccounts
+  next.copilot = copilot
+  return next
+}
+
+/**
+ * Remove the slot matching `label` from `copilot.testAccounts`. Returns
+ * the unchanged config when no slot matches (caller can detect that by
+ * comparing `listTestAccountsConfig(before).length` to `after`).
+ */
+export function removeTestAccountConfig(cfg: Record<string, any>, label: string): Record<string, any> {
+  const ta = cfg.copilot?.testAccounts
+  const labels = (ta?.labels ?? []) as string[]
+  const idx = labels.findIndex((l) => l === label)
+  if (idx < 0) return cfg
+  const next = { ...cfg }
+  const copilot = { ...(next.copilot ?? {}) }
+  const testAccounts = { ...(copilot.testAccounts ?? {}) }
+  const remove = (arr: string[] | undefined) => {
+    if (!arr) return arr
+    const out = [...arr]
+    out.splice(idx, 1)
+    return out
+  }
+  testAccounts.tokens = remove(testAccounts.tokens)
+  testAccounts.labels = remove(testAccounts.labels)
+  testAccounts.proxyUrls = remove(testAccounts.proxyUrls)
+  const nonEmpty = (arr: string[] | undefined) => (arr && arr.length > 0 ? arr : undefined)
+  const clean = {
+    tokens: nonEmpty(testAccounts.tokens),
+    labels: nonEmpty(testAccounts.labels),
+    proxyUrls: nonEmpty(testAccounts.proxyUrls),
+    supportedModels: testAccounts.supportedModels,
+  }
+  const hasAny =
+    clean.tokens !== undefined ||
+    clean.labels !== undefined ||
+    clean.proxyUrls !== undefined ||
+    clean.supportedModels !== undefined
+  if (hasAny) {
+    copilot.testAccounts = Object.fromEntries(Object.entries(clean).filter(([, v]) => v !== undefined))
+  } else {
+    delete copilot.testAccounts
+  }
+  if (Object.keys(copilot).length > 0) {
+    next.copilot = copilot
+  } else {
+    delete next.copilot
+  }
+  return next
+}
+
+/**
+ * Return the configured test-account slots as `{label, token, proxy}`.
+ * Mirrors the display form used by `providers test-accounts list` — the
+ * caller decides whether to mask the token.
+ */
+export function listTestAccountsConfig(
+  cfg: Record<string, any>,
+): Array<{ label: string; token: string; proxy: string | null }> {
+  const ta = cfg.copilot?.testAccounts
+  const tokens = (ta?.tokens ?? []) as string[]
+  const labels = (ta?.labels ?? []) as string[]
+  const proxyUrls = (ta?.proxyUrls ?? []) as string[]
+  return tokens.map((token, i) => ({
+    label: labels[i] ?? `edu-${i + 1}`,
+    token,
+    proxy: proxyUrls[i] && proxyUrls[i].length > 0 ? proxyUrls[i] : null,
+  }))
+}
+
+/**
+ * Load `copilot-connections.json`, run `transform`, and persist the
+ * result. Shared helper that backs `deactivate`, `activate`,
+ * `rotate-machine-id`, and `rotate-proxy` so they all take the same
+ * "read → mutate → write" path.
+ */
+export async function mutateConnections(transform: (state: State) => State): Promise<State> {
+  const raw = await Bun.file(connectionFile)
+    .json()
+    .catch(() => empty())
+  const parsed = StateSchema.zod.safeParse(raw)
+  const state = parsed.success ? (parsed.data as State) : empty()
+  const next = transform(state)
+  await Bun.write(connectionFile, JSON.stringify(next, null, 2))
+  return next
+}
+
+/**
+ * Strip `machineId` from the connection. `machine()` generates a fresh
+ * UUID on the next dispatch, so the account effectively rotates to a
+ * new device identity. `JSON.stringify` drops `undefined` values on
+ * persistence, which matches the on-disk shape for accounts that never
+ * had a machine id assigned.
+ */
+export function rotateMachineId(state: State, key: string): State {
+  return upsert(state, key, { machineId: undefined })
+}
+
+/**
+ * Overwrite per-account proxy config. Passing `undefined` for `url`
+ * clears the proxy (same semantics as `saveProxy(key, undefined)`).
+ * `envelope` defaults to the previously-stored value — pass
+ * `true`/`false` to change it explicitly.
+ */
+export function rotateProxyConfig(
+  state: State,
+  key: string,
+  input: { url?: string; token?: string; envelope?: boolean },
+): State {
+  return upsert(state, key, {
+    proxyUrl: input.url,
+    proxyToken: input.token,
+    envelope: input.envelope,
+  })
+}
+
+export const ProvidersDeactivateCommand = cmd({
+  command: "deactivate <key>",
+  describe: "mark a GitHub Copilot account as deactivated (skipped by routing)",
+  builder: (yargs) =>
+    yargs.positional("key", {
+      describe: "account key (e.g. github-copilot or github-copilot#edu)",
+      type: "string",
+      demandOption: true,
+    }),
+  async handler(args) {
+    const key = String(args.key)
+    await mutateConnections((state) => markDeactivatedConn(state, key))
+    prompts.log.success(`deactivated ${copilotAliasLabel(key)}`)
+  },
+})
+
+export const ProvidersActivateCommand = cmd({
+  command: "activate <key>",
+  aliases: ["reactivate"],
+  describe: "clear the deactivated flag for a GitHub Copilot account (alias: reactivate)",
+  builder: (yargs) =>
+    yargs.positional("key", {
+      describe: "account key (e.g. github-copilot or github-copilot#edu)",
+      type: "string",
+      demandOption: true,
+    }),
+  async handler(args) {
+    const key = String(args.key)
+    await mutateConnections((state) => clearDeactivatedConn(state, key))
+    prompts.log.success(`activated ${copilotAliasLabel(key)}`)
+  },
+})
+
+export const ProvidersRotateMachineIdCommand = cmd({
+  command: "rotate-machine-id <key>",
+  describe: "regenerate machineId for a GitHub Copilot account on next dispatch",
+  builder: (yargs) =>
+    yargs.positional("key", {
+      describe: "account key (e.g. github-copilot or github-copilot#edu)",
+      type: "string",
+      demandOption: true,
+    }),
+  async handler(args) {
+    const key = String(args.key)
+    await mutateConnections((state) => rotateMachineId(state, key))
+    prompts.log.success(
+      `cleared machineId for ${copilotAliasLabel(key)} — a fresh UUID will be generated on next dispatch`,
+    )
+  },
+})
+
+export const ProvidersRotateProxyCommand = cmd({
+  command: "rotate-proxy <key>",
+  describe: "update proxy config for a GitHub Copilot account",
+  builder: (yargs) =>
+    yargs
+      .positional("key", {
+        describe: "account key (e.g. github-copilot or github-copilot#edu)",
+        type: "string",
+        demandOption: true,
+      })
+      .option("url", {
+        type: "string",
+        describe: "proxy base URL (pass empty string to clear)",
+      })
+      .option("token", {
+        type: "string",
+        describe: "proxy token (optional)",
+      })
+      .option("envelope", {
+        type: "boolean",
+        describe: "opt into the POST /fetch envelope protocol",
+      }),
+  async handler(args) {
+    const key = String(args.key)
+    const url = typeof args.url === "string" ? args.url.trim() : undefined
+    const token = typeof args.token === "string" ? args.token.trim() : undefined
+    const envelope = typeof args.envelope === "boolean" ? args.envelope : undefined
+    await mutateConnections((state) =>
+      rotateProxyConfig(state, key, {
+        url: url && url.length > 0 ? url : undefined,
+        token: token && token.length > 0 ? token : undefined,
+        envelope,
+      }),
+    )
+    prompts.log.success(
+      url ? `updated proxy for ${copilotAliasLabel(key)} -> ${url}` : `cleared proxy for ${copilotAliasLabel(key)}`,
+    )
+  },
+})
+
+export const ProvidersPoolCommand = cmd({
+  command: "pool <key> <pool>",
+  describe: "pin a GitHub Copilot account to a specific pool (edu/prod) via config override",
+  builder: (yargs) =>
+    yargs
+      .positional("key", {
+        describe: "account key (e.g. github-copilot#edu)",
+        type: "string",
+        demandOption: true,
+      })
+      .positional("pool", {
+        describe: "target pool: edu, prod, or none (clear override)",
+        type: "string",
+        choices: ["edu", "prod", "none"],
+        demandOption: true,
+      }),
+  async handler(args) {
+    const key = String(args.key)
+    const pool = String(args.pool) as "edu" | "prod" | "none"
+    const cfg = await readGlobalConfigRaw()
+    const next = setPoolOverrideConfig(cfg, key, pool)
+    await writeGlobalConfigRaw(next)
+    if (pool === "none") {
+      prompts.log.success(`cleared pool override for ${copilotAliasLabel(key)}`)
+    } else {
+      prompts.log.success(`pinned ${copilotAliasLabel(key)} to pool=${pool}`)
+    }
+  },
+})
+
+export const ProvidersAllowedModelsCommand = cmd({
+  command: "allowed-models [key]",
+  describe: "show allowed prod + test-only models per pool",
+  builder: (yargs) =>
+    yargs
+      .positional("key", {
+        describe: "restrict output to the pool of this account key",
+        type: "string",
+      })
+      .option("json", { type: "boolean", describe: "emit result as JSON" }),
+  async handler(args) {
+    const allPools: PoolId[] = ["edu", "prod"]
+    let targetPool: PoolId | undefined
+    if (args.key) {
+      const key = String(args.key)
+      const state = await readConnections()
+      const plan = state.connections[key]?.plan
+      targetPool = accountPoolLabel(key, plan)
+      if (!targetPool) {
+        prompts.log.error(`no pool classification for ${copilotAliasLabel(key)} (plan=${plan ?? "unknown"})`)
+        return
+      }
+    }
+    const result: Record<string, { prod: string[]; test: string[] }> = Object.fromEntries(
+      (targetPool ? [targetPool] : allPools).map((pool) => [
+        pool,
+        {
+          prod: poolAllowedProdModels(pool),
+          test: poolAllowedTestModels(pool),
+        },
+      ]),
+    )
+    if (args.json) {
+      process.stdout.write(JSON.stringify(result, null, 2) + "\n")
+      return
+    }
+    for (const [pool, entry] of Object.entries(result)) {
+      prompts.log.info(`pool=${pool}`)
+      prompts.log.info(`  Allowed (prod): ${entry.prod.join(", ") || "<none>"}`)
+      prompts.log.info(`  Allowed (test-only): ${entry.test.join(", ") || "<none>"}`)
+    }
+  },
+})
+
+export const ProvidersTestAccountsCommand = cmd({
+  command: "test-accounts <action>",
+  describe: "manage copilot.testAccounts in ~/.config/opencode/opencode.json",
+  builder: (yargs) =>
+    yargs
+      .command({
+        command: "add <label>",
+        describe: "add a test account slot to copilot.testAccounts",
+        builder: (y) =>
+          y
+            .positional("label", {
+              describe: "human-readable label (e.g. student-1)",
+              type: "string",
+              demandOption: true,
+            })
+            .option("token", {
+              type: "string",
+              describe: "Copilot OAuth token (ghu_…)",
+              demandOption: true,
+            })
+            .option("proxy", {
+              type: "string",
+              describe: "optional proxy URL (enables envelope protocol)",
+            }),
+        async handler(args) {
+          const cfg = await readGlobalConfigRaw()
+          try {
+            const next = addTestAccountConfig(cfg, {
+              label: String(args.label),
+              token: String(args.token),
+              proxy: typeof args.proxy === "string" && args.proxy.length > 0 ? args.proxy : undefined,
+            })
+            await writeGlobalConfigRaw(next)
+            prompts.log.success(`added test account "${args.label}"`)
+          } catch (err) {
+            prompts.log.error((err as Error).message)
+            process.exit(1)
+          }
+        },
+      })
+      .command({
+        command: "list",
+        describe: "print configured copilot.testAccounts slots",
+        builder: (y) => y.option("json", { type: "boolean", describe: "emit result as JSON" }),
+        async handler(args) {
+          const cfg = await readGlobalConfigRaw()
+          const items = listTestAccountsConfig(cfg)
+          if (args.json) {
+            process.stdout.write(JSON.stringify(items, null, 2) + "\n")
+            return
+          }
+          if (items.length === 0) {
+            prompts.log.info("no test accounts configured")
+            return
+          }
+          for (const item of items) {
+            const masked = item.token.length > 8 ? item.token.slice(0, 4) + "…" + item.token.slice(-4) : "…"
+            const proxy = item.proxy ? ` proxy=${item.proxy}` : ""
+            prompts.log.info(`${item.label} ${UI.Style.TEXT_DIM}token=${masked}${proxy}`)
+          }
+        },
+      })
+      .command({
+        command: "remove <label>",
+        describe: "remove a test account slot by label",
+        builder: (y) =>
+          y.positional("label", {
+            describe: "label of the slot to remove",
+            type: "string",
+            demandOption: true,
+          }),
+        async handler(args) {
+          const cfg = await readGlobalConfigRaw()
+          const before = listTestAccountsConfig(cfg).length
+          const next = removeTestAccountConfig(cfg, String(args.label))
+          const after = listTestAccountsConfig(next).length
+          if (after === before) {
+            prompts.log.error(`no test account with label "${args.label}"`)
+            process.exit(1)
+          }
+          await writeGlobalConfigRaw(next)
+          prompts.log.success(`removed test account "${args.label}"`)
+        },
+      })
+      .demandCommand(),
+  async handler() {},
+})
+
 export const ProvidersCommand = cmd({
   command: "providers",
   aliases: ["auth"],
@@ -999,6 +1565,15 @@ export const ProvidersCommand = cmd({
       .command(ProvidersProxyCommand)
       .command(ProvidersExportCommand)
       .command(ProvidersImportCommand)
+      .command(ProvidersStatsCommand)
+      .command(ProvidersEnvCommand)
+      .command(ProvidersDeactivateCommand)
+      .command(ProvidersActivateCommand)
+      .command(ProvidersRotateMachineIdCommand)
+      .command(ProvidersRotateProxyCommand)
+      .command(ProvidersPoolCommand)
+      .command(ProvidersAllowedModelsCommand)
+      .command(ProvidersTestAccountsCommand)
       .demandCommand(),
   async handler() {},
 })
@@ -1504,16 +2079,16 @@ export const ProvidersAccountsCommand = cmd({
 
 export const ProvidersRouteDebugCommand = cmd({
   command: "route-debug [model]",
-  describe: "Show GitHub Copilot routing candidates for a model",
+  describe: "show GitHub Copilot routing candidates for a model",
   builder: (yargs) =>
     yargs
-      .positional("model", { type: "string" })
-      .option("provider", { type: "string" })
-      .option("account", { type: "string" })
-      .option("all-accounts", { type: "boolean" })
-      .option("all-models", { type: "boolean" })
-      .option("summary-only", { type: "boolean" })
-      .option("json", { type: "boolean" }),
+      .positional("model", { type: "string", describe: "model id to explain (omit with --all-models for full dump)" })
+      .option("provider", { type: "string", describe: "restrict to this provider id (e.g. github-copilot)" })
+      .option("account", { type: "string", describe: "restrict to a specific account key" })
+      .option("all-accounts", { type: "boolean", describe: "include deactivated / suspended accounts in the explanation" })
+      .option("all-models", { type: "boolean", describe: "explain every known model instead of a single one" })
+      .option("summary-only", { type: "boolean", describe: "print only the aggregate summary block (use with --json)" })
+      .option("json", { type: "boolean", describe: "emit routing explanation as JSON" }),
   handler: async (args) => {
     const data = await loadRouteExplain({
       model: args.model,
@@ -1776,5 +2351,184 @@ export const ProvidersImportCommand = cmd({
     if (result.removed.length > 0) prompts.log.info(`removed: ${result.removed.join(", ")}`)
     if (result.skipped.length > 0) prompts.log.warn(`skipped: ${result.skipped.join(", ")}`)
     prompts.outro(result.dryRun ? "no changes written" : "Done")
+  },
+})
+
+/**
+ * Assemble the unified stats payload shared by the CLI and HTTP endpoint.
+ * Loads persistent rate-state rows from SQLite and the connections.json
+ * plan / deactivated flags so operators can see a full cross-account
+ * picture in one call.
+ */
+export async function loadProvidersStats(opts: {
+  sinceMs?: number
+  now?: number
+} = {}): Promise<AggregateStats> {
+  const [rateRows, connections] = await Promise.all([
+    loadPersistedRateRows().catch(() => []),
+    readConnections().catch(() => empty()),
+  ])
+  return CopilotStats.aggregate({
+    sinceMs: opts.sinceMs,
+    now: opts.now,
+    rateRows,
+    connections,
+  })
+}
+
+export const ProvidersStatsCommand = cmd({
+  command: "stats",
+  describe: "show per-account dispatch / 429 / premium stats for GitHub Copilot",
+  builder: (yargs) =>
+    yargs
+      .option("json", { type: "boolean", describe: "emit raw aggregate JSON" })
+      .option("since", {
+        type: "string",
+        describe: "time window to report (e.g. 10m, 1h, 24h). Default: since boot.",
+      }),
+  async handler(args) {
+    const rawSince = (args as { since?: string }).since
+    const sinceMs = parseDuration(rawSince)
+    if (rawSince !== undefined && sinceMs === undefined) {
+      process.stderr.write(`error: invalid --since value "${rawSince}" (try 10m, 1h, 24h)\n`)
+      process.exit(1)
+    }
+    const payload = await loadProvidersStats({ sinceMs })
+    if ((args as { json?: boolean }).json) {
+      process.stdout.write(JSON.stringify(payload, null, 2) + "\n")
+      return
+    }
+    UI.empty()
+    prompts.intro("GitHub Copilot Stats")
+    const lines = renderStatsText(payload)
+    for (const line of lines) {
+      if (line === "") continue
+      prompts.log.info(line)
+    }
+    prompts.outro(`${payload.totals.accounts} account${payload.totals.accounts === 1 ? "" : "s"}`)
+  },
+})
+
+/**
+ * Table of all `OPENCODE_*` environment variables that influence the
+ * GitHub Copilot integration. Used by `providers env` to print a
+ * self-documenting list so operators can discover knobs without
+ * grepping the source tree. When a new env var is wired up, add it
+ * here alongside the feature toggle so the CLI help stays current.
+ */
+export const COPILOT_ENV_VARS: ReadonlyArray<{
+  name: string
+  description: string
+  defaultValue?: string
+}> = [
+  {
+    name: "OPENCODE_TEST_COPILOT_TOKENS",
+    description:
+      "Comma-separated list of Copilot OAuth tokens (ghu_...) injected as synthetic `github-copilot#edu-N` test accounts at boot. Ignored unless OPENCODE_ALLOW_TEST_ACCOUNTS=1.",
+  },
+  {
+    name: "OPENCODE_ALLOW_TEST_ACCOUNTS",
+    description:
+      "When `1`, un-filter test accounts (both config-derived and env-derived) from the production routing pool so they receive real traffic.",
+    defaultValue: "0",
+  },
+  {
+    name: "OPENCODE_IMPORT_ALL_COPILOT_TOKENS",
+    description:
+      "When `1`, migrate() imports EVERY token discovered in ~/.config/github-copilot/apps.json instead of just the primary — useful for multi-account setups.",
+    defaultValue: "0",
+  },
+  {
+    name: "OPENCODE_COPILOT_PROXY_ENVELOPE",
+    description:
+      "When `1`, proxied Copilot dispatches use the POST {proxy}/fetch JSON envelope protocol instead of raw HTTP forward. Also toggled per-account via `providers proxy --envelope`.",
+    defaultValue: "0",
+  },
+  {
+    name: "OPENCODE_PROBE_DISCOVERY",
+    description:
+      "Set to `0` to disable the lazy /models discovery probe that runs on first dispatch for each account. Default: enabled.",
+    defaultValue: "1",
+  },
+  {
+    name: "OPENCODE_DEBUG_PROVIDERS",
+    description: "When `1`, emit verbose provider routing + dispatch decisions to stderr.",
+    defaultValue: "0",
+  },
+  {
+    name: "OPENCODE_COPILOT_RATE_LIMITER_ENABLED",
+    description:
+      "Toggle the adaptive per-account rate limiter. When false, dispatch bypasses the 429-sliding-window semaphore. Default: true.",
+    defaultValue: "true",
+  },
+  {
+    name: "OPENCODE_COPILOT_RATE_LIMITER_WINDOW_MS",
+    description: "Sliding window (ms) for counting recent 429 errors per account. Default 600000 (10m).",
+    defaultValue: "600000",
+  },
+  {
+    name: "OPENCODE_COPILOT_RATE_LIMITER_CLEAN_MS",
+    description:
+      "Duration (ms) an account must stay below the 429 threshold before capacity regrows. Default 300000 (5m).",
+    defaultValue: "300000",
+  },
+  {
+    name: "OPENCODE_COPILOT_RATE_LIMITER_THRESHOLD",
+    description: "Per-minute 429 rate that triggers a shrink. Default 0.2.",
+    defaultValue: "0.2",
+  },
+  {
+    name: "OPENCODE_COPILOT_RATE_LIMITER_MAX",
+    description: "Maximum per-account concurrency ceiling. Default 7.",
+    defaultValue: "7",
+  },
+  {
+    name: "OPENCODE_COPILOT_RATE_LIMITER_MIN",
+    description: "Minimum per-account concurrency floor (shrink bottom). Default 1.",
+    defaultValue: "1",
+  },
+  {
+    name: "OPENCODE_COPILOT_RATE_LIMITER_ACQUIRE_TIMEOUT_MS",
+    description: "Max time (ms) a dispatch will wait on acquire() before giving up. Default 30000.",
+    defaultValue: "30000",
+  },
+]
+
+export const ProvidersEnvCommand = cmd({
+  command: "env",
+  describe: "list OPENCODE_* environment variables that affect GitHub Copilot routing",
+  builder: (yargs) =>
+    yargs
+      .option("json", { type: "boolean", describe: "emit the env-var table as JSON" })
+      .option("set-only", {
+        type: "boolean",
+        describe: "only show variables currently set in the environment",
+      }),
+  async handler(args) {
+    const rows = COPILOT_ENV_VARS.map((row) => ({
+      name: row.name,
+      description: row.description,
+      default: row.defaultValue ?? null,
+      current: process.env[row.name] ?? null,
+    }))
+    const filtered = (args as { setOnly?: boolean }).setOnly ? rows.filter((r) => r.current !== null) : rows
+    if ((args as { json?: boolean }).json) {
+      process.stdout.write(JSON.stringify(filtered, null, 2) + "\n")
+      return
+    }
+    UI.empty()
+    prompts.intro("GitHub Copilot environment variables")
+    if (filtered.length === 0) {
+      prompts.log.info("no OPENCODE_* copilot env vars currently set")
+      prompts.outro("Done")
+      return
+    }
+    for (const row of filtered) {
+      const setMarker = row.current !== null ? ` ${UI.Style.TEXT_DIM}(set=${row.current})` : ""
+      const defaultMarker = row.default !== null ? ` ${UI.Style.TEXT_DIM}[default=${row.default}]` : ""
+      prompts.log.info(`${row.name}${setMarker}${defaultMarker}`)
+      prompts.log.info(`  ${UI.Style.TEXT_DIM}${row.description}`)
+    }
+    prompts.outro(`${filtered.length} variable${filtered.length === 1 ? "" : "s"}`)
   },
 })
