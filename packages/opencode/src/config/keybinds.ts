@@ -12,6 +12,7 @@ export const Keybinds = z
     scrollbar_toggle: z.string().optional().default("none").describe("Toggle session scrollbar"),
     username_toggle: z.string().optional().default("none").describe("Toggle username visibility"),
     status_view: z.string().optional().default("<leader>s").describe("View status"),
+    copilot_accounts: z.string().optional().default("<leader>p").describe("View Copilot accounts panel"),
     session_export: z.string().optional().default("<leader>x").describe("Export session to editor"),
     session_new: z.string().optional().default("<leader>n").describe("Create a new session"),
     session_list: z.string().optional().default("<leader>l").describe("List all sessions"),
