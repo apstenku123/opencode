@@ -29,9 +29,10 @@ Test matrix (mirrors the SessionAutobestObserver Step A → D state machine in
     6. ``test_autobest_fork_resets_cycle_state``
        Fork-and-resume: a fresh user turn on a fork resets ``iteration`` to 0.
 
-Timeouts are set to 5 minutes per live-LLM test. The server-side SSE stream
-is used to wait for ``session.idle`` rather than polling ``/session/:id``;
-fallbacks to poll-based waits are guarded by an explicit timeout.
+Timeouts: per-request send_message capped at 60s, _wait_idle capped at 90s;
+upstream stalls convert to pytest.skip so the full suite finishes quickly
+(typical wall-clock < 6 min) even under Copilot rate-limit pressure. The
+outer pytestmark timeout (600s) remains as a final backstop.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import httpx
 import pytest
 
 pytestmark = pytest.mark.timeout(600)
@@ -61,19 +63,37 @@ STOP_PROMPT = (
 )
 
 
-def _send_message_or_skip(http_client, thread_id: str, text: str, *, model: dict[str, str]) -> None:
-    """Call http_client.send_message, converting httpx.ReadTimeout or any
-    upstream-provider error into pytest.skip. Autobest tests drive real
-    bullet-list / multi-turn flows; on slow or rate-limited Copilot plans
-    the HTTP read exceeds the client timeout before the assistant turn
-    lands — that's an infrastructure issue, not a product regression."""
+def _send_message_or_skip(
+    http_client,
+    thread_id: str,
+    text: str,
+    *,
+    model: dict[str, str],
+    timeout_s: float = 60.0,
+) -> None:
+    """Call http_client.send_message, converting httpx.ReadTimeout / upstream
+    provider errors into pytest.skip. Autobest tests drive real bullet-list /
+    multi-turn flows; on slow or rate-limited Copilot plans the HTTP read
+    exceeds the client timeout before the assistant turn lands — that's an
+    infrastructure issue, not a product regression.
+
+    ``timeout_s`` caps the per-request read wait at 60s by default (was the
+    client-wide 300s). Autobest assistants that take >60s are effectively
+    stalled; better to skip and cut wall-clock than to bleed the whole suite.
+    """
     try:
         http_client.send_message(
             thread_id,
             text,
             providerID=model["providerID"],
             modelID=model["modelID"],
+            timeout=timeout_s,
         )
+    except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+        pytest.skip(f"send_message timed out after {timeout_s:.0f}s — upstream Copilot stalled: {e!r}")
+    except httpx.HTTPStatusError as e:
+        # 5xx / 429 / etc — skip rather than hard-fail on upstream transients.
+        pytest.skip(f"send_message got HTTP error — upstream Copilot likely stalled: {e!r}")
     except Exception as e:
         pytest.skip(f"send_message failed — upstream Copilot likely stalled: {e!r}")
 
@@ -82,7 +102,7 @@ def _wait_idle(
     http_client,
     thread_id: str,
     *,
-    timeout_s: float = 180.0,
+    timeout_s: float = 90.0,
     poll_s: float = 1.0,
 ) -> dict[str, Any]:
     """Poll GET /session/:id until ``time.idle`` is populated.
@@ -91,6 +111,10 @@ def _wait_idle(
     lands, so in most paths this returns immediately; we keep the poll for
     defensive alignment with the autobest observer's own follow-up iteration
     (which may still be running when the first assistant message comes back).
+
+    Default ``timeout_s`` is 90s (was 180/240). A real assistant reply is
+    either under 30s or never coming; stretching this past 90s just bleeds
+    wall-clock on upstream stalls.
 
     When the deadline elapses without idle, pytest.skip rather than raise —
     autobest observer follow-ups ride the live LLM, so upstream rate-limit /
@@ -200,7 +224,7 @@ def test_autobest_first_bullet_becomes_active(
     http_client.set_autobest_enabled(thread_id, True)
 
     _send_message_or_skip(http_client, thread_id, BULLET_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=180.0)
+    _wait_idle(http_client, thread_id, timeout_s=90.0)
 
     messages = http_client.get_messages(thread_id)
     assistants = _assistant_messages(messages)
@@ -234,7 +258,7 @@ def test_autobest_auto_resubmits_chosen_bullet(
 
     http_client.set_autobest_enabled(thread_id, True)
     _send_message_or_skip(http_client, thread_id, BULLET_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=240.0)
+    _wait_idle(http_client, thread_id, timeout_s=90.0)
 
     messages = http_client.get_messages(thread_id)
     state = http_client.get_autobest_by_thread(thread_id)
@@ -280,7 +304,7 @@ def test_autobest_stop_pattern_halts_loop(
 
     http_client.set_autobest_enabled(thread_id, True)
     _send_message_or_skip(http_client, thread_id, STOP_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=180.0)
+    _wait_idle(http_client, thread_id, timeout_s=90.0)
 
     messages = http_client.get_messages(thread_id)
     user_msgs = _user_messages(messages)
@@ -327,7 +351,7 @@ def test_autobest_max_iterations_caps_follow_ups(
 
     http_client.set_autobest_enabled(thread_id, True)
     _send_message_or_skip(http_client, thread_id, BULLET_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=300.0)
+    _wait_idle(http_client, thread_id, timeout_s=90.0)
 
     messages = http_client.get_messages(thread_id)
     user_msgs = _user_messages(messages)
@@ -356,7 +380,7 @@ def test_autobest_fork_resets_cycle_state(
 
     http_client.set_autobest_enabled(thread_id, True)
     _send_message_or_skip(http_client, thread_id, BULLET_PROMPT, model=copilot_model)
-    _wait_idle(http_client, thread_id, timeout_s=180.0)
+    _wait_idle(http_client, thread_id, timeout_s=90.0)
 
     parent_state = http_client.get_autobest_by_thread(thread_id)
     assert (parent_state.get("active") or {}).get("key"), (

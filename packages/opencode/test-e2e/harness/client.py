@@ -262,9 +262,15 @@ class OpencodeClient:
         providerID: str,
         modelID: str,
         agent: Optional[str] = None,
+        timeout: Optional[float] = None,
         **extra: Any,
     ) -> dict[str, Any]:
-        """POST /session/:id/message — send a prompt synchronously."""
+        """POST /session/:id/message — send a prompt synchronously.
+
+        ``timeout`` overrides the client-level timeout for this single
+        request (in seconds). Useful when a caller wants to fail fast on
+        a slow upstream rather than waiting for the client-wide default.
+        """
         body: dict[str, Any] = {
             "parts": [{"type": "text", "text": text}],
             "model": {"providerID": providerID, "modelID": modelID},
@@ -272,7 +278,10 @@ class OpencodeClient:
         if agent is not None:
             body["agent"] = agent
         body.update(extra)
-        return self._post(f"/session/{session_id}/message", json=body)
+        post_kwargs: dict[str, Any] = {"json": body}
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+        return self._post(f"/session/{session_id}/message", **post_kwargs)
 
     # --- autobest ------------------------------------------------------
 
