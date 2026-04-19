@@ -35,6 +35,7 @@ import { Context, Effect, Layer } from "effect"
 
 import { AdaptiveHooks } from "./adaptive"
 import { Config } from "@/config"
+import { Instance } from "../project/instance"
 import { Memory, defaultLayer as memoryDefaultLayer } from "@/memory"
 import { makeMemoryBridge } from "@/memory/llm-bridge"
 import {
@@ -225,6 +226,19 @@ export namespace SessionMemoryObserver {
         threadID: _sessionID,
         timestamp: Date.now(),
       } as SextupleSource),
+    // Resolve the project scope for persistence. `Instance.current.project.id`
+    // reads from InstanceState (which is why this is lazy rather than a
+    // pre-computed value). Persisted rows carry this id, and the CLI
+    // `memory status`/`retrieve` subprocesses use `currentProjectID()`
+    // (same derivation) so both ends agree on a scope.
+    projectID: (_sessionID) =>
+      Effect.sync(() => {
+        try {
+          return Instance.current.project.id
+        } catch {
+          return undefined
+        }
+      }),
     // LLM bridges come from `deps.bridges`. When a phase's bridge is
     // unset the memory subsystem short-circuits gracefully:
     //   - querySynthModel: regex-based fallback (`regexKeywordQuery`) is used.
