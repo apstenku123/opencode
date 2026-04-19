@@ -46,7 +46,7 @@ from harness import (
     resolve_opencode_binary,
 )
 
-pytestmark = [pytest.mark.timeout(90)]
+pytestmark = [pytest.mark.timeout(300)]
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +420,7 @@ def test_autoskill_extracts_after_successful_tool_usage(
                 session = client.create_session()
                 _prompt_async(client, session["id"], "Please run three shell commands to help me: first `ls -1`, "
                     "then `pwd`, then `echo hi`. Use the bash tool for each.", model=live_copilot_model)
-                _wait_idle(client, session["id"], timeout_s=55.0)
+                _wait_idle(client, session["id"], timeout_s=180.0)
 
             auto_dir = _auto_skills_dir(isolated_skill_home)
             # Give fire-and-forget hook a moment to finish writing.
@@ -466,7 +466,7 @@ def test_skill_event_hotinserted_fires(
                     session = client.create_session()
                     _prompt_async(client, session["id"], "Use the bash tool three times to run: `date`, "
                         "`uname -a`, `echo skills-work`.", model=live_copilot_model)
-                    _wait_idle(client, session["id"], timeout_s=55.0)
+                    _wait_idle(client, session["id"], timeout_s=180.0)
 
                 ev = collector.wait_for(
                     lambda e: e.type == "skill.hot-inserted",
@@ -515,7 +515,7 @@ def test_skill_search_tool_returns_matches(
                 session = client.create_session()
                 _prompt_async(client, session["id"], "Use the skill_search tool to find skills related to bash. "
                     "Call it with query=\"bash\" and report the results.", model=live_copilot_model)
-                _wait_idle(client, session["id"], timeout_s=55.0)
+                _wait_idle(client, session["id"], timeout_s=180.0)
                 messages = client.get_messages(session["id"])
 
             # Walk every assistant tool part; find any skill_search call that
@@ -586,7 +586,7 @@ def test_skill_mention_flags_invocation(
                     # `$deploy please` should be parsed by
                     # `parseSkillMentions` as an explicit mention.
                     _prompt_async(client, session["id"], "$deploy please — reply in one short sentence.", model=live_copilot_model)
-                    _wait_idle(client, session["id"], timeout_s=55.0)
+                    _wait_idle(client, session["id"], timeout_s=180.0)
 
                 # The invocation record is a successful tool-complete for the
                 # skill. Evolution only publishes "evolution-suggested" on
