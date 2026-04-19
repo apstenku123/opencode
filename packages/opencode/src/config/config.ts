@@ -283,6 +283,49 @@ export const Info = z
           .describe(
             "Explicit pool-routing policy for GitHub Copilot multi-account. Defines edu (free/unlimited) vs prod (pro/enterprise) pools and the per-model family routing table.",
           ),
+        httpRetryRace: z
+          .object({
+            enabled: z
+              .boolean()
+              .optional()
+              .describe(
+                "Enable the HTTP retry-race orchestrator. When true, a stalled Copilot request spawns duplicate attempts against other accounts/proxies every `staggerMs`; first-to-respond wins, siblings are aborted. Dramatically cuts p99 latency on slow turns. Mirrors Rust `[http_retry_race]` section.",
+              ),
+            staggerMs: z
+              .number()
+              .int()
+              .min(100)
+              .optional()
+              .describe("Delay before spawning each next parallel attempt (ms). Default 40000."),
+            concurrentLimit: z
+              .number()
+              .int()
+              .min(1)
+              .optional()
+              .describe("Maximum in-flight attempts at once. Mirrors Rust `max_parallel`. Default 3."),
+            maxAttempts: z
+              .number()
+              .int()
+              .min(1)
+              .optional()
+              .describe("Absolute cap on attempts spawned per race (`max_parallel * max_cycles`). Default 6."),
+            totalDeadlineMs: z
+              .number()
+              .int()
+              .min(1000)
+              .optional()
+              .describe("Hard deadline for the whole race (ms). Mirrors Rust `abort_after_ms * max_cycles`. Default 120000."),
+            eventBusCapacity: z
+              .number()
+              .int()
+              .min(1)
+              .optional()
+              .describe("Ring-buffer size of the HttpAttemptBus observation history. Default 64."),
+          })
+          .optional()
+          .describe(
+            "HTTP retry-race orchestrator for stalled Copilot upstream turns. Mirrors codex_git `[http_retry_race]` in `config.schema.json`.",
+          ),
         rateLimiter: z
           .object({
             enabled: z

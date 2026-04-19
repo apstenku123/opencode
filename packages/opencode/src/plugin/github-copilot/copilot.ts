@@ -1059,6 +1059,101 @@ export async function dispatch(input: {
   return res
 }
 
+/**
+ * Module-level retry-race configuration + shared observation bus. Seeded
+ * inside `CopilotAuthPlugin` from `resolvedCfg.copilot.httpRetryRace`. When
+ * `cfg.enabled === false`, `dispatchWithRace` is a direct pass-through to
+ * `dispatch` — the race has zero overhead for users who opt out.
+ */
+let httpRetryRaceCfg: HttpRetryRaceConfig = { ...DEFAULT_HTTP_RETRY_RACE_CONFIG }
+let httpRetryRaceBus: HttpAttemptBus = new HttpAttemptBus(httpRetryRaceCfg.eventBusCapacity)
+
+export function setHttpRetryRaceConfig(cfg: HttpRetryRaceConfig): void {
+  httpRetryRaceCfg = cfg
+  httpRetryRaceBus = new HttpAttemptBus(cfg.eventBusCapacity)
+}
+
+export function getHttpRetryRaceConfig(): HttpRetryRaceConfig {
+  return httpRetryRaceCfg
+}
+
+export function getHttpRetryRaceBus(): HttpAttemptBus {
+  return httpRetryRaceBus
+}
+
+/**
+ * Higher-level dispatch that races `dispatch` across up to
+ * `cfg.concurrentLimit` candidate accounts when the retry-race is enabled.
+ *
+ * When disabled (`cfg.enabled === false`), behaves as a direct call to
+ * `dispatch(input)` — zero stagger, zero cancellation, zero bus events.
+ *
+ * When enabled:
+ *   - Attempt 1 issues against the routed primary account.
+ *   - Attempt N (for N > 1) issues against a failover candidate picked via
+ *     `pool.failoverTokenForModel`; each candidate is tried at most once.
+ *   - The first attempt to return a successful `Response` wins; siblings
+ *     receive `AbortSignal.aborted = true` via the fetch init.
+ *   - If every candidate exhausts or the `totalDeadlineMs` fires, the last
+ *     surfaced error (or `RetryRaceExhaustedError`) bubbles up.
+ *
+ * The `init.signal` of each attempt is wired to the per-attempt
+ * `AbortController` so `fetch` cancels on winner-select / parent-cancel.
+ */
+export async function dispatchWithRace(input: Parameters<typeof dispatch>[0], cfg?: HttpRetryRaceConfig): Promise<Response> {
+  const effective = cfg ?? httpRetryRaceCfg
+  if (!effective.enabled || !input.pool) {
+    return dispatch(input)
+  }
+  // Build an ordered list of candidate account keys: routed first, then
+  // any failover candidates.  We never dispatch against the same account
+  // twice in one race — two duplicate requests to the same account would
+  // just chew through its rate-limit budget.
+  const loaded = await input.read()
+  const state = syncAccount(loaded, input.auths)
+  const fallback: CopilotAuth = input.auths[0] ?? {
+    key: "github-copilot",
+    label: "Primary",
+    refresh: "",
+    access: "",
+    expires: 0,
+  }
+  const primary = routeAccount({
+    auths: input.auths,
+    state,
+    modelId: input.modelId,
+    providerID: input.providerID,
+    fallback,
+    runtime: input.runtime,
+  })
+  const tried = new Set<string>([primary.key])
+  const candidates: string[] = [primary.key]
+  for (let i = 1; i < effective.maxAttempts; i++) {
+    const lastKey = candidates[candidates.length - 1]
+    const next = input.pool.failoverTokenForModel(lastKey, input.modelId)
+    if (!next || tried.has(next)) break
+    tried.add(next)
+    candidates.push(next)
+  }
+  if (candidates.length < 2) {
+    // No alternates — nothing to race against, fall back to plain dispatch.
+    return dispatch(input)
+  }
+  const attempts = candidates.map((key) => async (ctx: { attempt: number; signal: AbortSignal }) => {
+    // Merge the race-level AbortController into the per-attempt init.signal.
+    const signal = ctx.signal
+    const attemptInit: RequestInit = { ...input.init, signal }
+    return dispatch({
+      ...input,
+      init: attemptInit,
+      // Pin the candidate by routing through `providerID`; when absent the
+      // routing machinery will prefer this key via `weighted`/`preferAccount`.
+      providerID: `github-copilot#${key}`,
+    })
+  })
+  return raceFetch(attempts, effective, { bus: httpRetryRaceBus })
+}
+
 async function dispatchOnce(ctx: {
   input: Parameters<typeof dispatch>[0]
   state: State
@@ -1354,6 +1449,10 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   // overrides (`OPENCODE_COPILOT_RATE_LIMITER_*`) are resolved there.
   const rlOpts = copilotRateLimiterConfig(resolvedCfg as any)
   runtime.rateLimiter = new CopilotRateLimiter(rlOpts)
+  // Seed the HTTP retry-race config + its observation bus. The bus ring
+  // buffer retains the most recent `eventBusCapacity` observations so
+  // late-joining debug consumers see race history without tailing logs.
+  setHttpRetryRaceConfig(httpRetryRaceConfig(resolvedCfg as any))
   const discoveryBarrier = createDiscoveryBarrier()
   CopilotRuntimeState.current = runtime
   // Boot the AccountPool against the live runtime + SQLite cooldown store.
@@ -1363,6 +1462,26 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
   const rateStore = await openRateStore(rateStateFile).catch(() => undefined)
   const pool = new AccountPool({ runtime, store: rateStore })
   CopilotRuntimeState.pool = pool
+  // Boot-time parallel quota + `/models` fan-out. Mirrors codex_git's
+  // `discover_copilot_accounts` — runs `loadAccountStatuses()` once at plugin
+  // init so the first `/turn/start` sees hot `copilot-connections.json`
+  // caches (api_base_url + plan SKU + supported models) instead of triggering
+  // a cold lazy probe on the request path. Fire-and-forget: never blocks
+  // plugin init, and respects the same `OPENCODE_PROBE_DISCOVERY=0` opt-out
+  // the CLI honours. Disable explicitly via `OPENCODE_EAGER_COPILOT_DISCOVERY=0`.
+  if (
+    process.env.OPENCODE_EAGER_COPILOT_DISCOVERY !== "0" &&
+    process.env.OPENCODE_PROBE_DISCOVERY !== "0"
+  ) {
+    ;(async () => {
+      try {
+        const { loadAccountStatuses } = await import("../../cli/cmd/providers")
+        await loadAccountStatuses()
+      } catch (err) {
+        log.warn("eager copilot discovery failed", { error: err instanceof Error ? err.message : String(err) })
+      }
+    })().catch(() => undefined)
+  }
   return {
     provider: {
       id: "github-copilot",
@@ -1534,7 +1653,7 @@ export async function CopilotAuthPlugin(input: PluginInput): Promise<Hooks> {
               if (!list || list.length === 0) continue
               for (const m of list) pool.markModelUnsupported(auth.key, m)
             }
-            return dispatch({
+            return dispatchWithRace({
               getAuth,
               auths,
               read: readState,
