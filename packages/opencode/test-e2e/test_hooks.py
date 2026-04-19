@@ -1258,45 +1258,49 @@ def test_stop_hook_failed_abort_injects_stop_abort_tag(
 
 
 @pytest.mark.live
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(900)
 @_skip_if_live_disabled
 def test_posttooluse_normal_fires_after_tool(
     hook_log_dir: Path,
 ) -> None:
-    """No hook output — just verify the hook fires and payload has
-    ``tool_name`` + ``tool_response``."""
+    """PostToolUse fires baseline after bash executes — via SGR auto-dispatch.
+
+    SGR rewrite: the server dispatches bash from the structured payload;
+    PostToolUse hook fires after execute with the captured tool output.
+    No hook-side rewrite; we just assert the hook payload carries
+    ``tool_name`` + ``tool_response`` + ``tool_use_id``.
+    """
     hooks = {
         "PostToolUse": [_hook_entry("PostToolUse", hook_log_dir, matcher="bash")],
     }
-    server = _live_hooks_spawn_server(hook_log_dir, hooks)
-    with server:
+    server = _spawn_sgr_hooks_server(hook_log_dir, hooks)
+    try:
         _skip_if_no_instance_routes(server)
-        try:
-            with _live_client(server) as client:
-                session = client.create_session()
-                client.send_message(
-                    session["id"],
-                    "Run `echo ping` via the bash tool. Stop.",
-                    providerID=TOOL_MODEL["providerID"],
-                    modelID=TOOL_MODEL["modelID"],
-                )
-                try:
-                    payload = _read_hook_log(hook_log_dir, "PostToolUse", timeout_s=60.0)
-                except TimeoutError:
-                    pytest.skip(
-                        "PostToolUse hook never fired — model declined to "
-                        "invoke bash. TS unit tests cover this path."
-                    )
-                assert payload["hook_event_name"] == "PostToolUse"
-                assert payload["tool_name"] == "bash"
-                assert "tool_response" in payload
-                assert "tool_use_id" in payload
-                try:
-                    client.delete_session(session["id"])
-                except Exception:
-                    pass
-        finally:
-            _cleanup_live_server(server)
+
+        _instance, session_id, _ = _dispatch_bash_via_sgr(
+            server,
+            command_hint="echo ping",
+            description_hint="Print ping for PostToolUse baseline",
+        )
+
+        payload = _read_hook_log(hook_log_dir, "PostToolUse", timeout_s=10.0)
+        assert payload["hook_event_name"] == "PostToolUse"
+        assert payload["tool_name"] == "bash"
+        assert "tool_response" in payload
+        assert "tool_use_id" in payload
+
+        with OpencodeClient(
+            server.base_url,
+            project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
+            timeout_s=30.0,
+        ) as client:
+            try:
+                client.delete_session(session_id)
+            except Exception:
+                pass
+    finally:
+        server.stop()
+        _cleanup_live_server(server)
 
 
 # ---- 7. SubagentStart + SubagentStop (reason=completed) -----------------
