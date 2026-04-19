@@ -40,7 +40,7 @@ describe("tui timer fired route", () => {
           }
           const res = await app.request("/tui/timer-fired", {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", "x-opencode-directory": tmp.path },
             body: JSON.stringify(body),
           })
           expect(res.status).toBe(200)
