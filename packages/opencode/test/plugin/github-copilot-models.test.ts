@@ -14,6 +14,14 @@ import {
 import { discover } from "@/plugin/github-copilot/connections"
 import { MessageV2 } from "@/session/message-v2"
 
+// Suppress the eager /copilot_internal/user + /models fan-out that
+// `CopilotAuthPlugin` spawns at boot. Those background fetches race
+// against the per-test `globalThis.fetch` mocks installed below and
+// contaminate their call-capture arrays (leading to `seen[0]` being a
+// stale discovery call instead of the test's own device-code request).
+// Mirrors the guard the plugin reads at line 1483 of copilot.ts.
+process.env.OPENCODE_EAGER_COPILOT_DISCOVERY = "0"
+
 const originalFetch = globalThis.fetch
 
 afterEach(() => {
