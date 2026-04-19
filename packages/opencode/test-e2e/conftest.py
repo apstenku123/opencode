@@ -1,6 +1,10 @@
 """Pytest fixtures for opencode e2e tests.
 
 Fixtures:
+    - ``_e2e_session_lock``          (session-scoped, autouse): cross-process
+      mutex. Every pytest invocation under this directory blocks at session
+      start until it can acquire ``/tmp/opencode-e2e.lock``. Hard cap: 15 min.
+      See :pyfunc:`_e2e_session_lock` for the lock-file semantics.
     - ``opencode_server``            (session-scoped): started ``OpencodeServer``.
     - ``http_client``                (function-scoped): ``OpencodeClient``.
     - ``authenticated_copilot_session`` (function-scoped): thread ID bound to
@@ -9,19 +13,48 @@ Fixtures:
       OAuth token is on disk.
     - ``copilot_model``              (session-scoped): provider/model pair to
       use for live tests. Overridable via ``OPENCODE_E2E_COPILOT_MODEL``
-      (default: ``gpt-4o``).
+      (default: ``gpt-4.1``).
+
+Cross-process mutex (``_e2e_session_lock``)
+------------------------------------------
+Parallel pytest runs — either inside a single agent or across multiple
+agents racing on the same workstation — cannot safely share the user's
+real Copilot OAuth tokens, the `/tmp/opencode-e2e.lock` inter-process
+guards, or the spawned `opencode serve` subprocesses (port allocation is
+ephemeral but data dirs and rate-limits are shared). The lock serialises
+test sessions:
+
+    - Path: ``/tmp/opencode-e2e.lock`` (POSIX advisory ``flock`` via
+      :pymod:`filelock`).
+    - Timeout: 900s (15 min). Exceeding it aborts the test session with a
+      ``Timeout`` exception.
+    - Audit file: ``/tmp/opencode-e2e.lock.meta`` — JSON ``{pid, started_at,
+      suite_names}`` written immediately after acquisition. Consumers can
+      inspect this to detect stale locks.
+    - Watchdog: a daemon thread fires after 900s of hold time, logs to
+      stderr, and ``os.kill(self, SIGTERM)``s the owning process so the
+      finally: branch runs and the lock is released.
+    - Release: ``finally:`` on fixture teardown unlinks both files.
+
+Because the fixture is ``autouse=True``, every pytest invocation under
+this directory (``.venv/bin/python -m pytest test_*.py``) picks it up
+without any opt-in. Do NOT remove the ``autouse``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Iterator
 
 import pytest
+from filelock import FileLock, Timeout
 
 # Make ``harness`` importable without installing the package.
 _HERE = Path(__file__).parent
@@ -35,6 +68,137 @@ from harness import (  # noqa: E402
     prepare_isolated_home,
     resolve_opencode_binary,
 )
+
+
+# ---------------------------------------------------------------------------
+# Cross-process session mutex
+# ---------------------------------------------------------------------------
+
+E2E_LOCK_PATH = "/tmp/opencode-e2e.lock"
+E2E_LOCK_META_PATH = "/tmp/opencode-e2e.lock.meta"
+E2E_LOCK_TIMEOUT_S = 900  # 15 minutes — hard cap for acquisition AND hold-time.
+
+
+def _write_lock_meta(suite_names: list[str]) -> None:
+    """Persist ``{pid, started_at, suite_names}`` next to the lock file.
+
+    Written once per successful acquisition. Stale-lock auditors can
+    cross-reference ``pid`` against ``/proc`` / ``ps`` to detect a dead
+    holder.
+    """
+    meta = {
+        "pid": os.getpid(),
+        "started_at": time.time(),
+        "started_at_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "suite_names": suite_names,
+    }
+    try:
+        Path(E2E_LOCK_META_PATH).write_text(json.dumps(meta, indent=2))
+    except OSError:
+        # Best-effort — the lock itself holds the mutex, meta is informational.
+        pass
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _e2e_session_lock(request) -> Iterator[None]:
+    """Session-scoped cross-process mutex. See module docstring for semantics.
+
+    Serialises ALL pytest invocations under this conftest.py. Fires a
+    watchdog at 900s that ``SIGTERM``s the current process so the
+    ``finally:`` branch below runs — thus releasing the lock even on a
+    runaway session.
+    """
+    # Allow an escape hatch for CI environments that don't need the guard.
+    if os.environ.get("OPENCODE_E2E_SKIP_LOCK") == "1":
+        yield
+        return
+
+    # Collect suite names for the audit file. ``request.session.items`` is
+    # not yet populated at the point this fixture runs (collection happens
+    # after session start); fall back to the items actually passed on the
+    # CLI via ``request.config.args``.
+    suite_names: list[str] = []
+    try:
+        suite_names = [str(a) for a in request.config.args]
+    except Exception:
+        pass
+
+    lock = FileLock(E2E_LOCK_PATH, timeout=E2E_LOCK_TIMEOUT_S)
+    acquire_start = time.monotonic()
+    try:
+        print(
+            f"[e2e-lock] pid={os.getpid()} acquiring {E2E_LOCK_PATH} "
+            f"(timeout={E2E_LOCK_TIMEOUT_S}s)...",
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            lock.acquire(timeout=E2E_LOCK_TIMEOUT_S)
+        except Timeout as err:
+            raise pytest.UsageError(
+                f"[e2e-lock] could not acquire {E2E_LOCK_PATH} within "
+                f"{E2E_LOCK_TIMEOUT_S}s — another pytest session is holding "
+                "the mutex or the lock is stale. Inspect "
+                f"{E2E_LOCK_META_PATH} for the current holder."
+            ) from err
+    except Exception:
+        raise
+
+    wait_s = time.monotonic() - acquire_start
+    print(
+        f"[e2e-lock] pid={os.getpid()} acquired {E2E_LOCK_PATH} "
+        f"after {wait_s:.1f}s",
+        file=sys.stderr,
+        flush=True,
+    )
+    _write_lock_meta(suite_names)
+    hold_start = time.monotonic()
+
+    # Watchdog: if hold time exceeds the hard cap, log + SIGTERM self so
+    # the finally: branch releases the lock. A pure RuntimeError raised
+    # from the thread would never reach the main thread; SIGTERM hooks
+    # into pytest's shutdown path.
+    watchdog_stop = threading.Event()
+
+    def _watchdog() -> None:
+        # Poll in 1-second slices so we can exit quickly on normal teardown.
+        while not watchdog_stop.is_set():
+            if time.monotonic() - hold_start > E2E_LOCK_TIMEOUT_S:
+                print(
+                    f"[e2e-lock] WATCHDOG: hold time exceeded "
+                    f"{E2E_LOCK_TIMEOUT_S}s — aborting session (pid={os.getpid()})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                except OSError:
+                    pass
+                return
+            watchdog_stop.wait(1.0)
+
+    watchdog = threading.Thread(target=_watchdog, name="e2e-lock-watchdog", daemon=True)
+    watchdog.start()
+
+    try:
+        yield
+    finally:
+        watchdog_stop.set()
+        held_s = time.monotonic() - hold_start
+        try:
+            lock.release()
+        except Exception:
+            pass
+        try:
+            Path(E2E_LOCK_META_PATH).unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(
+            f"[e2e-lock] pid={os.getpid()} released {E2E_LOCK_PATH} "
+            f"after {held_s:.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def pytest_configure(config) -> None:
