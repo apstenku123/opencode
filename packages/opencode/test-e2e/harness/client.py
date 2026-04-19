@@ -241,8 +241,20 @@ class OpencodeClient:
         """
         return self._get(f"/session/{session_id}/children")
 
-    def create_session(self, **body: Any) -> dict[str, Any]:
-        """POST /session — create a session directly (fires SessionStart)."""
+    def create_session(
+        self,
+        *,
+        config_overlay: Optional[dict[str, Any]] = None,
+        **body: Any,
+    ) -> dict[str, Any]:
+        """POST /session — create a session directly (fires SessionStart).
+
+        ``config_overlay`` is deep-merged over the server's global config for
+        this session only. Lets tests set per-session hooks/memories/skills
+        without respawning ``opencode serve``.
+        """
+        if config_overlay is not None:
+            body["configOverlay"] = config_overlay
         return self._post("/session", json=body)
 
     def delete_session(self, session_id: str) -> bool:
