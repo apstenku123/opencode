@@ -4,6 +4,7 @@ import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { Effect, Layer } from "effect"
 import {
   BUNDLE_VERSION,
+  MIN_SUPPORTED_BUNDLE_VERSION,
   applyBundle,
   buildBundle,
   exportBundle,
@@ -90,8 +91,26 @@ describe("github-copilot transfer bundle", () => {
     expect(() => parseBundle({ version: 99, accounts: [], connections: {}, exportedAt: 0 })).toThrow(
       /unsupported Copilot transfer bundle version/,
     )
+    expect(() => parseBundle({ version: 0, accounts: [], connections: {}, exportedAt: 0 })).toThrow(
+      /unsupported Copilot transfer bundle version/,
+    )
     expect(() => parseBundle("not-an-object")).toThrow(/schema mismatch/)
     expect(() => parseBundle({ version: 1 })).toThrow(/schema mismatch/)
+  })
+
+  test("parseBundle accepts v1 bundles (forward-compat for pre-v2 exports)", () => {
+    // A plain v1 payload — no new v2 fields. Must round-trip cleanly so
+    // bundles produced before the schema bump still import.
+    const v1 = {
+      version: MIN_SUPPORTED_BUNDLE_VERSION,
+      accounts: [{ key: "github-copilot", label: "Primary", refresh: "r" }],
+      connections: { "github-copilot": { plan: "pro" } },
+      exportedAt: 0,
+    }
+    const parsed = parseBundle(v1)
+    expect(parsed.version).toBe(MIN_SUPPORTED_BUNDLE_VERSION)
+    expect(parsed.connections["github-copilot"].machineId).toBeUndefined()
+    expect(parsed.connections["github-copilot"].discovery).toBeUndefined()
   })
 
   test("applyBundle merges into existing auth and keeps non-copilot entries", () => {
@@ -234,6 +253,184 @@ describe("github-copilot transfer bundle", () => {
       }),
     )
     expect(all["github-copilot"]).toBeUndefined()
+  })
+
+  test("buildBundle emits every v2 per-account field (envelope, machineId, unsupportedModels, discovery)", () => {
+    // Single source of truth for the fields we expect to survive the
+    // round-trip. Mirrors the per-account state added on this branch.
+    const bundle = buildBundle({
+      auths: [
+        { key: "github-copilot", label: "Primary", refresh: "rt", access: "at", expires: 0 },
+      ],
+      state: {
+        version: 1,
+        connections: {
+          "github-copilot": {
+            label: "Primary",
+            plan: "pro",
+            proxyUrl: "https://proxy.example",
+            proxyToken: "ptok",
+            envelope: true,
+            machineId: "11111111-2222-3333-4444-555555555555",
+            deactivated: true,
+            unsupportedModels: ["gpt-5-pro", "claude-opus-4-7"],
+            discovery: {
+              at: 1700000000000,
+              models: ["claude-opus-4-7", "gpt-5"],
+              api: "https://api.individual.githubcopilot.com",
+              plan: "pro",
+              login: "ent-user",
+              ok: true,
+            },
+          },
+        },
+      },
+      options: { now: 2 },
+    })
+    expect(bundle.version).toBe(BUNDLE_VERSION)
+    const conn = bundle.connections["github-copilot"]
+    expect(conn.envelope).toBe(true)
+    expect(conn.machineId).toBe("11111111-2222-3333-4444-555555555555")
+    expect(conn.deactivated).toBe(true)
+    expect(conn.unsupportedModels).toEqual(["gpt-5-pro", "claude-opus-4-7"])
+    expect(conn.discovery?.at).toBe(1700000000000)
+    expect(conn.discovery?.models).toEqual(["claude-opus-4-7", "gpt-5"])
+    expect(conn.discovery?.api).toBe("https://api.individual.githubcopilot.com")
+    expect(conn.discovery?.plan).toBe("pro")
+    expect(conn.discovery?.login).toBe("ent-user")
+    expect(conn.discovery?.ok).toBe(true)
+    expect(conn.discovery?.err).toBeUndefined()
+    // Account-level proxy fields still ride along.
+    expect(bundle.accounts[0].proxyUrl).toBe("https://proxy.example")
+    expect(bundle.accounts[0].proxyToken).toBe("ptok")
+
+    // Re-parse through the schema so the test also exercises the
+    // decode path — catches accidental drift between the in-memory
+    // shape and the on-wire JSON.
+    const json = JSON.parse(JSON.stringify(bundle))
+    const reparsed = parseBundle(json)
+    expect(reparsed.connections["github-copilot"].envelope).toBe(true)
+    expect(reparsed.connections["github-copilot"].machineId).toBe("11111111-2222-3333-4444-555555555555")
+    expect(reparsed.connections["github-copilot"].unsupportedModels).toEqual(["gpt-5-pro", "claude-opus-4-7"])
+    expect(reparsed.connections["github-copilot"].discovery?.models).toEqual(["claude-opus-4-7", "gpt-5"])
+  })
+
+  test("applyBundle restores every v2 field on an empty state", () => {
+    // Import target has no Copilot creds, no connection state. After
+    // apply, every v2 field must be visible on `nextState.connections`.
+    const bundle: Bundle = {
+      version: BUNDLE_VERSION,
+      accounts: [{ key: "github-copilot", label: "Primary", refresh: "rt" }],
+      connections: {
+        "github-copilot": {
+          label: "Primary",
+          plan: "pro",
+          proxyUrl: "https://proxy.example",
+          proxyToken: "ptok",
+          envelope: true,
+          machineId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+          deactivated: true,
+          unsupportedModels: ["gpt-5-pro"],
+          discovery: {
+            at: 1700000000000,
+            models: ["gpt-5", "claude-opus-4-7"],
+            api: "https://api.githubcopilot.com",
+            plan: "pro",
+            login: "user42",
+            ok: true,
+          },
+        },
+      },
+      exportedAt: 0,
+    }
+    const { nextAuth, nextState } = applyBundle({
+      bundle,
+      existingAuth: {},
+      existingState: emptyConnections(),
+      mode: "merge",
+    })
+    expect((nextAuth["github-copilot"] as any).refresh).toBe("rt")
+    const conn = nextState.connections["github-copilot"]
+    expect(conn).toBeDefined()
+    expect(conn.label).toBe("Primary")
+    expect(conn.plan).toBe("pro")
+    expect(conn.proxyUrl).toBe("https://proxy.example")
+    expect(conn.proxyToken).toBe("ptok")
+    expect(conn.envelope).toBe(true)
+    expect(conn.machineId).toBe("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+    expect(conn.deactivated).toBe(true)
+    expect(conn.unsupportedModels).toEqual(["gpt-5-pro"])
+    expect(conn.discovery?.at).toBe(1700000000000)
+    expect(conn.discovery?.models).toEqual(["gpt-5", "claude-opus-4-7"])
+    expect(conn.discovery?.api).toBe("https://api.githubcopilot.com")
+    expect(conn.discovery?.plan).toBe("pro")
+    expect(conn.discovery?.login).toBe("user42")
+    expect(conn.discovery?.ok).toBe(true)
+  })
+
+  test("deactivated flag survives export -> import round-trip across machines", async () => {
+    // Seed machine A: one account, flagged as deactivated (e.g. server
+    // returned 401/403 and the runtime suspended it).
+    await provide(
+      Effect.gen(function* () {
+        const auth = yield* Auth.Service
+        yield* auth.set("github-copilot", {
+          type: "oauth",
+          refresh: "rt-a",
+          access: "at-a",
+          expires: 0,
+        })
+        const fs = yield* AppFileSystem.Service
+        const store = new ConnectionsStore(fs)
+        yield* store.write({
+          version: 1,
+          connections: {
+            "github-copilot": {
+              plan: "pro",
+              deactivated: true,
+              machineId: "00000000-1111-2222-3333-444444444444",
+              envelope: true,
+              unsupportedModels: ["gpt-5-pro"],
+              discovery: {
+                at: 1700000000000,
+                models: ["gpt-5"],
+                ok: false,
+                err: "token_expired",
+              },
+            },
+          },
+        })
+      }),
+    )
+
+    // Export on machine A.
+    const bundle = await provide(exportBundle({ exportedBy: "machine-A" }))
+    expect(bundle.connections["github-copilot"].deactivated).toBe(true)
+
+    // Move to machine B: wipe and import the bundle.
+    await resetCopilotAuth()
+    await provide(importBundle(bundle, { mode: "merge" }))
+
+    // Read back the restored connections state on machine B.
+    const restored = await provide(
+      Effect.gen(function* () {
+        const fs = yield* AppFileSystem.Service
+        const store = new ConnectionsStore(fs)
+        return yield* store.read()
+      }),
+    )
+    const conn = restored.connections["github-copilot"]
+    expect(conn).toBeDefined()
+    // The whole point of this test: a suspension flagged on one machine
+    // stays visible when sharing the bundle to a peer.
+    expect(conn.deactivated).toBe(true)
+    expect(conn.machineId).toBe("00000000-1111-2222-3333-444444444444")
+    expect(conn.envelope).toBe(true)
+    expect(conn.unsupportedModels).toEqual(["gpt-5-pro"])
+    expect(conn.discovery?.at).toBe(1700000000000)
+    expect(conn.discovery?.models).toEqual(["gpt-5"])
+    expect(conn.discovery?.ok).toBe(false)
+    expect(conn.discovery?.err).toBe("token_expired")
   })
 
   test("redacted bundle roundtrip retains connection metadata but no refresh tokens", async () => {

@@ -24,7 +24,25 @@ import { list as listCopilotAuths, label as copilotLabel, type CopilotAuth } fro
 import { Store as ConnectionsStore, empty as emptyConnections, type Conn, type State as ConnectionsState } from "./connections"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 
-export const BUNDLE_VERSION = 1 as const
+/**
+ * Bundle schema version.
+ *
+ * - `1`: initial shape — `label`, `login`, `plan`, `proxyUrl`, `proxyToken`,
+ *   `preferred`, `deactivated`.
+ * - `2`: adds per-account routing state so sharing a bundle between machines
+ *   preserves the full connection lifecycle: `envelope` (proxy protocol
+ *   flag), `machineId` (stable per-account UUID the Copilot API expects),
+ *   `unsupportedModels[]` (model-not-supported memoisation), and
+ *   `discovery.{at,models,api,plan,login,ok,err}` (last capability probe).
+ *
+ * v1 bundles are still accepted by `parseBundle` — the missing fields
+ * simply round-trip as absent, mirroring the Rust importer's forward-compat
+ * behaviour.
+ */
+export const BUNDLE_VERSION = 2 as const
+
+/** Minimum bundle version `parseBundle` still accepts for import. */
+export const MIN_SUPPORTED_BUNDLE_VERSION = 1 as const
 
 /* ------------------------------------------------------------------ */
 /* Schemas                                                            */
@@ -41,6 +59,21 @@ const BundleAccount = Schema.Struct({
   proxyToken: Schema.optional(Schema.String),
 })
 
+/**
+ * Discovery snapshot mirrored from `connections.ts`. Kept as its own
+ * schema so the `connections.discovery` round-trip matches the on-disk
+ * `copilot-connections.json` shape 1:1.
+ */
+const BundleDiscovery = Schema.Struct({
+  at: Schema.Number,
+  models: Schema.Array(Schema.String),
+  api: Schema.optional(Schema.String),
+  plan: Schema.optional(Schema.String),
+  login: Schema.optional(Schema.String),
+  ok: Schema.optional(Schema.Boolean),
+  err: Schema.optional(Schema.String),
+})
+
 const BundleConn = Schema.Struct({
   label: Schema.optional(Schema.String),
   login: Schema.optional(Schema.String),
@@ -49,6 +82,14 @@ const BundleConn = Schema.Struct({
   proxyToken: Schema.optional(Schema.String),
   preferred: Schema.optional(Schema.Boolean),
   deactivated: Schema.optional(Schema.Boolean),
+  /** Proxy envelope protocol opt-in — see `connections.ts`. */
+  envelope: Schema.optional(Schema.Boolean),
+  /** Stable per-account machine UUID required by the Copilot API. */
+  machineId: Schema.optional(Schema.String),
+  /** Models the server has rejected with `model_not_supported`. */
+  unsupportedModels: Schema.optional(Schema.Array(Schema.String)),
+  /** Last capability-probe snapshot (models list, plan, login, etc.). */
+  discovery: Schema.optional(BundleDiscovery),
 })
 
 const Bundle = Schema.Struct({
@@ -64,6 +105,7 @@ const Bundle = Schema.Struct({
 
 export type BundleAccount = typeof BundleAccount.Type
 export type BundleConn = typeof BundleConn.Type
+export type BundleDiscovery = typeof BundleDiscovery.Type
 export type Bundle = typeof Bundle.Type
 
 export { Bundle as BundleSchema }
@@ -131,7 +173,31 @@ export function buildBundle(input: {
       ...(conn.proxyUrl !== undefined ? { proxyUrl: conn.proxyUrl } : {}),
       ...(!redacted && conn.proxyToken !== undefined ? { proxyToken: conn.proxyToken } : {}),
       ...(conn.preferred !== undefined ? { preferred: conn.preferred } : {}),
+      // `deactivated` must ride the bundle so a suspension marked on one
+      // machine is still visible after importing on a peer — otherwise a
+      // flagged account silently re-enters the rotation post-transfer.
       ...(conn.deactivated !== undefined ? { deactivated: conn.deactivated } : {}),
+      ...(conn.envelope !== undefined ? { envelope: conn.envelope } : {}),
+      // `machineId` is *not* a secret (Copilot API treats it as a stable
+      // client fingerprint); copying it keeps request-side headers
+      // identical across machines sharing the bundle.
+      ...(conn.machineId !== undefined ? { machineId: conn.machineId } : {}),
+      ...(conn.unsupportedModels !== undefined && conn.unsupportedModels.length > 0
+        ? { unsupportedModels: [...conn.unsupportedModels] }
+        : {}),
+      ...(conn.discovery !== undefined
+        ? {
+            discovery: {
+              at: conn.discovery.at,
+              models: [...conn.discovery.models],
+              ...(conn.discovery.api !== undefined ? { api: conn.discovery.api } : {}),
+              ...(conn.discovery.plan !== undefined ? { plan: conn.discovery.plan } : {}),
+              ...(conn.discovery.login !== undefined ? { login: conn.discovery.login } : {}),
+              ...(conn.discovery.ok !== undefined ? { ok: conn.discovery.ok } : {}),
+              ...(conn.discovery.err !== undefined ? { err: conn.discovery.err } : {}),
+            },
+          }
+        : {}),
     }
     // Don't emit empty shells.
     if (Object.keys(entry).length > 0) connections[key] = entry
@@ -180,9 +246,15 @@ export function parseBundle(raw: unknown): Bundle {
     throw new Error("invalid Copilot transfer bundle: schema mismatch")
   }
   const bundle = opt.value
-  if (bundle.version !== BUNDLE_VERSION) {
+  // Accept any schema in [MIN_SUPPORTED_BUNDLE_VERSION, BUNDLE_VERSION]; v1
+  // bundles simply lack the v2-added optional fields. Anything newer is a
+  // hard reject — we can't guarantee the format is forward-compatible.
+  if (
+    bundle.version < MIN_SUPPORTED_BUNDLE_VERSION ||
+    bundle.version > BUNDLE_VERSION
+  ) {
     throw new Error(
-      `unsupported Copilot transfer bundle version ${bundle.version} (expected ${BUNDLE_VERSION})`,
+      `unsupported Copilot transfer bundle version ${bundle.version} (expected ${MIN_SUPPORTED_BUNDLE_VERSION}..${BUNDLE_VERSION})`,
     )
   }
   return bundle
