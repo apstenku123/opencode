@@ -43,8 +43,8 @@ describe("DEFAULT_HTTP_RETRY_RACE_CONFIG", () => {
     expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.enabled).toBe(true)
   })
 
-  test("stagger = 45s (healthy-turn guard)", () => {
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.staggerMs).toBe(45_000)
+  test("stagger = 20s — tight enough that attempt-2 launches inside the 180s pytest test timeout", () => {
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.staggerMs).toBe(20_000)
   })
 
   test("concurrent limit = 2 (1 original + 1 backup; ≤2× quota burn)", () => {
@@ -55,8 +55,8 @@ describe("DEFAULT_HTTP_RETRY_RACE_CONFIG", () => {
     expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.maxAttempts).toBe(3)
   })
 
-  test("total deadline = 3 minutes", () => {
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.totalDeadlineMs).toBe(180_000)
+  test("total deadline = 2.5 minutes — leaves 30s headroom inside the 180s pytest timeout", () => {
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.totalDeadlineMs).toBe(150_000)
   })
 
   test("event bus capacity = 64 (matches Rust broadcast channel)", () => {
@@ -105,10 +105,10 @@ describe("httpRetryRaceConfig resolver honours the new defaults", () => {
     expect(cfg.enabled).toBe(false)
     // Other fields still track the new defaults so a user who disables
     // the race and later re-enables it lands on the tuned stagger/limit.
-    expect(cfg.staggerMs).toBe(45_000)
+    expect(cfg.staggerMs).toBe(20_000)
     expect(cfg.concurrentLimit).toBe(2)
     expect(cfg.maxAttempts).toBe(3)
-    expect(cfg.totalDeadlineMs).toBe(180_000)
+    expect(cfg.totalDeadlineMs).toBe(150_000)
   })
 
   test("rollback via env beats config for enabled=true", () => {
@@ -135,6 +135,6 @@ describe("httpRetryRaceConfig resolver honours the new defaults", () => {
     expect(cfg.staggerMs).toBe(30_000)
     expect(cfg.concurrentLimit).toBe(2)
     expect(cfg.maxAttempts).toBe(3)
-    expect(cfg.totalDeadlineMs).toBe(180_000)
+    expect(cfg.totalDeadlineMs).toBe(150_000)
   })
 })

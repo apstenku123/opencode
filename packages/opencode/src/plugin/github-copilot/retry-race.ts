@@ -112,10 +112,17 @@ export type HttpRetryRaceConfig = {
  */
 export const DEFAULT_HTTP_RETRY_RACE_CONFIG: HttpRetryRaceConfig = {
   enabled: true,
-  staggerMs: 45_000,
+  // Tighter schedule so retry-race stays useful inside a 180s pytest
+  // signal-timeout. With a 45s stagger + 180s deadline the first
+  // duplicate only launches at T=45s and attempt 3 at T=90s, leaving
+  // almost no headroom for the winning stream to complete. Shrinking
+  // stagger=20s (first dup at T=20s, dup-2 at T=40s) and deadline=150s
+  // gives every attempt ≥110s of stream budget while still fitting well
+  // inside tests and user-facing SLOs.
+  staggerMs: 20_000,
   concurrentLimit: 2,
   maxAttempts: 3,
-  totalDeadlineMs: 180_000,
+  totalDeadlineMs: 150_000,
   eventBusCapacity: 64,
 }
 

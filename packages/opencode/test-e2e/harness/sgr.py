@@ -68,7 +68,7 @@ from .client import OpencodeClient
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_POLL_TIMEOUT_S = 180.0
+DEFAULT_POLL_TIMEOUT_S = 300.0
 DEFAULT_POLL_INTERVAL_S = 1.0
 
 

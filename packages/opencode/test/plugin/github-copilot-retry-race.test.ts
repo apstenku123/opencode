@@ -53,10 +53,10 @@ describe("HttpRetryRaceConfig defaults", () => {
     // `HttpRetryRaceConfig::default()` to trade a lower quota burn for
     // still-meaningful p99 tail latency reduction.
     expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.enabled).toBe(true)
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.staggerMs).toBe(45_000)
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.staggerMs).toBe(20_000)
     expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.concurrentLimit).toBe(2)
     expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.maxAttempts).toBe(3)
-    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.totalDeadlineMs).toBe(180_000)
+    expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.totalDeadlineMs).toBe(150_000)
     expect(DEFAULT_HTTP_RETRY_RACE_CONFIG.eventBusCapacity).toBe(64)
   })
 })
