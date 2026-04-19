@@ -233,87 +233,108 @@ def _skip_if_no_instance_routes(server: OpencodeServer) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_session_start_hook_fires_on_create(hook_log_dir: Path) -> None:
-    """``POST /session`` → ``SessionStart`` hook receives JSON payload."""
-    hooks = {"SessionStart": [_hook_entry("SessionStart", hook_log_dir)]}
-    with _spawn_server(hook_log_dir=hook_log_dir, hooks=hooks) as server:
-        _skip_if_no_instance_routes(server)
-        try:
-            with OpencodeClient(
-                server.base_url,
-                project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
-            ) as client:
-                session = client.create_session()
-                assert session["id"].startswith("ses_")
+def test_session_start_hook_fires_on_create(
+    hook_log_dir: Path,
+    long_lived_server: tuple[OpencodeServer, OpencodeClient],
+) -> None:
+    """``POST /session`` → ``SessionStart`` hook receives JSON payload.
 
-                payload = _read_hook_log(hook_log_dir, "SessionStart")
-                assert payload["hook_event_name"] == "SessionStart"
-                assert payload["session_id"] == session["id"]
-                assert "cwd" in payload
-                assert "triggered_at" in payload
-                # SessionStart carries `source` + `model` fields.
-                assert "source" in payload
-        finally:
-            _cleanup_server_dirs(server)
-
-
-def test_session_end_hook_fires_on_delete(hook_log_dir: Path) -> None:
-    """``DELETE /session/:id`` → ``SessionEnd`` hook receives JSON payload."""
-    hooks = {
-        "SessionStart": [_hook_entry("SessionStart", hook_log_dir)],
-        "SessionEnd": [_hook_entry("SessionEnd", hook_log_dir)],
+    Migrated to the shared ``long_lived_server`` fixture via the
+    ``configOverlay`` body field on ``POST /session`` — each session
+    gets its own hook entries without respawning ``opencode serve``.
+    """
+    _, client = long_lived_server
+    overlay = {
+        "experimental": {
+            "hooks": {"SessionStart": [_hook_entry("SessionStart", hook_log_dir)]},
+        },
     }
-    with _spawn_server(hook_log_dir=hook_log_dir, hooks=hooks) as server:
-        _skip_if_no_instance_routes(server)
+    session = client.create_session(config_overlay=overlay)
+    try:
+        assert session["id"].startswith("ses_")
+
+        payload = _read_hook_log(hook_log_dir, "SessionStart")
+        assert payload["hook_event_name"] == "SessionStart"
+        assert payload["session_id"] == session["id"]
+        assert "cwd" in payload
+        assert "triggered_at" in payload
+        # SessionStart carries `source` + `model` fields.
+        assert "source" in payload
+    finally:
         try:
-            with OpencodeClient(
-                server.base_url,
-                project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
-            ) as client:
-                session = client.create_session()
-                _read_hook_log(hook_log_dir, "SessionStart")  # wait for start
-
-                client.delete_session(session["id"])
-
-                payload = _read_hook_log(hook_log_dir, "SessionEnd")
-                assert payload["hook_event_name"] == "SessionEnd"
-                assert payload["session_id"] == session["id"]
-                assert "reason" in payload
-        finally:
-            _cleanup_server_dirs(server)
+            client.delete_session(session["id"])
+        except Exception:
+            pass
 
 
-def test_hook_matcher_filters_events(hook_log_dir: Path) -> None:
-    """A matcher regex on ``SessionStart.source`` restricts firing."""
-    # Match only sessions whose source is "no-such-source" — the default
-    # source is "cli", so the hook should NOT fire.
-    hooks = {
-        "SessionStart": [
-            _hook_entry(
-                "SessionStart",
-                hook_log_dir,
-                matcher="^no-such-source$",
-                name="mismatched",
-            ),
-        ],
+def test_session_end_hook_fires_on_delete(
+    hook_log_dir: Path,
+    long_lived_server: tuple[OpencodeServer, OpencodeClient],
+) -> None:
+    """``DELETE /session/:id`` → ``SessionEnd`` hook receives JSON payload.
+
+    Uses the shared ``long_lived_server`` + per-session overlay.
+    """
+    _, client = long_lived_server
+    overlay = {
+        "experimental": {
+            "hooks": {
+                "SessionStart": [_hook_entry("SessionStart", hook_log_dir)],
+                "SessionEnd": [_hook_entry("SessionEnd", hook_log_dir)],
+            },
+        },
     }
-    with _spawn_server(hook_log_dir=hook_log_dir, hooks=hooks) as server:
-        _skip_if_no_instance_routes(server)
-        try:
-            with OpencodeClient(
-                server.base_url,
-                project_directory=str(server._e2e_cwd),  # type: ignore[attr-defined]
-            ) as client:
-                client.create_session()
+    session = client.create_session(config_overlay=overlay)
+    try:
+        _read_hook_log(hook_log_dir, "SessionStart")  # wait for start
 
-                log_path = hook_log_dir / "opencode-hook-SessionStart.log"
-                # Poll briefly to catch any late write; must remain absent.
-                time.sleep(0.5)
-                assert not log_path.exists(), (
-                    f"hook fired despite matcher mismatch; log={log_path.read_text()}"
-                )
-        finally:
-            _cleanup_server_dirs(server)
+        client.delete_session(session["id"])
+
+        payload = _read_hook_log(hook_log_dir, "SessionEnd")
+        assert payload["hook_event_name"] == "SessionEnd"
+        assert payload["session_id"] == session["id"]
+        assert "reason" in payload
+    finally:
+        # best-effort cleanup if delete above raised before reaching here
+        pass
+
+
+def test_hook_matcher_filters_events(
+    hook_log_dir: Path,
+    long_lived_server: tuple[OpencodeServer, OpencodeClient],
+) -> None:
+    """A matcher regex on ``SessionStart.source`` restricts firing.
+
+    Uses the shared ``long_lived_server`` + per-session overlay.
+    """
+    _, client = long_lived_server
+    overlay = {
+        "experimental": {
+            "hooks": {
+                "SessionStart": [
+                    _hook_entry(
+                        "SessionStart",
+                        hook_log_dir,
+                        matcher="^no-such-source$",
+                        name="mismatched",
+                    ),
+                ],
+            },
+        },
+    }
+    session = client.create_session(config_overlay=overlay)
+    try:
+        log_path = hook_log_dir / "opencode-hook-SessionStart.log"
+        # Poll briefly to catch any late write; must remain absent.
+        time.sleep(0.5)
+        assert not log_path.exists(), (
+            f"hook fired despite matcher mismatch; log={log_path.read_text()}"
+        )
+    finally:
+        try:
+            client.delete_session(session["id"])
+        except Exception:
+            pass
 
 
 def test_session_start_additional_context_stdout(hook_log_dir: Path) -> None:
