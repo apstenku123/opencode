@@ -1,4 +1,6 @@
 import {
+  codedashProfileFile,
+  forgeCredentialFile,
   githubCopilotAppsFile,
   githubCopilotOAuthFile,
   legacyCredentialFile,
@@ -175,6 +177,64 @@ export function oauth(raw: unknown): CopilotAuth[] {
 }
 
 /**
+ * Parse `~/forge/.credentials.json` — the Forge CLI credential store.
+ * Array of `{id, auth_details: {o_auth_with_api_key: {tokens: {access_token}}}}`
+ * entries. Each `github_copilot` entry becomes its own
+ * `github-copilot#forge-<prefix>` slot so distinct Copilot App IDs used
+ * by Forge (different from VS Code / CLI / multiplexer) register as
+ * separate pool accounts.
+ */
+export function forge(raw: unknown): CopilotAuth[] {
+  if (!Array.isArray(raw)) return []
+  const items: CopilotAuth[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue
+    const e = entry as Record<string, unknown>
+    if (e.id !== "github_copilot") continue
+    const auth = (e.auth_details && typeof e.auth_details === "object") ? (e.auth_details as Record<string, unknown>) : {}
+    const ooauth = (auth.o_auth_with_api_key && typeof auth.o_auth_with_api_key === "object")
+      ? (auth.o_auth_with_api_key as Record<string, unknown>)
+      : {}
+    const tokens = (ooauth.tokens && typeof ooauth.tokens === "object") ? (ooauth.tokens as Record<string, unknown>) : {}
+    const access = typeof tokens.access_token === "string" ? tokens.access_token : undefined
+    if (!access) continue
+    // Use first 8 chars of the token as the slug — good enough to
+    // disambiguate when multiple forge creds are stored.
+    const slug = access.replace(/[^a-z0-9]+/gi, "").toLowerCase().slice(0, 8) || "default"
+    const key = `github-copilot#forge-${slug}`
+    items.push({
+      key,
+      label: label(key),
+      refresh: access,
+      access,
+      expires: 0,
+    })
+  }
+  return items
+}
+
+/**
+ * Parse `~/.codedash/github-profile.json` — single-GitHub-user store
+ * with `{username, token}`. Registers as `github-copilot#codedash-<user>`.
+ */
+export function codedash(raw: unknown): CopilotAuth[] {
+  if (!raw || typeof raw !== "object") return []
+  const data = raw as Record<string, unknown>
+  const token = typeof data.token === "string" ? data.token : undefined
+  if (!token) return []
+  const user = typeof data.username === "string" ? data.username : undefined
+  const slug = user ? user.replace(/[^a-z0-9]+/gi, "-").toLowerCase().slice(0, 16) : "default"
+  const key = `github-copilot#codedash-${slug}`
+  return [{
+    key,
+    label: user ?? label(key),
+    refresh: token,
+    access: token,
+    expires: 0,
+  }]
+}
+
+/**
  * Transient map populated by `migrate()` with proxy metadata from
  * `~/.copilot/auth/credential.json`. `Auth.Info` has no proxy fields
  * (proxy lives on Conn in `copilot-connections.json`), so downstream
@@ -190,11 +250,20 @@ export const migrate = Effect.fn("CopilotAuth.migrate")(function* (src?: Migrati
   const raw = yield* fs.read(fs.legacy).pipe(Effect.orElseSucceed(() => ({})))
   const rawApps = yield* fs.read(fs.apps).pipe(Effect.orElseSucceed(() => ({})))
   const rawOauth = yield* fs.read(fs.oauth).pipe(Effect.orElseSucceed(() => ({})))
-  // Merge all three sources plus env-supplied test tokens. Dedup by final
-  // `key`; the legacy CLI credential file is preferred when the same key
-  // is produced by multiple sources.
+  const rawForge = yield* fs.read(fs.forge).pipe(Effect.orElseSucceed(() => [] as unknown))
+  const rawCodedash = yield* fs.read(fs.codedash).pipe(Effect.orElseSucceed(() => ({})))
+  // Merge all five on-disk sources plus env-supplied test tokens. Dedup by
+  // final `key`; the legacy CLI credential file is preferred when the
+  // same key is produced by multiple sources.
   const envTests = testTokensFromEnv(process.env.OPENCODE_TEST_COPILOT_TOKENS)
-  const allFound = [...legacy(raw), ...apps(rawApps), ...oauth(rawOauth), ...envTests]
+  const allFound = [
+    ...legacy(raw),
+    ...apps(rawApps),
+    ...oauth(rawOauth),
+    ...forge(rawForge),
+    ...codedash(rawCodedash),
+    ...envTests,
+  ]
   const seen = new Set<string>()
   const uniq: CopilotAuth[] = []
   for (const item of allFound) {
@@ -268,6 +337,8 @@ export type MigrationIO = {
   legacy: string
   apps: string
   oauth: string
+  forge: string
+  codedash: string
   marker: string
   read(path: string): Effect.Effect<unknown, unknown>
   write(path: string, value: unknown): Effect.Effect<void, unknown>
@@ -280,6 +351,8 @@ export function io(): Effect.Effect<MigrationIO, never, AppFileSystem.Service> {
       legacy: legacyCredentialFile,
       apps: githubCopilotAppsFile,
       oauth: githubCopilotOAuthFile,
+      forge: forgeCredentialFile,
+      codedash: codedashProfileFile,
       marker: migrationFile,
       read(path: string) {
         return fs.readJson(path)

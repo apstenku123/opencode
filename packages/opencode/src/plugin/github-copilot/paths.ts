@@ -18,4 +18,18 @@ export const githubCopilotAppsFile = path.join(Global.Path.home, ".config", "git
  * other.
  */
 export const githubCopilotOAuthFile = path.join(Global.Path.home, ".config", "github-copilot", "oauth.json")
+/**
+ * Forge CLI credential store — `~/forge/.credentials.json`. Stores an
+ * array of `{id, auth_details}` entries; `id: "github_copilot"` entries
+ * carry an access token + optional enterprise `api_key` SKU in
+ * `auth_details.o_auth_with_api_key.tokens.access_token`.
+ */
+export const forgeCredentialFile = path.join(Global.Path.home, "forge", ".credentials.json")
+/**
+ * Codedash profile — `~/.codedash/github-profile.json`. Single-GitHub
+ * user shape with `{username, token}`. Not per-app, but useful when the
+ * user has authenticated codedash against a distinct account that's not
+ * in the other stores.
+ */
+export const codedashProfileFile = path.join(Global.Path.home, ".codedash", "github-profile.json")
 export const migrationFile = path.join(Global.Path.data, "copilot-migration.json")

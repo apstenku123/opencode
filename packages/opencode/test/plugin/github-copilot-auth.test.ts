@@ -1488,6 +1488,8 @@ test("migration e2e migrates legacy credentials into empty auth store with injec
         legacy: legacyPath,
         apps: legacyPath + ".apps",
         oauth: legacyPath + ".oauth",
+        forge: legacyPath + ".forge",
+        codedash: legacyPath + ".codedash",
         marker: markerPath,
         read(path: string) {
           return fs.readJson(path)
