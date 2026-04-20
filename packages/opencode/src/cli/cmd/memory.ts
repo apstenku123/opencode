@@ -26,6 +26,8 @@ import { Instance } from "../../project/instance"
 import {
   currentProjectID,
   deleteForProject,
+  listForProject,
+  sessionDetailForProject,
   statusForProject,
 } from "../../server/instance/memory"
 import {
@@ -46,10 +48,10 @@ import {
   layer as memoryFacadeLayer,
   memoryRetrievalLayer,
   memoryStorageLayer,
-  mockEmbeddingLayer,
   makeMemoryBridge,
   type RetrievalMode,
 } from "../../memory"
+import { autoEmbeddingLayer } from "../../embedding"
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
 import { Config } from "../../config"
 import { Provider } from "../../provider"
@@ -83,7 +85,7 @@ const memoryStack = (() => {
   // `memoryRetrievalLayer` needs `MemoryStorage` → wire it through
   // explicitly (matches `defaultLayer` composition in `memory/index.ts`).
   const retrieval = Layer.provide(memoryRetrievalLayer, memoryStorageLayer)
-  const deps = Layer.mergeAll(memoryStorageLayer, retrieval, mockEmbeddingLayer())
+  const deps = Layer.mergeAll(memoryStorageLayer, retrieval, autoEmbeddingLayer())
   return Layer.provideMerge(memoryFacadeLayer, deps)
 })()
 const ingestStack = Layer.provideMerge(memoryStack, foreignIngestCheckpointLayer)
@@ -123,6 +125,106 @@ const StatusCommand = cmd({
           prompts.log.info(`  ${row.tool}: ${row.count}`)
         }
       }
+      prompts.outro("Done")
+    })
+  },
+})
+
+// --------------------------------------------------------------------------
+// `memory list`
+// --------------------------------------------------------------------------
+
+const ListCommand = cmd({
+  command: "list",
+  describe: "list stored memory sextuples for the current project",
+  builder: (yargs: Argv) =>
+    yargs
+      .option("limit", {
+        describe: "maximum number of rows to return",
+        type: "number",
+        default: 20,
+      })
+      .option("json", {
+        describe: "output as JSON",
+        type: "boolean",
+        default: false,
+      }),
+  handler: async (args) => {
+    await bootstrap(process.cwd(), async () => {
+      const projectID = currentProjectID()
+      const body = await listForProject(projectID, args.limit as number)
+      if (args.json) {
+        process.stdout.write(JSON.stringify(body, null, 2) + EOL)
+        return
+      }
+      UI.empty()
+      prompts.intro("Memory list")
+      prompts.log.info(`Project: ${body.projectID ?? "(global)"}`)
+      if (body.items.length === 0) {
+        prompts.log.info("Items: (none)")
+        prompts.outro("Done")
+        return
+      }
+      for (const row of body.items) {
+        prompts.log.info(
+          `[${row.embedded ? "embedded" : "raw"}] ${row.hashId} ${row.problem}`,
+        )
+      }
+      prompts.outro("Done")
+    })
+  },
+})
+
+// --------------------------------------------------------------------------
+// `memory session-detail`
+// --------------------------------------------------------------------------
+
+const SessionDetailCommand = cmd({
+  command: "session-detail",
+  describe: "show foreign-ingest detail for one stored session",
+  builder: (yargs: Argv) =>
+    yargs
+      .option("tool", {
+        describe: "foreign tool name",
+        type: "string",
+        demandOption: true,
+      })
+      .option("source-id", {
+        describe: "foreign session identifier",
+        type: "string",
+        demandOption: true,
+      })
+      .option("git-root", {
+        describe: "override git-root scope; defaults to current project worktree",
+        type: "string",
+      })
+      .option("json", {
+        describe: "output as JSON",
+        type: "boolean",
+        default: false,
+      }),
+  handler: async (args) => {
+    await bootstrap(process.cwd(), async () => {
+      const projectID = currentProjectID()
+      const body = await sessionDetailForProject({
+        projectID,
+        tool: args.tool as string,
+        sourceID: args["source-id"] as string,
+        gitRoot: args["git-root"] as string | undefined,
+      })
+      if (args.json) {
+        process.stdout.write(JSON.stringify(body, null, 2) + EOL)
+        return
+      }
+      UI.empty()
+      prompts.intro("Memory session detail")
+      prompts.log.info(`Project: ${body.projectID ?? "(global)"}`)
+      prompts.log.info(`Git root: ${body.gitRoot ?? "(unscoped)"}`)
+      prompts.log.info(`Tool: ${body.detail.tool}`)
+      prompts.log.info(`Source ID: ${body.detail.sourceID}`)
+      prompts.log.info(`State: ${body.detail.state}`)
+      prompts.log.info(`Stored sextuples: ${body.detail.storedSextuplesCount}`)
+      prompts.log.info(`Stored skills: ${body.detail.storedSkillsCount}`)
       prompts.outro("Done")
     })
   },
@@ -554,6 +656,8 @@ export const MemoryCommand = cmd({
   builder: (yargs: Argv) =>
     yargs
       .command(StatusCommand)
+      .command(ListCommand)
+      .command(SessionDetailCommand)
       .command(ResetCommand)
       .command(IngestCommand)
       .command(CrawlCommand)

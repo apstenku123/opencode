@@ -16,6 +16,7 @@
 import { Effect, Layer } from "effect"
 import { Hono } from "hono"
 import { describeRoute, resolver, validator } from "hono-openapi"
+import path from "node:path"
 import z from "zod"
 
 import { Bus } from "../../bus"
@@ -26,7 +27,7 @@ import {
   layer as memoryFacadeLayer,
   memoryRetrievalLayer,
   memoryStorageLayer,
-  mockEmbeddingLayer,
+  autoEmbeddingLayer,
 } from "../../memory"
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
 import { ForeignIngestDoneTable, MemorySextupleTable } from "../../memory/memory.sql"
@@ -112,6 +113,58 @@ const StatusResponse = z
   })
   .meta({ ref: "MemoryStatus" })
 
+const MemoryListItem = z
+  .object({
+    id: z.string(),
+    hashId: z.string(),
+    projectID: z.string().nullable(),
+    keywords: z.array(z.string()),
+    problem: z.string(),
+    rootCause: z.string(),
+    solution: z.string(),
+    embedded: z.boolean(),
+    timeCreated: z.number().int(),
+    timeUpdated: z.number().int(),
+  })
+  .meta({ ref: "MemoryListItem" })
+
+const ListResponse = z
+  .object({
+    projectID: z.string().nullable(),
+    items: z.array(MemoryListItem),
+  })
+  .meta({ ref: "MemoryListResponse" })
+
+const ForeignIngestSessionDetailRequest = z
+  .object({
+    tool: z.string().min(1),
+    sourceID: z.string().min(1),
+    gitRoot: z.string().optional(),
+  })
+  .meta({ ref: "ForeignIngestSessionDetailRequest" })
+
+const ForeignIngestSessionDetail = z
+  .object({
+    tool: z.string(),
+    sourceID: z.string(),
+    sourcePath: z.string(),
+    contentHash: z.string().nullable(),
+    updatedAt: z.number().int().nullable(),
+    state: z.enum(["pending", "done"]),
+    storedSextuplesCount: z.number().int(),
+    storedSkillsCount: z.number().int(),
+    ingestedAt: z.number().int().nullable(),
+  })
+  .meta({ ref: "ForeignIngestSessionDetail" })
+
+const ForeignIngestSessionDetailResponse = z
+  .object({
+    projectID: z.string().nullable(),
+    gitRoot: z.string().nullable(),
+    detail: ForeignIngestSessionDetail,
+  })
+  .meta({ ref: "ForeignIngestSessionDetailResponse" })
+
 const IngestRequestBody = z
   .object({
     gitRoot: z.string().optional(),
@@ -133,6 +186,8 @@ const IngestRequestBody = z
       ),
   })
   .meta({ ref: "MemoryIngestRequest" })
+
+const MemoryExtractionFormatSchema = z.record(z.string(), z.unknown())
 
 const IngestResponse = z
   .object({
@@ -174,10 +229,13 @@ const CrawlResponse = z
  * the real provider is not configured — round-3 swaps in the
  * `openAICompatLayer` once the embedding-config plumbing lands.
  */
-const memoryStack = Layer.provideMerge(
-  memoryFacadeLayer,
-  Layer.mergeAll(memoryStorageLayer, memoryRetrievalLayer, mockEmbeddingLayer()),
-)
+const memoryStack = (() => {
+  const retrieval = Layer.provide(memoryRetrievalLayer, memoryStorageLayer)
+  return Layer.provideMerge(
+    memoryFacadeLayer,
+    Layer.mergeAll(memoryStorageLayer, retrieval, autoEmbeddingLayer()),
+  )
+})()
 
 const ingestStack = Layer.provideMerge(memoryStack, foreignIngestCheckpointLayer)
 
@@ -197,7 +255,15 @@ const resolveLlmExtractor = Effect.gen(function* () {
   const cfg = yield* Config.Service.use((svc) => svc.get())
   const spec = cfg.memories?.extractionModel?.trim() || cfg.model?.trim()
   if (!spec) return NO_OP_EXTRACTOR
-  const bridge = yield* makeMemoryBridge({ modelSpec: spec }).pipe(
+  const formatSchema = MemoryExtractionFormatSchema.optional().parse(
+    (cfg.memories as { extractionFormatSchema?: Record<string, unknown> } | undefined)
+      ?.extractionFormatSchema,
+  )
+  const bridge = yield* makeMemoryBridge({
+    modelSpec: spec,
+    formatSchema,
+    schemaName: formatSchema ? "Phase1Extraction" : undefined,
+  }).pipe(
     Effect.catchCause(() => Effect.succeed(undefined as undefined)),
   )
   if (!bridge) return NO_OP_EXTRACTOR
@@ -252,6 +318,63 @@ export const MemoryRoutes = () =>
         const projectID = currentProjectID()
         const status = await statusForProject(projectID)
         return c.json(status)
+      },
+    )
+    .get(
+      "/list",
+      describeRoute({
+        summary: "List memory sextuples for the current project",
+        description:
+          "Return stored memory sextuples for the current project ordered by newest first. This is a read-only introspection surface for debugging and parity checks.",
+        operationId: "memory.list",
+        responses: {
+          200: {
+            description: "Memory sextuple list",
+            content: { "application/json": { schema: resolver(ListResponse) } },
+          },
+        },
+      }),
+      validator(
+        "query",
+        z.object({
+          limit: z.coerce.number().int().positive().max(200).optional(),
+        }),
+      ),
+      async (c) => {
+        const query = c.req.valid("query")
+        const projectID = currentProjectID()
+        const items = await listForProject(projectID, query.limit)
+        return c.json({
+          projectID,
+          items,
+        })
+      },
+    )
+    .get(
+      "/session-detail",
+      describeRoute({
+        summary: "Get foreign-ingest session detail for the current project",
+        description:
+          "Return exact-root foreign-ingest detail for one `(tool, sourceID, gitRoot)` session, including stored sextuple counts scoped to the resolved project/worktree.",
+        operationId: "memory.sessionDetail",
+        responses: {
+          200: {
+            description: "Foreign-ingest session detail",
+            content: { "application/json": { schema: resolver(ForeignIngestSessionDetailResponse) } },
+          },
+        },
+      }),
+      validator("query", ForeignIngestSessionDetailRequest),
+      async (c) => {
+        const query = c.req.valid("query")
+        const projectID = currentProjectID()
+        const body = await sessionDetailForProject({
+          projectID,
+          tool: query.tool,
+          sourceID: query.sourceID,
+          gitRoot: query.gitRoot,
+        })
+        return c.json(body)
       },
     )
     .post(
@@ -442,12 +565,25 @@ export async function statusForProject(projectID: string | null) {
           })
           .from(MemorySextupleTable)
     const [counts] = sxQuery.all()
-    const checkpointRows = db
+    const gitRoot = projectID
+      ? (() => {
+          try {
+            return Instance.worktree
+          } catch {
+            return undefined
+          }
+        })()
+      : undefined
+    const checkpointQuery = db
       .select({
         tool: ForeignIngestDoneTable.tool,
         count: drizzleSql<number>`COUNT(*)`,
       })
       .from(ForeignIngestDoneTable)
+    const checkpointRows = (gitRoot
+      ? checkpointQuery.where(eq(ForeignIngestDoneTable.git_root, gitRoot))
+      : checkpointQuery
+    )
       .groupBy(ForeignIngestDoneTable.tool)
       .all()
 
@@ -456,6 +592,99 @@ export async function statusForProject(projectID: string | null) {
       sextupleCount: Number(counts?.total ?? 0),
       embeddedCount: Number(counts?.embedded ?? 0),
       foreignIngest: checkpointRows.map((r) => ({ tool: String(r.tool), count: Number(r.count) })),
+    }
+  })
+}
+
+export async function listForProject(projectID: string | null, limit?: number) {
+  const program = Effect.gen(function* () {
+    const memory = yield* Memory
+    const rows = yield* memory.listByProject(projectID ?? undefined, limit)
+    return rows.map((row: Awaited<typeof rows>[number]) => ({
+      id: row.id,
+      hashId: row.hashId,
+      projectID: row.projectID ?? null,
+      keywords: row.keywords,
+      problem: row.problem,
+      rootCause: row.rootCause,
+      solution: row.solution,
+      embedded: row.embedding !== undefined,
+      timeCreated: row.timeCreated,
+      timeUpdated: row.timeUpdated,
+    }))
+  }).pipe(Effect.provide(memoryStack))
+
+  return Effect.runPromise(program as Effect.Effect<any, any, never>)
+}
+
+export async function sessionDetailForProject(input: {
+  projectID: string | null
+  tool: string
+  sourceID: string
+  gitRoot?: string
+}) {
+  return Database.use((db) => {
+    const resolvedGitRoot =
+      input.gitRoot ??
+      (input.projectID
+        ? (() => {
+            try {
+              return Instance.worktree
+            } catch {
+              return undefined
+            }
+          })()
+        : undefined)
+
+    const checkpointBase = db
+      .select()
+      .from(ForeignIngestDoneTable)
+      .where(eq(ForeignIngestDoneTable.tool, input.tool))
+      .all()
+      .filter((row) => {
+        if (resolvedGitRoot === undefined) return true
+        return row.git_root === resolvedGitRoot
+      })
+
+    const checkpoint = checkpointBase.find((row) => {
+      const sourcePath = row.source_path
+      const base = path.basename(sourcePath)
+      const stem = base.replace(/\.(jsonl|json|db)$/i, "")
+      return sourcePath === input.sourceID || stem === input.sourceID || sourcePath.endsWith(`:${input.sourceID}`)
+    })
+
+    const sextupleBase = db
+      .select()
+      .from(MemorySextupleTable)
+      .all()
+      .filter((row) => {
+        if (input.projectID !== null && row.project_id !== input.projectID) return false
+        const source = row.source as unknown as Record<string, unknown>
+        if (source.type !== "foreign") return false
+        if (source.tool !== input.tool) return false
+        if (source.source_id !== input.sourceID) return false
+        return true
+      })
+
+    const detailRows = sextupleBase.sort((a, b) => b.time_updated - a.time_updated)
+    const latest = detailRows[0]
+    const sourcePath = checkpoint?.source_path ?? input.sourceID
+    const updatedAt = checkpoint?.done_at ?? latest?.time_updated ?? null
+
+    return {
+      projectID: input.projectID,
+      gitRoot: resolvedGitRoot ?? null,
+      detail: {
+        tool: input.tool,
+        sourceID: input.sourceID,
+        sourcePath,
+        contentHash: checkpoint?.content_hash ?? null,
+        updatedAt,
+        state: checkpoint ? "done" : "pending",
+        storedSextuplesCount: detailRows.length,
+        storedSkillsCount: 0,
+        ingestedAt: checkpoint?.done_at ?? null,
+      },
     }
   })
 }
