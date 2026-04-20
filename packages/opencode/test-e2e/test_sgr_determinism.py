@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 import pytest
@@ -114,6 +115,26 @@ SGR_DETERMINISM_MODEL = {
 # upstream-broken, not provider-drift we want to tolerate.
 LIVE_TURN_TIMEOUT_S = 180.0
 pytestmark = [pytest.mark.live, pytest.mark.timeout(300)]
+
+
+def _run_sgr_with_retry(attempts: int = 3, backoff_s: float = 2.0, **kwargs: Any) -> Any:
+    """Run ``run_sgr_or_skip`` up to ``attempts`` times, swallowing
+    ``pytest.skip`` between attempts. Free-tier tokens make retries
+    cheap; the first shot occasionally trips StructuredOutputError
+    ("Model did not produce structured output") even with a valid
+    prompt + schema. Final attempt re-raises the last skip/fail."""
+    import _pytest.outcomes as _po
+
+    last_exc: Any = None
+    for attempt in range(attempts):
+        try:
+            return run_sgr_or_skip(**kwargs)
+        except _po.OutcomeException as exc:
+            last_exc = exc
+            if attempt == attempts - 1:
+                raise
+            time.sleep(backoff_s)
+    raise last_exc  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +337,8 @@ def test_sgr_arithmetic_schema_is_valid(
         4. ``model_dump_json`` roundtrips without mutation.
     """
     _server, client = sgr_server
-    instance, _msg, _tid = run_sgr_or_skip(
-        client,
+    instance, _msg, _tid = _run_sgr_with_retry(
+        client=client,
         model=sgr_model,
         prompt="Compute the value of 7 plus 5 and return it as the integer "
                "answer field.",
@@ -363,8 +384,8 @@ def test_sgr_arithmetic_is_deterministic_across_runs(
     model creativity, not SGR correctness).
     """
     _server, client = sgr_server
-    instance, _msg, _tid = run_sgr_or_skip(
-        client,
+    instance, _msg, _tid = _run_sgr_with_retry(
+        client=client,
         model=sgr_model,
         prompt=prompt,
         pydantic_model=ArithmeticWithExplanation,
@@ -402,8 +423,8 @@ def test_sgr_classification_enforces_enum(
         4. A full ``model_dump_json`` roundtrip preserves both fields.
     """
     _server, client = sgr_server
-    instance, _msg, _tid = run_sgr_or_skip(
-        client,
+    instance, _msg, _tid = _run_sgr_with_retry(
+        client=client,
         model=sgr_model,
         prompt="Classify this user message as one of the labels 'bug', "
                "'feature', 'question', or 'other'. Return the chosen "
