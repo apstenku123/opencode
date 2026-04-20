@@ -96,6 +96,7 @@ describe("session timer routes", () => {
         const drained = await app.request(`/session/${session.id}/timer/drain?inject=true`, {
           method: "POST",
         })
+        if (drained.status !== 200) console.log("DRAIN_TIMER_STATUS", drained.status, await drained.text())
         expect(drained.status).toBe(200)
         expect(await drained.json()).toMatchObject([{ id: "job" }])
 
@@ -116,6 +117,179 @@ describe("session timer routes", () => {
         expect(await after.json()).toEqual([])
 
         await svc.remove(session.id)
+      },
+    })
+  })
+
+  test("timer drain inject appends a synthetic user message through shared adaptive inject accounting", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await svc.create({})
+        const app = Server.Default().app
+
+        const create = await app.request(`/session/${session.id}/timer`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: "job", delay: 1, repeat: false }),
+        })
+        expect(create.status).toBe(200)
+
+        await new Promise((resolve) => setTimeout(resolve, 5))
+
+        const drained = await app.request(`/session/${session.id}/timer/drain?inject=true`, {
+          method: "POST",
+        })
+        if (drained.status !== 200) console.log("DRAIN_TIMER_ACCOUNTING_STATUS", drained.status, await drained.text())
+        expect(drained.status).toBe(200)
+        expect(await drained.json()).toEqual([{ id: "job", at: expect.any(Number) }])
+
+        const messages = await run(SessionNs.Service.use((svc) => svc.messages({ sessionID: session.id })))
+        const injected = messages.at(-1)
+        expect(injected?.info.role).toBe("user")
+        expect(injected?.parts).toEqual([
+          expect.objectContaining({
+            type: "text",
+            text: "[timer:job] fired",
+            synthetic: true,
+          }),
+        ])
+
+        await svc.remove(session.id)
+      },
+    })
+  })
+
+  test("isolates timers between sessions in the same instance", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const a = await svc.create({})
+        const b = await svc.create({})
+        const app = Server.Default().app
+
+        const created = await app.request(`/session/${a.id}/timer`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: "job", delay: 1, repeat: false }),
+        })
+        expect(created.status).toBe(200)
+
+        const listA = await app.request(`/session/${a.id}/timer`)
+        expect(listA.status).toBe(200)
+        expect(await listA.json()).toEqual([
+          {
+            id: "job",
+            delay: 1,
+            repeat: false,
+            active: true,
+            next: expect.any(Number),
+          },
+        ])
+
+        const listB = await app.request(`/session/${b.id}/timer`)
+        expect(listB.status).toBe(200)
+        expect(await listB.json()).toEqual([])
+
+        const drainedB = await app.request(`/session/${b.id}/timer/drain`, { method: "POST" })
+        expect(drainedB.status).toBe(200)
+        expect(await drainedB.json()).toEqual([])
+
+        const deletedB = await app.request(`/session/${b.id}/timer/job`, { method: "DELETE" })
+        expect(deletedB.status).toBe(200)
+        expect(await deletedB.json()).toBe(false)
+
+        await svc.remove(a.id)
+        await svc.remove(b.id)
+      },
+    })
+  })
+
+  test("cleans session timers on dispose and reopen", async () => {
+    await using tmp = await tmpdir({ git: true })
+
+    const created = await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const session = await svc.create({})
+        const app = Server.Default().app
+        const res = await app.request(`/session/${session.id}/timer`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: "job", delay: 25, repeat: true }),
+        })
+        expect(res.status).toBe(200)
+        return session
+      },
+    })
+
+    await Instance.disposeAll()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const app = Server.Default().app
+        const list = await app.request(`/session/${created.id}/timer`)
+        expect(list.status).toBe(200)
+        expect(await list.json()).toEqual([])
+
+        await svc.remove(created.id)
+      },
+    })
+  })
+
+  test("removing one session clears only its timers and preserves siblings", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const a = await svc.create({})
+        const b = await svc.create({})
+        const app = Server.Default().app
+
+        const createA = await app.request(`/session/${a.id}/timer`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: "job-a", delay: 25, repeat: true }),
+        })
+        expect(createA.status).toBe(200)
+
+        const createB = await app.request(`/session/${b.id}/timer`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: "job-b", delay: 1, repeat: false }),
+        })
+        expect(createB.status).toBe(200)
+
+        const removed = await app.request(`/session/${a.id}`, { method: "DELETE" })
+        expect(removed.status).toBe(200)
+        expect(await removed.json()).toBe(true)
+
+        const listA = await app.request(`/session/${a.id}/timer`)
+        expect(listA.status).toBe(200)
+        expect(await listA.json()).toEqual([])
+
+        await new Promise((resolve) => setTimeout(resolve, 5))
+
+        const drainB = await app.request(`/session/${b.id}/timer/drain`, { method: "POST" })
+        expect(drainB.status).toBe(200)
+        expect(await drainB.json()).toEqual([{ id: "job-b", at: expect.any(Number) }])
+
+        const listB = await app.request(`/session/${b.id}/timer`)
+        expect(listB.status).toBe(200)
+        expect(await listB.json()).toEqual([
+          {
+            id: "job-b",
+            delay: 1,
+            repeat: false,
+            active: false,
+            next: null,
+          },
+        ])
+
+        await svc.remove(b.id)
       },
     })
   })

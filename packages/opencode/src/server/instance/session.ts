@@ -29,9 +29,18 @@ import { NamedError } from "@opencode-ai/shared/util/error"
 import { jsonRequest } from "./trace"
 import { TimerSvc } from "./timer"
 import * as History from "@/history"
+import * as SessionAutobest from "@/session/autobest"
+import { AdaptiveHooks } from "@/session/adaptive"
 import * as ConfigOverlay from "@/session/config-overlay"
+import { Instruction } from "@/session/instruction"
 import { Config } from "../../config"
 import { mergeDeep } from "remeda"
+
+type SessionSkillOverlay = {
+  skills?: {
+    paths?: string[]
+  }
+}
 
 const log = Log.create({ service: "server" })
 
@@ -197,8 +206,8 @@ export const SessionRoutes = lazy(() =>
         }),
       ),
       async (c) => {
-        c.req.valid("param")
-        const items = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.list()).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const param = c.req.valid("param")
+        const items = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.list(param.sessionID)))
         return c.json(items)
       },
     )
@@ -228,9 +237,9 @@ export const SessionRoutes = lazy(() =>
       ),
       validator("json", TimerSvc.CreateInput),
       async (c) => {
-        c.req.valid("param")
+        const param = c.req.valid("param")
         const body = c.req.valid("json")
-        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.create(body)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.create(param.sessionID, body)))
         return c.json(item)
       },
     )
@@ -267,15 +276,28 @@ export const SessionRoutes = lazy(() =>
       async (c) => {
         const param = c.req.valid("param")
         const query = c.req.valid("query")
-        const items = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.drain()).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const items = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.drain(param.sessionID)))
         if (query.inject) {
           for (const item of items) {
             await AppRuntime.runPromise(
-              Session.Service.use((svc) =>
-                svc.appendUserText({
+              AdaptiveHooks.Service.use((adaptive) =>
+                adaptive.appendSyntheticUserText({
                   sessionID: param.sessionID,
-                  time: item.at,
+                  source: `timer:${item.id}`,
                   text: `[timer:${item.id}] fired`,
+                  phase: "external",
+                  append: Effect.promise(() =>
+                    AppRuntime.runPromise(
+                      Session.Service.use((svc) =>
+                        svc.appendUserText({
+                          sessionID: param.sessionID,
+                          time: item.at,
+                          text: `[timer:${item.id}] fired`,
+                          synthetic: true,
+                        }),
+                      ),
+                    ),
+                  ),
                 }),
               ),
             )
@@ -311,7 +333,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const param = c.req.valid("param")
-        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.pause(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.pause(param.sessionID, param.id)))
         return c.json(item ?? null)
       },
     )
@@ -342,7 +364,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const param = c.req.valid("param")
-        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.resume(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const item = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.resume(param.sessionID, param.id)))
         return c.json(item ?? null)
       },
     )
@@ -376,6 +398,16 @@ export const SessionRoutes = lazy(() =>
                         ts: z.number(),
                       }),
                     ),
+                    cycle: z
+                      .object({
+                        iteration: z.number(),
+                        stepKind: z.enum(["a", "b", "c", "d"]),
+                        turnID: z.string().optional(),
+                        whatNextAsked: z.boolean().optional(),
+                        whereIsPlanAsked: z.boolean().optional(),
+                        stagnationCount: z.number().optional(),
+                      })
+                      .optional(),
                     log: z
                       .array(
                         z.object({
@@ -430,6 +462,7 @@ export const SessionRoutes = lazy(() =>
           enabled,
           active: state.active ?? null,
           picks: state.picks,
+          ...(state.cycle ? { cycle: state.cycle } : {}),
           log: log.flatMap((item) =>
             item.log
               ? [
@@ -446,6 +479,7 @@ export const SessionRoutes = lazy(() =>
           result: result
             ? {
                 ts: result.ts,
+                resultingAction: result.resultingAction ?? null,
                 ...(result.selected ? { selected: result.selected } : {}),
                 changed: result.changed,
                 candidates: result.candidates,
@@ -621,17 +655,17 @@ export const SessionRoutes = lazy(() =>
             }),
           ),
         )
+        const result = SessionAutobest.resultEventFromDecision({
+          sessionID,
+          ts: body.ts,
+          decision: out.decision,
+        })
         return c.json({
           active: out.decision.active ?? null,
           changed: out.decision.changed,
           selected: out.decision.selected ?? null,
           candidates: out.decision.candidates,
-          result: {
-            ts: out.decision.active?.ts ?? body.ts ?? Date.now(),
-            selected: out.decision.selected ?? null,
-            changed: out.decision.changed,
-            candidates: out.decision.candidates,
-          },
+          result,
         })
       },
     )
@@ -662,7 +696,7 @@ export const SessionRoutes = lazy(() =>
       ),
       async (c) => {
         const param = c.req.valid("param")
-        const ok = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.delete(param.id)).pipe(Effect.provide(TimerSvc.defaultLayer)))
+        const ok = await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.delete(param.sessionID, param.id)))
         return c.json(ok)
       },
     )
@@ -699,6 +733,166 @@ export const SessionRoutes = lazy(() =>
       },
     )
     .get(
+      "/:sessionID/instruction",
+      describeRoute({
+        summary: "List injected session instructions",
+        description: "Get the current session-scoped instruction snippets injected at runtime for this session only.",
+        operationId: "session.instruction.list",
+        responses: {
+          200: {
+            description: "Injected instructions",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ items: z.array(z.string()) })),
+              },
+            },
+          },
+        },
+      }),
+      validator("param", z.object({ sessionID: SessionID.zod })),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const items = await AppRuntime.runPromise(Instruction.Service.use((svc) => svc.listInjected(sessionID)))
+        return c.json({ items })
+      },
+    )
+    .post(
+      "/:sessionID/instruction",
+      describeRoute({
+        summary: "Inject session instruction",
+        description: "Attach a session-scoped instruction snippet that is injected into this session's system prompt until ejected.",
+        operationId: "session.instruction.inject",
+        responses: {
+          200: {
+            description: "Injected instructions",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ items: z.array(z.string()) })),
+              },
+            },
+          },
+        },
+      }),
+      validator("param", z.object({ sessionID: SessionID.zod })),
+      validator("json", z.object({ text: z.string().min(1) })),
+      async (c) => {
+        const param = c.req.valid("param")
+        const body = c.req.valid("json")
+        const items = await AppRuntime.runPromise(
+          Instruction.Service.use((svc) => svc.inject(param.sessionID, body.text)),
+        )
+        return c.json({ items })
+      },
+    )
+    .delete(
+      "/:sessionID/instruction",
+      describeRoute({
+        summary: "Eject session instruction",
+        description: "Remove a previously injected session-scoped instruction snippet.",
+        operationId: "session.instruction.eject",
+        responses: {
+          200: {
+            description: "Injected instructions",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ items: z.array(z.string()) })),
+              },
+            },
+          },
+        },
+      }),
+      validator("param", z.object({ sessionID: SessionID.zod })),
+      validator("json", z.object({ text: z.string().min(1) })),
+      async (c) => {
+        const param = c.req.valid("param")
+        const body = c.req.valid("json")
+        const items = await AppRuntime.runPromise(
+          Instruction.Service.use((svc) => svc.eject(param.sessionID, body.text)),
+        )
+        return c.json({ items })
+      },
+    )
+    .get(
+      "/:sessionID/skill",
+      describeRoute({
+        summary: "List injected session skill paths",
+        description:
+          "Get the current session-scoped skill path injections that are merged into this session's effective config only.",
+        operationId: "session.skill.list",
+        responses: {
+          200: {
+            description: "Injected skill paths",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ items: z.array(z.string()) })),
+              },
+            },
+          },
+        },
+      }),
+      validator("param", z.object({ sessionID: SessionID.zod })),
+      async (c) => {
+        const sessionID = c.req.valid("param").sessionID
+        const overlay = ConfigOverlay.get(sessionID) as SessionSkillOverlay | undefined
+        return c.json({ items: overlay?.skills?.paths ?? [] })
+      },
+    )
+    .post(
+      "/:sessionID/skill",
+      describeRoute({
+        summary: "Inject session skill paths",
+        description:
+          "Attach session-scoped skill search paths that are merged into this session's effective config until ejected.",
+        operationId: "session.skill.inject",
+        responses: {
+          200: {
+            description: "Injected skill paths",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ items: z.array(z.string()) })),
+              },
+            },
+          },
+        },
+      }),
+      validator("param", z.object({ sessionID: SessionID.zod })),
+      validator("json", z.object({ paths: z.array(z.string().min(1)).min(1) })),
+      async (c) => {
+        const param = c.req.valid("param")
+        const body = c.req.valid("json")
+        const overlay = ConfigOverlay.appendSessionSkillPaths(param.sessionID, body.paths) as SessionSkillOverlay
+        return c.json({ items: overlay.skills?.paths ?? [] })
+      },
+    )
+    .delete(
+      "/:sessionID/skill",
+      describeRoute({
+        summary: "Eject session skill paths",
+        description: "Remove previously injected session-scoped skill search paths.",
+        operationId: "session.skill.eject",
+        responses: {
+          200: {
+            description: "Injected skill paths",
+            content: {
+              "application/json": {
+                schema: resolver(z.object({ items: z.array(z.string()) })),
+              },
+            },
+          },
+        },
+      }),
+      validator("param", z.object({ sessionID: SessionID.zod })),
+      validator("json", z.object({ paths: z.array(z.string().min(1)).min(1) })),
+      async (c) => {
+        const param = c.req.valid("param")
+        const body = c.req.valid("json")
+        const overlay = ConfigOverlay.removeSessionSkillPaths(param.sessionID, body.paths) as
+          | SessionSkillOverlay
+          | undefined
+        return c.json({ items: overlay?.skills?.paths ?? [] })
+      },
+    )
+    .get(
       "/:sessionID/config",
       describeRoute({
         summary: "Get session config",
@@ -727,10 +921,15 @@ export const SessionRoutes = lazy(() =>
         const sessionID = c.req.valid("param").sessionID
         const cfg = await AppRuntime.runPromise(Config.Service.use((svc) => svc.get()))
         const overlay = ConfigOverlay.get(sessionID)
+        const injectedInstructions = await AppRuntime.runPromise(
+          Instruction.Service.use((svc) => svc.listInjected(sessionID)),
+        )
         const merged = overlay
           ? (mergeDeep(cfg as unknown as Record<string, unknown>, overlay) as unknown as typeof cfg)
           : cfg
-        return c.json(merged)
+        if (injectedInstructions.length === 0) return c.json(merged)
+        const instructions = [...(merged.instructions ?? []), ...injectedInstructions]
+        return c.json({ ...merged, instructions })
       },
     )
     .post(
@@ -810,6 +1009,7 @@ export const SessionRoutes = lazy(() =>
       async (c) => {
         const sessionID = c.req.valid("param").sessionID
         await AppRuntime.runPromise(Session.Service.use((svc) => svc.remove(sessionID)))
+        await AppRuntime.runPromise(TimerSvc.Service.use((svc) => svc.clear(sessionID)))
         ConfigOverlay.clear(sessionID)
         return c.json(true)
       },

@@ -70,6 +70,12 @@ import { InstanceState } from "@/effect"
 import { Effect, Layer, Context } from "effect"
 
 export namespace AdaptiveState {
+  export interface MaterializationEvent {
+    readonly phase: "postIteration" | "preBreak" | "external"
+    readonly source: string
+    readonly text: string
+  }
+
   /**
    * Per-session mutable accumulator shared across all observers and the
    * adaptive hook runner. Field semantics mirror the codex_git `Session`
@@ -96,6 +102,10 @@ export namespace AdaptiveState {
      * cluttering the strongly-typed fields above.
      */
     scratch: Record<string, unknown>
+    /** FIFO of synthetic-turn injections accepted by the shared owner. */
+    pendingInjects: Array<{ text: string; source: string; parentMessageID?: MessageID }>
+    /** Recent diagnostic trace of arbitration/materialization decisions. */
+    trace: Array<MaterializationEvent>
   }
 
   export const empty = (): Value => ({
@@ -106,6 +116,8 @@ export namespace AdaptiveState {
     whereIsPlanAsks: 0,
     whatNextAsks: 0,
     scratch: {},
+    pendingInjects: [],
+    trace: [],
   })
 
   /**
@@ -201,6 +213,27 @@ export namespace AdaptiveHooks {
      * this from `state.scratch.injectCount` for diagnostics / loop guards.
      */
     readonly noteInject: (sessionID: SessionID, source: string) => Effect.Effect<void>
+    /**
+     * Single append/accounting path for synthetic user-turn injections.
+     * Loop-boundary injectors should use this instead of calling
+     * `Session.appendUserText(...)` directly so source accounting stays
+     * coherent across adaptive and non-adaptive producers.
+     */
+    readonly appendSyntheticUserText: (args: {
+      sessionID: SessionID
+      source: string
+      text: string
+      phase?: "postIteration" | "preBreak" | "external"
+      append: Effect.Effect<void, never, never>
+    }) => Effect.Effect<void>
+    /** Snapshot the accepted injection queue for diagnostics/tests. */
+    readonly pendingInjectsFor: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<Inject>>
+    /** Drain accepted injections after they have been materialized into messages. */
+    readonly clearPendingInjectsFor: (sessionID: SessionID) => Effect.Effect<void>
+    /** Snapshot recent arbitration/materialization trace. */
+    readonly traceFor: (sessionID: SessionID) => Effect.Effect<ReadonlyArray<AdaptiveState.MaterializationEvent>>
+    /** Clear diagnostic trace for a session. */
+    readonly clearTraceFor: (sessionID: SessionID) => Effect.Effect<void>
     /** Run all registered `preIteration` observers in registration order. */
     readonly runPreIteration: (args: PreIterationArgs) => Effect.Effect<void>
     /** Run all registered `postIteration` observers and merge directives. */
@@ -283,6 +316,35 @@ export namespace AdaptiveHooks {
           bag.scratch.lastInjectSource = source
         })
 
+      const appendSyntheticUserText: Interface["appendSyntheticUserText"] = (args) =>
+        Effect.gen(function* () {
+          const bag = yield* stateFor(args.sessionID)
+          bag.pendingInjects.push({ text: args.text, source: args.source })
+          bag.trace.push({
+            phase: args.phase ?? "external",
+            source: args.source,
+            text: args.text,
+          })
+          if (args.append) yield* args.append
+          yield* noteInject(args.sessionID, args.source)
+        })
+
+      const pendingInjectsFor: Interface["pendingInjectsFor"] = (sessionID) =>
+        Effect.map(stateFor(sessionID), (bag) => [...bag.pendingInjects])
+
+      const clearPendingInjectsFor: Interface["clearPendingInjectsFor"] = (sessionID) =>
+        Effect.map(stateFor(sessionID), (bag) => {
+          bag.pendingInjects.length = 0
+        })
+
+      const traceFor: Interface["traceFor"] = (sessionID) =>
+        Effect.map(stateFor(sessionID), (bag) => [...bag.trace])
+
+      const clearTraceFor: Interface["clearTraceFor"] = (sessionID) =>
+        Effect.map(stateFor(sessionID), (bag) => {
+          bag.trace.length = 0
+        })
+
       const runPreIteration: Interface["runPreIteration"] = (args) =>
         Effect.gen(function* () {
           const bag = yield* stateFor(args.sessionID)
@@ -323,6 +385,11 @@ export namespace AdaptiveHooks {
         clear,
         resetCycleFor,
         noteInject,
+        appendSyntheticUserText,
+        pendingInjectsFor,
+        clearPendingInjectsFor,
+        traceFor,
+        clearTraceFor,
         runPreIteration,
         runPostIteration,
         runPreBreak,

@@ -1,6 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
+import { jsonSchema, type Tool } from "ai"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
 import { Agent as AgentSvc } from "../../src/agent/agent"
@@ -37,6 +38,7 @@ import { SessionStatus } from "../../src/session/status"
 import { Skill } from "../../src/skill"
 import { SkillEvolution } from "../../src/skill/evolution"
 import { SystemPrompt } from "../../src/session/system"
+import * as History from "../../src/history"
 import { Shell } from "../../src/shell/shell"
 import { Snapshot } from "../../src/snapshot"
 import { ToolRegistry } from "../../src/tool"
@@ -133,6 +135,31 @@ const mcp = Layer.succeed(
   }),
 )
 
+function makeMcpLayer(tools: Record<string, Tool>) {
+  return Layer.succeed(
+    MCP.Service,
+    MCP.Service.of({
+      status: () => Effect.succeed({}),
+      clients: () => Effect.succeed({}),
+      tools: () => Effect.succeed(tools),
+      prompts: () => Effect.succeed({}),
+      resources: () => Effect.succeed({}),
+      add: () => Effect.succeed({ status: { status: "disabled" as const } }),
+      connect: () => Effect.void,
+      disconnect: () => Effect.void,
+      getPrompt: () => Effect.succeed(undefined),
+      readResource: () => Effect.succeed(undefined),
+      startAuth: () => Effect.die("unexpected MCP auth in prompt-effect tests"),
+      authenticate: () => Effect.die("unexpected MCP auth in prompt-effect tests"),
+      finishAuth: () => Effect.die("unexpected MCP auth in prompt-effect tests"),
+      removeAuth: () => Effect.void,
+      supportsOAuth: () => Effect.succeed(false),
+      hasStoredTokens: () => Effect.succeed(false),
+      getAuthStatus: () => Effect.succeed("not_authenticated" as const),
+    }),
+  )
+}
+
 const lsp = Layer.succeed(
   LSP.Service,
   LSP.Service.of({
@@ -226,7 +253,65 @@ function makeHttp() {
   ).pipe(Layer.provide(summary))
 }
 
+function makeHttpWithMcp(tools: Record<string, Tool>) {
+  const deps = Layer.mergeAll(
+    Session.defaultLayer,
+    Snapshot.defaultLayer,
+    LLM.defaultLayer,
+    Env.defaultLayer,
+    AgentSvc.defaultLayer,
+    Command.defaultLayer,
+    Permission.defaultLayer,
+    Plugin.defaultLayer,
+    Skill.defaultLayer,
+    SkillEvolution.defaultLayer,
+    Config.defaultLayer,
+    ProviderSvc.defaultLayer,
+    filetime,
+    lsp,
+    makeMcpLayer(tools),
+    AppFileSystem.defaultLayer,
+    status,
+    Hook.defaultLayer,
+  ).pipe(Layer.provideMerge(infra))
+  const question = Question.layer.pipe(Layer.provideMerge(deps))
+  const todo = Todo.layer.pipe(Layer.provideMerge(deps))
+  const registry = ToolRegistry.layer.pipe(
+    Layer.provide(Skill.defaultLayer),
+    Layer.provide(SkillEvolution.defaultLayer),
+    Layer.provide(FetchHttpClient.layer),
+    Layer.provide(CrossSpawnSpawner.defaultLayer),
+    Layer.provide(Ripgrep.defaultLayer),
+    Layer.provide(Format.defaultLayer),
+    Layer.provideMerge(SubagentRegistry.defaultLayer),
+    Layer.provideMerge(todo),
+    Layer.provideMerge(question),
+    Layer.provideMerge(deps),
+  )
+  const trunc = Truncate.layer.pipe(Layer.provideMerge(deps))
+  const proc = SessionProcessor.layer.pipe(Layer.provide(summary), Layer.provideMerge(deps))
+  const compact = SessionCompaction.layer.pipe(Layer.provideMerge(proc), Layer.provideMerge(deps))
+  return Layer.mergeAll(
+    TestLLMServer.layer,
+    SessionPrompt.layer.pipe(
+      Layer.provide(SessionRevert.defaultLayer),
+      Layer.provide(summary),
+      Layer.provideMerge(AdaptiveHooks.defaultLayer),
+      Layer.provide(SessionMemoryObserver.defaultLayer),
+      Layer.provideMerge(run),
+      Layer.provideMerge(compact),
+      Layer.provideMerge(proc),
+      Layer.provideMerge(registry),
+      Layer.provideMerge(trunc),
+      Layer.provide(Instruction.defaultLayer),
+      Layer.provide(SystemPrompt.defaultLayer),
+      Layer.provideMerge(deps),
+    ),
+  ).pipe(Layer.provide(summary))
+}
+
 const it = testEffect(makeHttp())
+const itWithMcp = (tools: Record<string, Tool>) => testEffect(makeHttpWithMcp(tools))
 const unix = process.platform !== "win32" ? it.live : it.live.skip
 
 // Config that registers a custom "test" provider with a "test-model" model
@@ -736,7 +821,151 @@ it.live(
         expect(result).toMatchObject({
           type: "autobest.result",
           sessionID: chat.id,
+          resultingAction: "tighten failing repro",
           changed: true,
+        })
+      }),
+      { git: true, config: providerCfg },
+    ),
+  10_000,
+)
+
+it.live(
+  "autobest observer respects session configOverlay maxIterations",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+
+        yield* llm.text(`- first follow-up
+- second follow-up`)
+        yield* llm.text(`- first follow-up
+- second follow-up`)
+
+        const chat = yield* sessions.create({
+          configOverlay: {
+            autobest: {
+              maxIterations: 1,
+            },
+          },
+        })
+        yield* sessions.setAutobestEnabled({ sessionID: chat.id, enabled: true, ts: 1 })
+        yield* user(chat.id, "hi")
+
+        yield* prompt.loop({ sessionID: chat.id })
+
+        const msgs = yield* sessions.messages({ sessionID: chat.id })
+        const syntheticUsers = msgs.filter(
+          (m) =>
+            m.info.role === "user" &&
+            m.parts.some((p) => p.type === "text" && p.synthetic === true),
+        )
+        expect(syntheticUsers).toHaveLength(1)
+
+        const state = yield* sessions.getAutobest(chat.id)
+        expect(state.cycle).toEqual({
+          iteration: 2,
+          stepKind: "d",
+          turnID: undefined,
+          whatNextAsked: undefined,
+          whereIsPlanAsked: undefined,
+          stagnationCount: undefined,
+        })
+      }),
+      { git: true, config: providerCfg },
+    ),
+  10_000,
+)
+
+itWithMcp({
+  "mcp__perplexity__perplexity_ask": {
+    inputSchema: jsonSchema({
+      type: "object",
+      additionalProperties: false,
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    }),
+    execute: () => Promise.resolve({ ok: true }),
+  },
+}).live(
+  "autobest grounding uses MCP wiring once and persists cooldown-aware history across two turns",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const mcpSvc = yield* MCP.Service
+        const dispatched: string[] = []
+
+        const tools = yield* mcpSvc.tools()
+        tools["mcp__perplexity__perplexity_ask"] = {
+          inputSchema: jsonSchema({
+            type: "object",
+            additionalProperties: false,
+            properties: { query: { type: "string" } },
+            required: ["query"],
+          }),
+          execute: (args) => {
+            dispatched.push(String((args as { query?: string }).query ?? ""))
+            return Promise.resolve({ ok: true })
+          },
+        }
+
+        yield* llm.text("I need more context before I can answer.")
+        yield* llm.text("Still need more context before I can answer.")
+
+        const chat = yield* sessions.create({
+          configOverlay: {
+            autobest: {
+              maxIterations: 2,
+            },
+          },
+        })
+        yield* sessions.setAutobestEnabled({ sessionID: chat.id, enabled: true, ts: 1 })
+        yield* user(chat.id, "hi")
+
+        yield* prompt.loop({ sessionID: chat.id })
+
+        expect(dispatched).toHaveLength(1)
+        expect(dispatched[0]).toContain("empty_extract")
+        expect(dispatched[0]).toContain("I need more context")
+
+        const groundingEvents = (yield* Effect.promise(() => History.read(chat.id))).filter(
+          (event) => event.type === "autobest.grounding",
+        )
+        expect(groundingEvents).toHaveLength(2)
+        expect(groundingEvents[0]).toMatchObject({
+          type: "autobest.grounding",
+          outcome: "dispatched",
+          turn: 0,
+          toolsUsed: ["mcp__perplexity__perplexity_ask"],
+        })
+        expect(groundingEvents[1]).toMatchObject({
+          type: "autobest.grounding",
+          outcome: "skipped",
+          turn: 1,
+          reason: expect.stringContaining("cooldown"),
+        })
+
+        const syntheticUsers = (yield* sessions.messages({ sessionID: chat.id })).filter(
+          (message) =>
+            message.info.role === "user" &&
+            message.parts.some((part) => part.type === "text" && part.synthetic === true),
+        )
+        expect(syntheticUsers).toHaveLength(1)
+        expect(
+          syntheticUsers[0]?.parts.find((part): part is MessageV2.TextPart => part.type === "text")?.text,
+        ).toBe("And what's next?")
+
+        const state = yield* sessions.getAutobest(chat.id)
+        expect(state.cycle).toEqual({
+          iteration: 2,
+          stepKind: "d",
+          turnID: undefined,
+          whatNextAsked: true,
+          whereIsPlanAsked: undefined,
+          stagnationCount: undefined,
         })
       }),
       { git: true, config: providerCfg },
@@ -1743,6 +1972,246 @@ it.live(
         )
         expect(summaryInjected).toBeDefined()
         off()
+      }),
+      { git: true, config: providerCfg },
+    ),
+  30_000,
+)
+
+it.live(
+  "runLoop records deterministic injector ordering when postIteration and preBreak injectors both fire",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const hooks = yield* AdaptiveHooks.Service
+        const chat = yield* sessions.create({
+          title: "Competing injectors",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        let postInjected = false
+        let preInjected = false
+        const offPost = yield* hooks.register({
+          name: "test:competing:post",
+          postIteration: () =>
+            Effect.sync(() => {
+              if (postInjected) return AdaptiveHooks.Continue
+              postInjected = true
+              return AdaptiveHooks.Inject({
+                text: "postIteration follow-up",
+                source: "test:competing:post",
+              })
+            }),
+        })
+        const offPre = yield* hooks.register({
+          name: "test:competing:pre",
+          preBreak: () =>
+            Effect.sync(() => {
+              if (preInjected) return AdaptiveHooks.Continue
+              preInjected = true
+              return AdaptiveHooks.Inject({
+                text: "preBreak follow-up",
+                source: "test:competing:pre",
+              })
+            }),
+        })
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "start" }],
+        })
+        yield* llm.text("assistant first")
+        yield* llm.text("assistant second")
+
+        const result = yield* prompt.loop({ sessionID: chat.id })
+        expect(result.info.role).toBe("assistant")
+        expect(yield* llm.hits).toHaveLength(3)
+
+        const msgs = yield* sessions.messages({ sessionID: chat.id })
+        const syntheticUsers = msgs.filter(
+          (m) => m.info.role === "user" && m.parts.some((p) => p.type === "text" && p.synthetic === true),
+        )
+        expect(syntheticUsers).toHaveLength(2)
+        const injectedTexts = syntheticUsers
+          .flatMap((m) => m.parts)
+          .filter((p): p is MessageV2.TextPart => p.type === "text" && p.synthetic === true)
+          .map((p) => p.text)
+        expect(injectedTexts.sort()).toEqual(["postIteration follow-up", "preBreak follow-up"])
+
+        const bag = yield* hooks.stateFor(chat.id)
+        expect(bag.scratch.injectCount).toBe(2)
+        expect(bag.scratch.lastInjectSource).toBe("test:competing:pre")
+
+        offPre()
+        offPost()
+      }),
+      { git: true, config: providerCfg },
+    ),
+  30_000,
+)
+
+it.live(
+  "runLoop exposes diagnostic preBreak materialization trace for competing producers",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const hooks = yield* AdaptiveHooks.Service
+        const chat = yield* sessions.create({
+          title: "Trace coexistence",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        let postInjected = false
+        let preInjected = false
+        const offPost = yield* hooks.register({
+          name: "test:trace:post",
+          postIteration: () =>
+            Effect.sync(() => {
+              if (postInjected) return AdaptiveHooks.Continue
+              postInjected = true
+              return AdaptiveHooks.Inject({
+                text: "post trace follow-up",
+                source: "test:trace:post",
+              })
+            }),
+        })
+        const offPre = yield* hooks.register({
+          name: "test:trace:pre",
+          preBreak: () =>
+            Effect.sync(() => {
+              if (preInjected) return AdaptiveHooks.Continue
+              preInjected = true
+              return AdaptiveHooks.Inject({
+                text: "pre trace follow-up",
+                source: "test:trace:pre",
+              })
+            }),
+        })
+
+        yield* hooks.appendSyntheticUserText({
+          sessionID: chat.id,
+          source: "timer:trace",
+          text: "[timer:trace] fired",
+          phase: "external",
+          append: Effect.void,
+        })
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "start" }],
+        })
+        yield* llm.text("assistant first")
+        yield* llm.text("assistant second")
+
+        const result = yield* prompt.loop({ sessionID: chat.id })
+        expect(result.info.role).toBe("assistant")
+
+        const trace = yield* hooks.traceFor(chat.id)
+        expect(trace.map((entry) => `${entry.phase}:${entry.source}`)).toEqual([
+          "external:timer:trace",
+          "postIteration:test:trace:post",
+          "preBreak:test:trace:pre",
+        ])
+
+        offPre()
+        offPost()
+      }),
+      { git: true, config: providerCfg },
+    ),
+  30_000,
+)
+
+it.live(
+  "runLoop boundedly materializes multi-producer trace through external, postIteration, and preBreak sources",
+  () =>
+    provideTmpdirServer(
+      Effect.fnUntraced(function* ({ llm }) {
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const hooks = yield* AdaptiveHooks.Service
+        const chat = yield* sessions.create({
+          title: "Bounded trace scenario",
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        })
+
+        let postInjected = false
+        let preInjected = false
+        const offPost = yield* hooks.register({
+          name: "test:bounded:post",
+          postIteration: () =>
+            Effect.sync(() => {
+              if (postInjected) return AdaptiveHooks.Continue
+              postInjected = true
+              return AdaptiveHooks.Inject({
+                text: "post bounded follow-up",
+                source: "test:bounded:post",
+              })
+            }),
+        })
+        const offPre = yield* hooks.register({
+          name: "test:bounded:pre",
+          preBreak: () =>
+            Effect.sync(() => {
+              if (preInjected) return AdaptiveHooks.Continue
+              preInjected = true
+              return AdaptiveHooks.Inject({
+                text: "pre bounded follow-up",
+                source: "test:bounded:pre",
+              })
+            }),
+        })
+
+        yield* hooks.clearTraceFor(chat.id)
+        yield* hooks.appendSyntheticUserText({
+          sessionID: chat.id,
+          source: "timer:bounded",
+          text: "[timer:bounded] fired",
+          phase: "external",
+          append: Effect.void,
+        })
+
+        yield* prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: "start" }],
+        })
+        yield* llm.text("assistant first")
+        yield* llm.text("assistant second")
+
+        const loopPromise = Effect.runPromise(prompt.loop({ sessionID: chat.id }))
+        const trace = yield* Effect.promise(async () => {
+          const deadline = Date.now() + 5000
+          while (Date.now() < deadline) {
+            const entries = await Effect.runPromise(hooks.traceFor(chat.id))
+            if (
+              entries.map((entry) => `${entry.phase}:${entry.source}`).join("|") ===
+              "external:timer:bounded|postIteration:test:bounded:post|preBreak:test:bounded:pre"
+            ) {
+              return entries
+            }
+            await new Promise((resolve) => setTimeout(resolve, 50))
+          }
+          throw new Error("timed out waiting for bounded multi-producer trace")
+        })
+
+        expect(trace.map((entry) => `${entry.phase}:${entry.source}`)).toEqual([
+          "external:timer:bounded",
+          "postIteration:test:bounded:post",
+          "preBreak:test:bounded:pre",
+        ])
+
+        void loopPromise.catch(() => undefined)
+        offPre()
+        offPost()
       }),
       { git: true, config: providerCfg },
     ),

@@ -66,6 +66,22 @@ import { SkillEvolution } from "@/skill/evolution"
 import { maybeAutoExtractSkill } from "@/skill/hook"
 import { Rollout } from "@/rollout"
 
+function hookSessionContext(parentID: SessionID | undefined, agentName: string) {
+  if (!parentID) return { agentLevel: 0, sessionContext: { source: "cli" as const } }
+  return {
+    agentLevel: 1,
+    sessionContext: {
+      source: "sub_agent" as const,
+      subagent: {
+        source: "thread_spawn" as const,
+        parent_session_id: parentID,
+        depth: 1,
+        agent_role: agentName,
+      },
+    },
+  }
+}
+
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
 
@@ -638,13 +654,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const tools: Record<string, AITool> = {}
         const run = yield* runner()
         const promptOps = yield* ops()
+        const hookContext = hookSessionContext(input.session.parentID, input.agent.name)
 
         const context = (args: any, options: ToolExecutionOptions): Tool.Context => ({
           sessionID: input.session.id,
           abort: options.abortSignal!,
           messageID: input.processor.message.id,
           callID: options.toolCallId,
-          extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps },
+          extra: {
+            model: input.model,
+            bypassAgentCheck: input.bypassAgentCheck,
+            promptOps,
+            agentLevel: hookContext.agentLevel,
+          },
           agent: input.agent.name,
           messages: input.messages,
           metadata: (val) =>
@@ -668,6 +690,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 sessionID: input.session.id,
                 tool: { messageID: input.processor.message.id, callID: options.toolCallId },
                 ruleset: Permission.merge(input.agent.permission, input.session.permission ?? []),
+                metadata: {
+                  ...req.metadata,
+                  __execPolicyInvocation:
+                    typeof args?.command === "string"
+                      ? { tool: req.permission, command: args.command, cwd: input.session.directory }
+                      : typeof args?.filePath === "string"
+                        ? { tool: req.permission, path: args.filePath, cwd: input.session.directory }
+                        : typeof args?.path === "string"
+                          ? { tool: req.permission, path: args.path, cwd: input.session.directory }
+                          : { tool: req.permission, cwd: input.session.directory },
+                },
               })
               .pipe(Effect.orDie),
         })
@@ -1655,21 +1688,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         },
       )
 
-      const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
-        const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user")
-        if (Option.isSome(match)) return match.value
-        const msgs = yield* sessions.messages({ sessionID, limit: 1 })
-        if (msgs.length > 0) return msgs[0]
-        throw new Error("Impossible")
-      })
+      const lastAssistant = (sessionID: SessionID): Effect.Effect<MessageV2.WithParts> =>
+        Effect.gen(function* () {
+          const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user")
+          if (Option.isSome(match)) return match.value
+          const msgs = yield* sessions.messages({ sessionID, limit: 1 })
+          if (msgs.length > 0) return msgs[0]
+          throw new Error("Impossible")
+        })
 
-      const runLoop: (sessionID: SessionID) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
-        function* (sessionID: SessionID) {
+      const runLoop = Effect.fn("SessionPrompt.run")(function* (sessionID: SessionID) {
           const ctx = yield* InstanceState.context
           const slog = elog.with({ sessionID })
           let structured: unknown | undefined
           let step = 0
           const session = yield* sessions.get(sessionID)
+          const lastAssistantMessage = yield* lastAssistant(sessionID)
 
           // Lazy-register the memory turn observer inside the Instance
           // scope of this runLoop — safe across repeated calls because
@@ -1689,6 +1723,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // `Effect.serviceOption`), so we don't need to provide it here.
           yield* SessionAutobestObserver.ensureRegistered().pipe(
             Effect.provideService(AdaptiveHooks.Service, adaptive),
+            Effect.provideService(Config.Service, config),
+            Effect.provideService(MCP.Service, mcp),
             Effect.provideService(Session.Service, sessions),
             Effect.catchCause(() => Effect.void),
           )
@@ -1708,6 +1744,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               event: { hook_event_name: "TurnStart", turn_id: turnId },
               sessionID,
               cwd: ctx.directory,
+              ...hookSessionContext(session.parentID, lastAssistantMessage.info.agent),
             })
             .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
           if (turnStart && turnStart.outcome === "abort") {
@@ -1763,20 +1800,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               // continuation) or `break`/`continue` to mutate the turn.
               const pre = yield* adaptive.runPreBreak({ sessionID, step })
               if (pre.kind === "inject") {
-                yield* sessions.appendUserText({
+                yield* adaptive.appendSyntheticUserText({
                   sessionID,
+                  append: sessions.appendUserText({
+                    sessionID,
+                    text: pre.message.text,
+                    synthetic: true,
+                    // Carry forward the current turn's agent/model so the
+                    // next iteration's provider lookup resolves against a
+                    // real provider (not the "manual"/"manual" stub).
+                    agent: lastUser.agent,
+                    model: {
+                      providerID: lastUser.model.providerID,
+                      modelID: lastUser.model.modelID,
+                    },
+                  }),
+                  source: pre.message.source,
                   text: pre.message.text,
-                  synthetic: true,
-                  // Carry forward the current turn's agent/model so the
-                  // next iteration's provider lookup resolves against a
-                  // real provider (not the "manual"/"manual" stub).
-                  agent: lastUser.agent,
-                  model: {
-                    providerID: lastUser.model.providerID,
-                    modelID: lastUser.model.modelID,
-                  },
+                  phase: "preBreak",
                 })
-                yield* adaptive.noteInject(sessionID, pre.message.source)
                 yield* slog.info("preBreak.inject", {
                   source: pre.message.source,
                   length: pre.message.text.length,
@@ -2342,17 +2384,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             })
             if (post.kind === "break") break
             if (post.kind === "inject") {
-              yield* sessions.appendUserText({
+              yield* adaptive.appendSyntheticUserText({
                 sessionID,
+                append: sessions.appendUserText({
+                  sessionID,
+                  text: post.message.text,
+                  synthetic: true,
+                  agent: lastUser.agent,
+                  model: {
+                    providerID: lastUser.model.providerID,
+                    modelID: lastUser.model.modelID,
+                  },
+                }),
+                source: post.message.source,
                 text: post.message.text,
-                synthetic: true,
-                agent: lastUser.agent,
-                model: {
-                  providerID: lastUser.model.providerID,
-                  modelID: lastUser.model.modelID,
-                },
+                phase: "postIteration",
               })
-              yield* adaptive.noteInject(sessionID, post.message.source)
               yield* slog.info("postIteration.inject", {
                 source: post.message.source,
                 length: post.message.text.length,
@@ -2391,8 +2438,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // call at the top of `runLoop`). The inline duplicate block
           // was removed during round-4 consolidation.
           return out
-        },
-      )
+        })
 
       const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
         "SessionPrompt.loop",

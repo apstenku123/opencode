@@ -246,4 +246,88 @@ describe("AdaptiveHooks", () => {
       }),
     )
   })
+
+  test("appendSyntheticUserText shares the append path and inject accounting contract", async () => {
+    await run(
+      Effect.gen(function* () {
+        const hooks = yield* AdaptiveHooks.Service
+        const seen = yield* Ref.make<string[]>([])
+        const sessionID = sid("session_append_shared")
+        yield* hooks.appendSyntheticUserText({
+          sessionID,
+          source: "timer:job",
+          text: "timer fired",
+          append: Ref.update(seen, (items) => [...items, "appended"]),
+        })
+        const bag = yield* hooks.stateFor(sessionID)
+        const pending = yield* hooks.pendingInjectsFor(sessionID)
+        expect(yield* Ref.get(seen)).toEqual(["appended"])
+        expect(bag.scratch.injectCount).toBe(1)
+        expect(bag.scratch.lastInjectSource).toBe("timer:job")
+        expect(pending).toEqual([{ text: "timer fired", source: "timer:job" }])
+      }),
+    )
+  })
+
+  test("appendSyntheticUserText queues accepted injects in FIFO order and clearPendingInjectsFor drains them", async () => {
+    await run(
+      Effect.gen(function* () {
+        const hooks = yield* AdaptiveHooks.Service
+        const sessionID = sid("session_append_fifo")
+        yield* hooks.appendSyntheticUserText({
+          sessionID,
+          source: "test:first",
+          text: "first",
+          append: Effect.void,
+        })
+        yield* hooks.appendSyntheticUserText({
+          sessionID,
+          source: "test:second",
+          text: "second",
+          append: Effect.void,
+        })
+        expect(yield* hooks.pendingInjectsFor(sessionID)).toEqual([
+          { text: "first", source: "test:first" },
+          { text: "second", source: "test:second" },
+        ])
+        yield* hooks.clearPendingInjectsFor(sessionID)
+        expect(yield* hooks.pendingInjectsFor(sessionID)).toEqual([])
+      }),
+    )
+  })
+
+  test("queue bookkeeping preserves coexistence order for timer, subagent auto-wait, and stop-hook sources", async () => {
+    await run(
+      Effect.gen(function* () {
+        const hooks = yield* AdaptiveHooks.Service
+        const sessionID = sid("session_boundary_queue")
+        yield* hooks.appendSyntheticUserText({
+          sessionID,
+          source: "timer:coexist",
+          text: "[timer:coexist] fired",
+          append: Effect.void,
+        })
+        yield* hooks.appendSyntheticUserText({
+          sessionID,
+          source: "subagent:auto-wait",
+          text: "[Sub-agent results] All 1 sub-agent(s) have finished:\n- child [ok]: child result",
+          append: Effect.void,
+        })
+        yield* hooks.appendSyntheticUserText({
+          sessionID,
+          source: "stop-hooks",
+          text: '<stop-hook name="alpha">\nstop output\n</stop-hook>',
+          append: Effect.void,
+        })
+        expect(yield* hooks.pendingInjectsFor(sessionID)).toEqual([
+          { text: "[timer:coexist] fired", source: "timer:coexist" },
+          {
+            text: "[Sub-agent results] All 1 sub-agent(s) have finished:\n- child [ok]: child result",
+            source: "subagent:auto-wait",
+          },
+          { text: '<stop-hook name="alpha">\nstop output\n</stop-hook>', source: "stop-hooks" },
+        ])
+      }),
+    )
+  })
 })
