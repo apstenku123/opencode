@@ -827,20 +827,21 @@ def test_task_close_cancels_child_sgr(
 
     # Fresh thread for the close dispatch to avoid task-schema context
     # leakage (the model would otherwise reuse the task plan it already
-    # produced on the spawn turn). Retries multiplied by poll_timeout have
-    # to fit inside the pytest @mark.timeout(600); 2 attempts × 180s =
-    # 360s leaves ~4 min of headroom for the earlier `_spawn_child_via_sgr`
-    # call above. Server-side retry-race already gives us 3× parallel
-    # attempts at the HTTP layer, so the per-test retry budget only needs
-    # to cover session-state flakes, not upstream model stalls.
+    # produced on the spawn turn). The spawn turn already consumed 2× the
+    # retry-race cycle (~300s), so this close turn gets the remaining
+    # budget: attempts=4 × short 60s poll_timeout means we fire 4 fresh
+    # turns (each with its own retry-race cycle) before giving up, and
+    # we stay inside @pytest.mark.timeout(600). A single model decline
+    # ("no structured output") on the first turn is no longer enough to
+    # skip the test.
     _run_sgr_with_retry(
-        attempts=2,
+        attempts=4,
         client=subagent_sgr_client,
         model=subagent_sgr_model,
         prompt=f"Plan a task_close call: session_id='{child_id}'.",
         pydantic_model=_ClosePlan,
         schema_overrides=close_schema,
-        poll_timeout_s=180.0,
+        poll_timeout_s=60.0,
     )
     child = subagent_sgr_client.get_session(child_id)
     assert child["id"] == child_id
