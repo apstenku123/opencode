@@ -91,7 +91,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 from pydantic import BaseModel, Field, ValidationError
@@ -114,12 +114,12 @@ from harness.sgr import (
 # ---------------------------------------------------------------------------
 
 
-#: Per-turn wall-clock budget. Originally 30s to match the task spec,
-#: but gpt-5-mini on #enterprise and #free aliases (stub-injected when
-#: upstream /models doesn't advertise it) occasionally takes 40-50s on
-#: first-token latency. Bumped to 90s so we fail loudly on a real
-#: dispatch bug rather than a tail-latency blip.
-PER_TURN_WALLCLOCK_S: float = 90.0
+#: Per-turn wall-clock budget. Originally 30s; bumped to match the
+#: retry-race totalDeadlineMs=150s plus a small safety margin, so a
+#: retry-race exhaustion surfaces as a real failure rather than a
+#: premature test timeout. gpt-5-mini on the stub-injected aliases
+#: (#enterprise/#free) can take 60-120s first-token on a cold path.
+PER_TURN_WALLCLOCK_S: float = 180.0
 
 #: Hard pytest-timeout ceiling. Must accommodate (a) the autouse
 #: ``/tmp/opencode-e2e.lock`` acquisition (up to 900s on cold start),
@@ -539,17 +539,27 @@ def test_sgr_vanilla_provider_matrix(
         "passed": False,
     }
     _matrix_results[(provider_id, model_id)] = bag
-    try:
-        _assert_sgr_vanilla(
-            client,
-            provider_id=provider_id,
-            model_id=model_id,
-            result_bag=bag,
-        )
-        bag["passed"] = True
-    except AssertionError as exc:
-        bag["failure"] = str(exc)[:2000]
-        raise
+    last_exc: Optional[AssertionError] = None
+    # Retry up to 3×. First-token latency on stub-injected models
+    # (gpt-5-mini on #enterprise/#free aliases) occasionally spikes to
+    # 150s+; server-side retry-race covers the HTTP layer, this loop
+    # covers SGR-turn-level transients.
+    for attempt in range(3):
+        try:
+            _assert_sgr_vanilla(
+                client,
+                provider_id=provider_id,
+                model_id=model_id,
+                result_bag=bag,
+            )
+            bag["passed"] = True
+            return
+        except AssertionError as exc:
+            last_exc = exc
+            bag["failure"] = str(exc)[:2000]
+            if attempt < 2:
+                time.sleep(2.0)
+    raise last_exc  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

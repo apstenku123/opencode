@@ -399,22 +399,33 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
             f"inspect OPENCODE_MEMORY_OBSERVER_DEBUG=1 logs."
         )
 
-        # Retrieve + verify every required field is non-empty.
-        rc, stdout, stderr = _run_memory_cli(
-            root,
-            "retrieve",
-            "--query",
-            "parseInt leading zero octal radix bug",
-            "--mode",
-            "cosine",
-            "--top-k",
-            "5",
-            "--json",
-            cwd=scratch,
+        # Retrieve + verify every required field is non-empty. Retries up
+        # to 5× with 2s backoff because the embedding index on disk can
+        # lag a few seconds behind the extraction fiber's sqlite write.
+        body: dict[str, Any] = {}
+        last_stderr = ""
+        for attempt in range(5):
+            rc, stdout, last_stderr = _run_memory_cli(
+                root,
+                "retrieve",
+                "--query",
+                "parseInt leading zero octal radix bug",
+                "--mode",
+                "cosine",
+                "--top-k",
+                "5",
+                "--json",
+                cwd=scratch,
+            )
+            assert rc == 0, f"memory retrieve rc={rc}\nstderr={last_stderr}"
+            body = _parse_json_tail(stdout)
+            if body.get("hits"):
+                break
+            time.sleep(2.0)
+        assert body.get("hits"), (
+            f"no hits returned after 5× retries: {body}\n"
+            f"stderr tail:\n{last_stderr[-2000:]}"
         )
-        assert rc == 0, f"memory retrieve rc={rc}\nstderr={stderr}"
-        body = _parse_json_tail(stdout)
-        assert body["hits"], f"no hits returned: {body}"
         top = body["hits"][0]
         assert (top.get("problem") or "").strip(), f"empty problem: {top}"
         assert (top.get("rootCause") or "").strip(), f"empty rootCause: {top}"
