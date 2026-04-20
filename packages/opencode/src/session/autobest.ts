@@ -58,6 +58,52 @@ export function fromEvent(event: SessionEvent.Autobest) {
   } satisfies History.Event
 }
 
+export function resultEvent(input: {
+  sessionID: string
+  ts: number
+  changed: boolean
+  candidates: Autobest.Candidate[]
+  resultingAction?: string | null
+  selected?: Autobest.Candidate
+}) {
+  return {
+    ts: input.ts,
+    type: "autobest.result",
+    sessionID: input.sessionID,
+    resultingAction: input.resultingAction ?? null,
+    ...(input.selected
+      ? {
+          selected: {
+            key: input.selected.key,
+            score: input.selected.score,
+            ...(input.selected.reason ? { reason: [...input.selected.reason] } : {}),
+          },
+        }
+      : {}),
+    changed: input.changed,
+    candidates: input.candidates.map((item) => ({
+      key: item.key,
+      score: item.score,
+      ...(item.reason ? { reason: [...item.reason] } : {}),
+    })),
+  } satisfies History.Event
+}
+
+export function resultEventFromDecision(input: {
+  sessionID: string
+  ts?: number
+  decision: Autobest.Decision
+}) {
+  return resultEvent({
+    sessionID: input.sessionID,
+    ts: input.decision.active?.ts ?? input.ts ?? Date.now(),
+    resultingAction: input.decision.active?.key ?? null,
+    selected: input.decision.selected,
+    changed: input.decision.changed,
+    candidates: input.decision.candidates,
+  })
+}
+
 export async function append(sessionID: string, state: Autobest.State, input: { candidates: Autobest.Candidate[]; ts?: number }) {
   const out = Autobest.apply(state, input)
   await History.append(sessionID, {

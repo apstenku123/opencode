@@ -106,6 +106,7 @@ describe("session action routes", () => {
           log: [],
           result: {
             ts: 10,
+            resultingAction: "lane-b",
             selected: { key: "lane-b", score: 8, reason: ["best"] },
             changed: true,
             candidates: [
@@ -137,6 +138,9 @@ describe("session action routes", () => {
           ],
           result: {
             ts: 12,
+            type: "autobest.result",
+            sessionID: session.id,
+            resultingAction: "lane-c",
             selected: { key: "lane-c", score: 9, reason: ["fresh", "best"] },
             changed: true,
             candidates: [
@@ -159,6 +163,7 @@ describe("session action routes", () => {
           log: [],
           result: {
             ts: 12,
+            resultingAction: "lane-c",
             selected: { key: "lane-c", score: 9, reason: ["fresh", "best"] },
             changed: true,
             candidates: [

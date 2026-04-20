@@ -28,6 +28,7 @@ import {
   memoryRetrievalLayer,
   memoryStorageLayer,
   autoEmbeddingLayer,
+  Memory,
 } from "../../memory"
 import { layer as foreignIngestCheckpointLayer } from "../../memory/foreign-ingest/checkpoint"
 import { ForeignIngestDoneTable, MemorySextupleTable } from "../../memory/memory.sql"

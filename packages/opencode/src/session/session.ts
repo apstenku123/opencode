@@ -32,6 +32,7 @@ import * as History from "@/history"
 import * as Autobest from "@/autobest"
 import * as Hook from "@/hook"
 import * as ConfigOverlay from "@/session/config-overlay"
+import * as SessionAutobest from "@/session/autobest"
 import { RolloutPath } from "@/rollout/path"
 import { Effect, Layer, Option, Context } from "effect"
 
@@ -667,13 +668,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
       configOverlay?: Record<string, unknown>
     }) {
       const directory = yield* InstanceState.directory
-      const workspace = yield* InstanceState.workspaceID
       return yield* createNext({
         parentID: input?.parentID,
         directory,
         title: input?.title,
         permission: input?.permission,
-        workspaceID: workspace,
+        workspaceID: input?.workspaceID ?? (yield* InstanceState.workspaceID),
         configOverlay: input?.configOverlay,
       })
     })
@@ -859,16 +859,24 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
 
     const getAutobest: Interface["getAutobest"] = (sessionID) =>
       Effect.promise(async () => {
-        const items = await History.readByType(sessionID, "autobest.active")
+        const items = await History.read(sessionID)
+        const cycle = Autobest.reduceCycleEvents(
+          items.filter(
+            (item): item is Autobest.CycleEvent =>
+              item.type === "autobest.cycle.advance" || item.type === "autobest.cycle.reset",
+          ),
+        )
         return items.reduce<Autobest.State>(
           (state, item) =>
-            Autobest.setActive(state, {
-              key: item.key,
-              source: item.source,
-              score: item.score,
-              ts: item.ts,
-            }),
-          Autobest.empty(),
+            item.type === "autobest.active"
+              ? Autobest.setActive(state, {
+                  key: item.key,
+                  source: item.source,
+                  score: item.score,
+                  ts: item.ts,
+                })
+              : state,
+          cycle ? { ...Autobest.empty(), cycle } : Autobest.empty(),
         )
       }).pipe(Effect.withSpan("Session.getAutobest"))
 
@@ -922,25 +930,18 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
           candidates: input.candidates,
           ts: input.ts,
         })
-        const ts = out.decision.active?.ts ?? input.ts ?? Date.now()
+        const result = SessionAutobest.resultEventFromDecision({
+          sessionID: input.sessionID,
+          ts: input.ts,
+          decision: out.decision,
+        })
         yield* Effect.promise(() =>
-          History.append(input.sessionID, {
-            ts,
-            type: "autobest.result",
-            sessionID: input.sessionID,
-            ...(out.decision.selected ? { selected: out.decision.selected } : {}),
-            changed: out.decision.changed,
-            candidates: out.decision.candidates.map((item) => ({
-              key: item.key,
-              score: item.score,
-              ...(item.reason ? { reason: item.reason } : {}),
-            })),
-          }),
+          History.append(input.sessionID, result),
         )
         if (!out.decision.active || !out.decision.changed) return out
         yield* Effect.promise(() =>
           History.append(input.sessionID, {
-            ts,
+            ts: result.ts,
             type: "autobest.active",
             sessionID: input.sessionID,
             source: out.decision.active?.source ?? "auto",

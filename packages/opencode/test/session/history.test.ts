@@ -2,11 +2,14 @@ import { describe, expect, test } from "bun:test"
 import path from "path"
 import { Session as SessionNs } from "../../src/session"
 import { last, read, readByType } from "../../src/history"
+import * as History from "../../src/history"
+import * as Autobest from "../../src/autobest"
 import { Instance } from "../../src/project/instance"
 import { AppRuntime } from "../../src/effect/app-runtime"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionAutobestObserver } from "../../src/session/autobest-observer"
 import { SessionStatus } from "../../src/session/status"
+import { SessionRoutes } from "../../src/server/instance/session"
 import { Layer, Effect } from "effect"
 import { MessageID, PartID } from "../../src/session/schema"
 
@@ -336,12 +339,95 @@ describe("session history", () => {
     })
   })
 
+  test("session getAutobest hydrates durable cycle state from history", async () => {
+    await Instance.provide({
+      directory: projectRoot,
+      fn: async () => {
+        const session = await create({})
+        await setAutobest({ sessionID: session.id, key: "lane-a", ts: 1 })
+        await History.append(
+          session.id,
+          Autobest.buildCycleAdvanceEvent({
+            sessionID: session.id,
+            ts: 4,
+            cycle: {
+              iteration: 4,
+              stepKind: "d",
+              whatNextAsked: true,
+            },
+            reason: "max-iterations-reached",
+          }),
+        )
+        expect(await getAutobest(session.id)).toEqual({
+          active: { key: "lane-a", source: "manual", ts: 1, score: undefined },
+          picks: [{ key: "lane-a", source: "manual", ts: 1, score: undefined }],
+          cycle: {
+            iteration: 4,
+            stepKind: "d",
+            turnID: undefined,
+            whatNextAsked: true,
+            whereIsPlanAsked: undefined,
+            stagnationCount: undefined,
+          },
+        })
+      },
+    })
+  })
+
   test("session autobest observer extracts ranked candidates from assistant bullets", async () => {
     expect(SessionAutobestObserver.extract(`- tighten failing repro
 - rerun focused lane`)).toEqual([
       { key: "tighten failing repro", score: 100 },
       { key: "rerun focused lane", score: 99 },
     ])
+  })
+
+  test("session autobest extract route persists autobest.result", async () => {
+    await Instance.provide({
+      directory: projectRoot,
+      fn: async () => {
+        const session = await create({})
+        const res = await SessionRoutes().request(`/${session.id}/autobest/extract`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            ts: 123,
+            candidates: [
+              { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+              { key: "rerun tests", score: 55 },
+            ],
+          }),
+        })
+        expect(res.status).toBe(200)
+        expect(await res.json()).toMatchObject({
+          result: {
+            ts: 123,
+            type: "autobest.result",
+            sessionID: session.id,
+            resultingAction: "follow the plan",
+            selected: { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+            changed: true,
+            candidates: [
+              { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+              { key: "rerun tests", score: 55 },
+            ],
+          },
+        })
+        expect(await last(session.id, "autobest.result")).toEqual({
+          ts: 123,
+          type: "autobest.result",
+          sessionID: session.id,
+          resultingAction: "follow the plan",
+          selected: { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+          changed: true,
+          candidates: [
+            { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+            { key: "rerun tests", score: 55 },
+          ],
+        })
+        expect(await readByType(session.id, "autobest.result")).toHaveLength(1)
+      },
+    })
   })
 
 })

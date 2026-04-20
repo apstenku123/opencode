@@ -149,6 +149,34 @@ describe("session autobest history", () => {
     expect(post.reason).toBe("max-iterations-reached")
   })
 
+  test("max-iteration denial should persist terminal step d", () => {
+    const continuation = shouldContinue({
+      enabled: true,
+      changed: true,
+      activeKey: "do thing",
+      cycle: { iteration: 3, stepKind: "a" },
+      maxIterations: 3,
+    })
+    const event = Autobest.buildCycleAdvanceEvent({
+      sessionID: "s-max-terminal",
+      cycle: {
+        iteration: 4,
+        stepKind: continuation.shouldContinue ? "a" : "d",
+      },
+      reason: continuation.shouldContinue ? "step_a" : continuation.reason,
+    })
+    expect(event.stepKind).toBe("d")
+    expect(event.iteration).toBe(4)
+    expect(Autobest.reduceCycleEvents([event])).toEqual({
+      iteration: 4,
+      stepKind: "d",
+      turnID: undefined,
+      whatNextAsked: undefined,
+      whereIsPlanAsked: undefined,
+      stagnationCount: undefined,
+    })
+  })
+
   test("shouldContinue defaults to DEFAULT_MAX_ITERATIONS", () => {
     expect(DEFAULT_MAX_ITERATIONS).toBe(3)
     const out = shouldContinue({
@@ -236,6 +264,85 @@ describe("session autobest history", () => {
       candidates: [
         { key: "b", score: 7, reason: ["best"] },
         { key: "a", score: 2 },
+      ],
+    })
+  })
+
+  test("autobest.result persists the resulting action", async () => {
+    const sessionID = "s-autobest-result"
+    await clean(sessionID)
+    await History.append(sessionID, {
+      ts: 60,
+      type: "autobest.result",
+      sessionID,
+      resultingAction: "Where is the plan?",
+      selected: { key: "Where is the plan?", score: 100, reason: ["ask_where_is_plan"] },
+      changed: true,
+      candidates: [{ key: "Where is the plan?", score: 100, reason: ["ask_where_is_plan"] }],
+    })
+    expect(await History.last(sessionID, "autobest.result")).toEqual({
+      ts: 60,
+      type: "autobest.result",
+      sessionID,
+      resultingAction: "Where is the plan?",
+      selected: { key: "Where is the plan?", score: 100, reason: ["ask_where_is_plan"] },
+      changed: true,
+      candidates: [{ key: "Where is the plan?", score: 100, reason: ["ask_where_is_plan"] }],
+    })
+  })
+
+  test("resultEvent preserves durable extract/result shape", () => {
+    expect(
+      SessionAutobest.resultEvent({
+        sessionID: "s-extract-result",
+        ts: 70,
+        resultingAction: "follow the plan",
+        selected: { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+        changed: true,
+        candidates: [
+          { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+          { key: "rerun tests", score: 33 },
+        ],
+      }),
+    ).toEqual({
+      ts: 70,
+      type: "autobest.result",
+      sessionID: "s-extract-result",
+      resultingAction: "follow the plan",
+      selected: { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+      changed: true,
+      candidates: [
+        { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+        { key: "rerun tests", score: 33 },
+      ],
+    })
+  })
+
+  test("resultEventFromDecision derives durable extract/result shape from a decision", () => {
+    expect(
+      SessionAutobest.resultEventFromDecision({
+        sessionID: "s-decision-result",
+        ts: 71,
+        decision: {
+          active: { key: "follow the plan", score: 99, source: "auto", ts: 72 },
+          selected: { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+          changed: true,
+          candidates: [
+            { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+            { key: "rerun tests", score: 33 },
+          ],
+        },
+      }),
+    ).toEqual({
+      ts: 72,
+      type: "autobest.result",
+      sessionID: "s-decision-result",
+      resultingAction: "follow the plan",
+      selected: { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+      changed: true,
+      candidates: [
+        { key: "follow the plan", score: 99, reason: ["plan_step_skipped"] },
+        { key: "rerun tests", score: 33 },
       ],
     })
   })
