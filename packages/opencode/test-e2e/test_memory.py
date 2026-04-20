@@ -399,13 +399,17 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
             f"inspect OPENCODE_MEMORY_OBSERVER_DEBUG=1 logs."
         )
 
-        # Retrieve + verify every required field is non-empty. Retries up
-        # to 12× with 5s backoff — the embedding fiber can lag 30-50s
-        # behind the extraction fiber's sqlite write on a cold path, and
-        # with free-tier tokens it's cheap to wait.
+        # Retrieve + verify every required field is non-empty. The mock
+        # embedding layer (shared hash-based impl; see
+        # `memory/embedding.ts::mockLayer`) returns 32-dim vectors whose
+        # cosine similarity against an unrelated query can be negative
+        # for hash collision reasons — so we pass ``--min-score -1`` to
+        # keep any non-null match. Retries 3× with 2s backoff cover the
+        # brief window between extraction-fiber sqlite write and
+        # embedding update.
         body: dict[str, Any] = {}
         last_stderr = ""
-        for attempt in range(12):
+        for attempt in range(3):
             rc, stdout, last_stderr = _run_memory_cli(
                 root,
                 "retrieve",
@@ -415,6 +419,8 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
                 "cosine",
                 "--top-k",
                 "5",
+                "--min-score",
+                "-1",
                 "--json",
                 cwd=scratch,
             )
@@ -422,9 +428,9 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
             body = _parse_json_tail(stdout)
             if body.get("hits"):
                 break
-            time.sleep(5.0)
+            time.sleep(2.0)
         assert body.get("hits"), (
-            f"no hits returned after 12× retries (~60s of backoff): {body}\n"
+            f"no hits returned after 3× retries: {body}\n"
             f"stderr tail:\n{last_stderr[-2000:]}"
         )
         top = body["hits"][0]
