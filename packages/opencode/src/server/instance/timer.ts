@@ -5,6 +5,8 @@ import { Context, Effect, Layer } from "effect"
 import z from "zod"
 
 export namespace TimerSvc {
+  export const SessionID = z.string().min(1).meta({ ref: "TimerSessionID" })
+
   export const Info = z
     .object({
       id: z.string(),
@@ -39,19 +41,17 @@ export namespace TimerSvc {
     .meta({ ref: "TimerItemInput" })
 
   export interface Interface {
-    readonly list: () => Effect.Effect<Info[]>
-    readonly get: (id: string) => Effect.Effect<Info | undefined>
-    readonly create: (input: z.infer<typeof CreateInput>) => Effect.Effect<Info>
-    readonly pause: (id: string) => Effect.Effect<Info | undefined>
-    readonly resume: (id: string) => Effect.Effect<Info | undefined>
-    readonly delete: (id: string) => Effect.Effect<boolean>
-    readonly drain: () => Effect.Effect<Fired[]>
-    readonly clear: () => Effect.Effect<void>
+    readonly list: (sessionID?: string) => Effect.Effect<Info[]>
+    readonly get: (sessionID: string, id: string) => Effect.Effect<Info | undefined>
+    readonly create: (sessionID: string, input: z.infer<typeof CreateInput>) => Effect.Effect<Info>
+    readonly pause: (sessionID: string, id: string) => Effect.Effect<Info | undefined>
+    readonly resume: (sessionID: string, id: string) => Effect.Effect<Info | undefined>
+    readonly delete: (sessionID: string, id: string) => Effect.Effect<boolean>
+    readonly drain: (sessionID: string) => Effect.Effect<Fired[]>
+    readonly clear: (sessionID: string) => Effect.Effect<void>
   }
 
   export class Service extends Context.Service<Service, Interface>()("@opencode/TimerSvc") {}
-
-  const shared = new Map<string, ReturnType<typeof Timer.create>>()
 
   export const layer = Layer.effect(
     Service,
@@ -59,46 +59,72 @@ export namespace TimerSvc {
       const state = yield* InstanceState.make(
         Effect.fn("TimerSvc.state")(() =>
           Effect.sync(() => {
-            const dir = Instance.directory
-            const found = shared.get(dir)
-            if (found) return found
-            const next = Timer.create()
-            shared.set(dir, next)
-            return next
-          }),
+            const timers = new Map<string, ReturnType<typeof Timer.create>>()
+            return {
+              timers,
+              get(sessionID: string) {
+                const found = timers.get(sessionID)
+                if (found) return found
+                const next = Timer.create()
+                timers.set(sessionID, next)
+                return next
+              },
+              clear(sessionID: string) {
+                const found = timers.get(sessionID)
+                if (!found) return
+                found.clear()
+                timers.delete(sessionID)
+              },
+            }
+          }).pipe(
+            Effect.tap((state) =>
+              Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  for (const timer of state.timers.values()) timer.clear()
+                  state.timers.clear()
+                }),
+              ),
+            ),
+          ),
         ),
       )
 
-      const list = Effect.fn("TimerSvc.list")(function* () {
-        return (yield* InstanceState.get(state)).list()
+      const list = Effect.fn("TimerSvc.list")(function* (sessionID?: string) {
+        if (!sessionID) return []
+        return (yield* InstanceState.get(state)).get(sessionID).list()
       })
 
-      const get = Effect.fn("TimerSvc.get")(function* (id: string) {
-        return (yield* InstanceState.get(state)).get(id)
+      const get = Effect.fn("TimerSvc.get")(function* (sessionID: string, id: string) {
+        return (yield* InstanceState.get(state)).get(sessionID).get(id)
       })
 
-      const create = Effect.fn("TimerSvc.create")(function* (input: z.infer<typeof CreateInput>) {
-        return (yield* InstanceState.get(state)).create(input.id, input.delay, input.repeat)
+      const create = Effect.fn("TimerSvc.create")(function* (sessionID: string, input: z.infer<typeof CreateInput>) {
+        return (yield* InstanceState.get(state)).get(sessionID).create(input.id, input.delay, input.repeat)
       })
 
-      const pause = Effect.fn("TimerSvc.pause")(function* (id: string) {
-        return (yield* InstanceState.get(state)).pause(id)
+      const pause = Effect.fn("TimerSvc.pause")(function* (sessionID: string, id: string) {
+        return (yield* InstanceState.get(state)).get(sessionID).pause(id)
       })
 
-      const resume = Effect.fn("TimerSvc.resume")(function* (id: string) {
-        return (yield* InstanceState.get(state)).resume(id)
+      const resume = Effect.fn("TimerSvc.resume")(function* (sessionID: string, id: string) {
+        return (yield* InstanceState.get(state)).get(sessionID).resume(id)
       })
 
-      const del = Effect.fn("TimerSvc.delete")(function* (id: string) {
-        return (yield* InstanceState.get(state)).delete(id)
+      const del = Effect.fn("TimerSvc.delete")(function* (sessionID: string, id: string) {
+        const timers = (yield* InstanceState.get(state)).get(sessionID)
+        const deleted = timers.delete(id)
+        if (!deleted) return false
+        if (timers.list().length) return true
+        ;(yield* InstanceState.get(state)).clear(sessionID)
+        return true
       })
 
-      const drain = Effect.fn("TimerSvc.drain")(function* () {
-        return (yield* InstanceState.get(state)).drain()
+      const drain = Effect.fn("TimerSvc.drain")(function* (sessionID: string) {
+        return (yield* InstanceState.get(state)).get(sessionID).drain()
       })
 
-      const clear = Effect.fn("TimerSvc.clear")(function* () {
-        ;(yield* InstanceState.get(state)).clear()
+      const clear = Effect.fn("TimerSvc.clear")(function* (sessionID: string) {
+        ;(yield* InstanceState.get(state)).clear(sessionID)
       })
 
       return Service.of({ list, get, create, pause, resume, delete: del, drain, clear })

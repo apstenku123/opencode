@@ -228,10 +228,16 @@ export const ingest = (input: IngestInput) => {
 
           const sextuples = yield* input.extract(session, source)
           let producedAny = false
+          let persistFailed = false
           for (const sx of sextuples) {
             const result = yield* memory
               .addWithoutEmbedding({ ...sx, projectID: sx.projectID ?? input.projectID })
-              .pipe(Effect.catch(() => Effect.succeed(undefined)))
+              .pipe(
+                Effect.catch(() => {
+                  persistFailed = true
+                  return Effect.succeed(undefined)
+                }),
+              )
             if (result?.inserted) {
               stats.inserted += 1
               producedAny = true
@@ -239,8 +245,10 @@ export const ingest = (input: IngestInput) => {
           }
           if (producedAny) stats.produced += 1
 
-          // Always checkpoint — even when extraction emitted nothing — so
-          // we don't reprocess the same session every run.
+          if (persistFailed) return
+
+          // Checkpoint only after successful persistence or an explicitly
+          // empty extraction so transient storage failures remain retryable.
           yield* checkpoint
             .insertDone({
               tool: d.tool,

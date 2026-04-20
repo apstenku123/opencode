@@ -1160,7 +1160,7 @@ export async function dispatchWithRace(input: Parameters<typeof dispatch>[0], cf
       init: attemptInit,
       // Pin the candidate by routing through `providerID`; when absent the
       // routing machinery will prefer this key via `weighted`/`preferAccount`.
-      providerID: `github-copilot#${key}`,
+      providerID: key,
     })
   })
   return raceFetch(attempts, effective, { bus: httpRetryRaceBus })

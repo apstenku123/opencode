@@ -104,6 +104,18 @@ describe("autobest/steps - decideEmptyFollowup (Step C / D)", () => {
     expect(out.kind === "c" && out.action).toBe("Where is the plan?")
     expect(out.reason).toBe("ask_where_is_plan")
   })
+
+  test("where-is-plan only fires once before falling back to what-next", () => {
+    const first = decideEmptyFollowup({ iteration: 0, maxIterations: 3, askWhereIsPlanOnEmpty: true })
+    expect(first.kind).toBe("c")
+    expect(first.kind === "c" && first.reason).toBe("ask_where_is_plan")
+
+    const cycle: CycleState = { iteration: 1, stepKind: "c", whereIsPlanAsked: true }
+    const second = decideEmptyFollowup({ cycle, iteration: 1, maxIterations: 3, askWhereIsPlanOnEmpty: true })
+    expect(second.kind).toBe("c")
+    expect(second.kind === "c" && second.action).toBe("And what's next?")
+    expect(second.reason).toBe("ask_what_next")
+  })
 })
 
 describe("autobest/steps - runSteps orchestration", () => {
@@ -170,6 +182,30 @@ describe("autobest/steps - runSteps orchestration", () => {
 
     const second = runSteps({ stepACandidates: [], cycle, maxIterations: 3 })
     expect(second.kind).toBe("d")
+  })
+
+  test("askWhereIsPlanOnEmpty yields deterministic C -> C -> D cycle", () => {
+    const first = runSteps({ stepACandidates: [], maxIterations: 3, askWhereIsPlanOnEmpty: true })
+    expect(first.kind).toBe("c")
+    expect(first.kind === "c" && first.reason).toBe("ask_where_is_plan")
+
+    const second = runSteps({
+      stepACandidates: [],
+      maxIterations: 3,
+      askWhereIsPlanOnEmpty: true,
+      cycle: { iteration: 1, stepKind: "c", whereIsPlanAsked: true },
+    })
+    expect(second.kind).toBe("c")
+    expect(second.kind === "c" && second.reason).toBe("ask_what_next")
+
+    const third = runSteps({
+      stepACandidates: [],
+      maxIterations: 3,
+      askWhereIsPlanOnEmpty: true,
+      cycle: { iteration: 2, stepKind: "c", whereIsPlanAsked: true, whatNextAsked: true },
+    })
+    expect(third.kind).toBe("d")
+    expect(third.reason).toBe("what_next_already_asked")
   })
 })
 
@@ -258,6 +294,38 @@ describe("autobest/steps - runStepsEffect", () => {
       runStepsEffect({ sessionID: "s", stepACandidates: [], cycle, maxIterations: 3 }),
     )
     expect(dec.kind).toBe("d")
+  })
+
+  test("effect path preserves where-is-plan -> what-next -> done ordering", async () => {
+    const first = await Effect.runPromise(
+      runStepsEffect({ sessionID: "s", stepACandidates: [], maxIterations: 3, askWhereIsPlanOnEmpty: true }),
+    )
+    expect(first.kind).toBe("c")
+    expect(first.kind === "c" && first.reason).toBe("ask_where_is_plan")
+
+    const second = await Effect.runPromise(
+      runStepsEffect({
+        sessionID: "s",
+        stepACandidates: [],
+        maxIterations: 3,
+        askWhereIsPlanOnEmpty: true,
+        cycle: { iteration: 1, stepKind: "c", whereIsPlanAsked: true },
+      }),
+    )
+    expect(second.kind).toBe("c")
+    expect(second.kind === "c" && second.reason).toBe("ask_what_next")
+
+    const third = await Effect.runPromise(
+      runStepsEffect({
+        sessionID: "s",
+        stepACandidates: [],
+        maxIterations: 3,
+        askWhereIsPlanOnEmpty: true,
+        cycle: { iteration: 2, stepKind: "c", whereIsPlanAsked: true, whatNextAsked: true },
+      }),
+    )
+    expect(third.kind).toBe("d")
+    expect(third.reason).toBe("what_next_already_asked")
   })
 
   test("compactReader failure is swallowed and treated as undefined window", async () => {

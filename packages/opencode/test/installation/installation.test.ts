@@ -95,6 +95,21 @@ describe("installation", () => {
       expect(result).toBe("1.6.0")
     })
 
+    test("reads npm registry versions for yarn method", async () => {
+      const layer = testLayer(
+        () => jsonResponse({ version: "1.7.0" }),
+        (cmd, args) => {
+          if (cmd === "npm" && args.includes("registry")) return "https://registry.npmjs.org\n"
+          return ""
+        },
+      )
+
+      const result = await Effect.runPromise(
+        Installation.Service.use((svc) => svc.latest("yarn")).pipe(Effect.provide(layer)),
+      )
+      expect(result).toBe("1.7.0")
+    })
+
     test("reads scoop manifest versions", async () => {
       const layer = testLayer(() => jsonResponse({ version: "2.3.4" }))
 
@@ -147,6 +162,28 @@ describe("installation", () => {
         Installation.Service.use((svc) => svc.latest("brew")).pipe(Effect.provide(layer)),
       )
       expect(result).toBe("2.1.0")
+    })
+  })
+
+  describe("upgrade", () => {
+    test("uses yarn global add for yarn upgrades", async () => {
+      const seen: Array<{ cmd: string; args: readonly string[] }> = []
+      const layer = testLayer(
+        () => jsonResponse({ tag_name: "v0.0.0" }),
+        (cmd, args) => {
+          seen.push({ cmd, args })
+          if (cmd === process.execPath && args.includes("--version")) return "0.0.0\n"
+          return ""
+        },
+      )
+
+      await Effect.runPromise(
+        Installation.Service.use((svc) => svc.upgrade("yarn", "2.0.0")).pipe(Effect.provide(layer)),
+      )
+
+      expect(seen.some((item) => item.cmd === "yarn" && item.args.join(" ") === "global add opencode-ai@2.0.0")).toBe(
+        true,
+      )
     })
   })
 })

@@ -11,6 +11,21 @@ import { SubagentRegistry } from "../subagent/registry"
 import * as Hook from "../hook"
 import { Cause, Effect, Fiber, Option } from "effect"
 
+function subagentHookContext(parentSessionID: SessionID, agentType: string) {
+  return {
+    agentLevel: 1,
+    sessionContext: {
+      source: "sub_agent" as const,
+      subagent: {
+        source: "thread_spawn" as const,
+        parent_session_id: parentSessionID,
+        depth: 1,
+        agent_role: agentType,
+      },
+    },
+  }
+}
+
 /**
  * Max wait for an available Copilot slot before giving up and returning
  * `"Copilot pool exhausted, retry later"` from an async `task` spawn.
@@ -193,6 +208,7 @@ export const TaskTool = Tool.define(
       const hookOpt = yield* Effect.serviceOption(Hook.Service)
       const fireSubagentStart = Effect.gen(function* () {
         if (Option.isNone(hookOpt)) return
+        const hookContext = subagentHookContext(ctx.sessionID, next.name)
         yield* hookOpt.value
           .dispatch({
             event: {
@@ -204,6 +220,7 @@ export const TaskTool = Tool.define(
               prompt: params.prompt,
             },
             sessionID: ctx.sessionID,
+            ...hookContext,
           })
           .pipe(Effect.ignore)
       })
@@ -298,43 +315,7 @@ export const TaskTool = Tool.define(
           })
         })
 
-        // Build a SubagentStop dispatcher that captures the Hook.Service
-        // at the tool's (parent) context — so cancellation paths don't depend
-        // on the forked child fiber's context, which drops Hook.Service at
-        // top-level `runFork`. Without this the SubagentStop hook only fires
-        // when the child completes normally; cancel-via-interrupt was silent.
-        const fireSubagentStop = (reason: "completed" | "cancelled" | "failed", summaryText: string) =>
-          Effect.gen(function* () {
-            if (Option.isNone(hookOpt)) return
-            yield* hookOpt.value
-              .dispatch({
-                event: {
-                  hook_event_name: "SubagentStop",
-                  stop_hook_active: false,
-                  agent_id: nextSession.id,
-                  agent_type: next.name,
-                  parent_session_id: ctx.sessionID,
-                  child_session_id: nextSession.id,
-                  summary: summaryText,
-                  reason,
-                  last_assistant_message: summaryText.length > 0 ? summaryText : null,
-                },
-                sessionID: ctx.sessionID,
-              })
-              .pipe(Effect.ignore)
-          })
-
         let cancelFiber: (() => void) | undefined
-        // Guard: `SubagentStop` must fire at most once per child. The fork
-        // success/failure branch, the explicit cancel path, and the ambient
-        // `ctx.abort` listener can all race — only the winner gets to
-        // dispatch the hook.
-        let stopFired = false
-        const dispatchStopOnce = (reason: "completed" | "cancelled" | "failed", summaryText: string) => {
-          if (stopFired) return
-          stopFired = true
-          ops.fork(fireSubagentStop(reason, summaryText))
-        }
 
         yield* subagents.spawn(SessionID.make(ctx.sessionID), nextSession.id, {
           cancel: () => cancelFiber?.(),
@@ -364,47 +345,27 @@ export const TaskTool = Tool.define(
         // keeps running until it finishes on its own or is explicitly
         // cancelled via `ctx.abort` / `subagents.cancelChild`.
         //
-        // NOTE on hook dispatch: we dispatch `SubagentStop` via
-        // `dispatchStopOnce` from the tool's own Effect context (captured
-        // above via `hookOpt`) rather than from within the forked fiber.
-        // When a top-level fork is interrupted early, its
-        // `matchCauseEffect` onFailure handler is not guaranteed to run (a
-        // pending interrupt can tear the fiber down before the handler
-        // Effect materialises). Firing from the outer context ensures the
-        // `cancelled` branch is observable by user hooks even for very
-        // short-lived child fibers.
         const fiber = ops.fork(
           runChild.pipe(
             Effect.matchCauseEffect({
               onSuccess: (result) =>
-                Effect.sync(() => {
+                Effect.gen(function* () {
                   const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
-                  dispatchStopOnce("completed", text)
                   // Registry close keeps `waitForAll` / `listChildren` in sync.
-                  ops.fork(
-                    subagents.close(nextSession.id, { status: "completed", result: text }),
-                  )
+                  yield* subagents.close(nextSession.id, { status: "completed", result: text })
                 }),
               onFailure: (cause) =>
-                Effect.sync(() => {
+                Effect.gen(function* () {
                   const status = Cause.hasInterruptsOnly(cause) ? "cancelled" : "error"
-                  const reason = status === "cancelled" ? "cancelled" : "failed"
-                  dispatchStopOnce(reason, "")
-                  ops.fork(
-                    subagents.close(nextSession.id, {
-                      status,
-                      error: Cause.pretty(cause),
-                    }),
-                  )
+                  yield* subagents.close(nextSession.id, {
+                    status,
+                    error: Cause.pretty(cause),
+                  })
                 }),
             }),
           ),
         )
         cancelFiber = () => {
-          // Fire the hook up front, from the tool's own context — the
-          // forked fiber may be interrupted before its onFailure handler
-          // runs, so we cannot rely on it to emit `SubagentStop`.
-          dispatchStopOnce("cancelled", "")
           // Best-effort: signal the child runner to stop and interrupt the
           // forked fiber. Either alone is sufficient; both is defensive.
           try {

@@ -8,8 +8,10 @@ import * as Autobest from "@/autobest"
 import * as Grounding from "@/autobest/grounding"
 import { compactWindowReaderFromSession } from "@/autobest/compact"
 import type { Candidate, CycleState, StepKind } from "@/autobest"
+import { Config } from "@/config"
 import * as History from "@/history"
 import { MCP } from "@/mcp"
+import * as ConfigOverlay from "@/session/config-overlay"
 
 /**
  * Default cap on auto-continue feedback iterations.
@@ -118,13 +120,17 @@ export namespace SessionAutobestObserver {
   }) {
     const session = yield* Session.Service
     const mcp = yield* Effect.serviceOption(MCP.Service)
-    const maxIterations = opts?.maxIterations ?? DEFAULT_MAX_ITERATIONS
+    const config = yield* Config.Service
     const groundingCfg = opts?.grounding
     const compactReader = compactWindowReaderFromSession(session)
+    const askWhereIsPlanOnEmpty = false
     const observer: AdaptiveHooks.Observer = {
       name: "autobest",
       postIteration: (state, args) =>
         Effect.gen(function* () {
+          const rawCfg = yield* config.get()
+          const cfg = ConfigOverlay.applyOverlay(rawCfg, args.sessionID)
+          const maxIterations = opts?.maxIterations ?? cfg.autobest?.maxIterations ?? DEFAULT_MAX_ITERATIONS
           const enabled = yield* session.getAutobestEnabled(args.sessionID)
           if (!enabled) return AdaptiveHooks.Continue
 
@@ -210,19 +216,12 @@ export namespace SessionAutobestObserver {
             stepACandidates: candidates,
             cycle,
             maxIterations,
+            askWhereIsPlanOnEmpty,
             compactReader,
             assistantTail: text,
           })
 
           if (decision.kind === "a" && candidates.length) {
-            // Step A: persist the candidate via `applyAutobest` (writes
-            // `autobest.result` + `autobest.active` history events),
-            // record the cycle advance, and auto-continue by injecting
-            // the chosen bullet as the next synthetic user turn. The
-            // max-iterations guard above (decision.kind falls through to
-            // Step D when `iteration >= maxIterations`) prevents infinite
-            // loops. `shouldContinue` callers can also short-circuit via
-            // STOP_PATTERNS in the most recent user message.
             const result = yield* session
               .applyAutobest({ sessionID: args.sessionID, candidates, ts: Date.now() })
               .pipe(
@@ -231,31 +230,7 @@ export namespace SessionAutobestObserver {
                   onSuccess: (v) => v,
                 }),
               )
-            const next = Autobest.buildCycleAdvanceEvent({
-              sessionID: args.sessionID,
-              cycle: {
-                iteration: iteration + 1,
-                stepKind: "a",
-                turnID: cycle?.turnID,
-                whatNextAsked: cycle?.whatNextAsked,
-              },
-              reason: "step_a",
-            })
-            yield* Effect.promise(() => History.append(args.sessionID, next))
-            state.iteration = iteration + 1
             const activeKey = result?.decision.active?.key ?? candidates[0]?.key
-            if (!activeKey) return AdaptiveHooks.Continue
-            // Stop-pattern short-circuit — when the most-recent
-            // *non-synthetic* user message contains one of
-            // `STOP_PATTERNS`, the observer has still captured the
-            // candidates (so `active.key` is available for the UI) but
-            // must not inject a follow-up synthetic user turn. Matches
-            // the TUI's user-typed-`/stop` behaviour: the active pick
-            // persists, but the auto-loop stops here. We scan user
-            // messages in reverse chronological order (via
-            // `MessageV2.stream`) and filter out synthetic injections
-            // so a previous-iteration self-inject cannot hide a freshly
-            // typed "stop autobest".
             const lastUserText = yield* session
               .findMessage(args.sessionID, (m) => {
                 if (m.info.role !== "user") return false
@@ -281,11 +256,28 @@ export namespace SessionAutobestObserver {
                   },
                 }),
               )
-            for (const pat of STOP_PATTERNS) {
-              if (lastUserText.includes(pat)) {
-                return AdaptiveHooks.Continue
-              }
-            }
+            const continuation = shouldContinue({
+              enabled,
+              changed: result?.decision.changed ?? false,
+              activeKey,
+              lastUserText,
+              cycle,
+              maxIterations,
+            })
+            const next = Autobest.buildCycleAdvanceEvent({
+              sessionID: args.sessionID,
+              cycle: {
+                iteration: iteration + 1,
+                stepKind: continuation.shouldContinue ? "a" : "d",
+                turnID: cycle?.turnID,
+                whatNextAsked: cycle?.whatNextAsked,
+                whereIsPlanAsked: cycle?.whereIsPlanAsked,
+              },
+              reason: continuation.shouldContinue ? "step_a" : continuation.reason,
+            })
+            yield* Effect.promise(() => History.append(args.sessionID, next))
+            state.iteration = iteration + 1
+            if (!continuation.shouldContinue) return AdaptiveHooks.Continue
             return AdaptiveHooks.Inject({
               text: activeKey,
               source: "autobest:step-a",
@@ -300,6 +292,7 @@ export namespace SessionAutobestObserver {
                 stepKind: "b",
                 turnID: cycle?.turnID,
                 whatNextAsked: cycle?.whatNextAsked,
+                whereIsPlanAsked: cycle?.whereIsPlanAsked,
               },
               reason: decision.reason,
             })
@@ -318,7 +311,8 @@ export namespace SessionAutobestObserver {
                 iteration: iteration + 1,
                 stepKind: "c",
                 turnID: cycle?.turnID,
-                whatNextAsked: true,
+                whatNextAsked: decision.reason === "ask_what_next" ? true : cycle?.whatNextAsked,
+                whereIsPlanAsked: decision.reason === "ask_where_is_plan" ? true : cycle?.whereIsPlanAsked,
               },
               reason: decision.reason,
             })
@@ -335,13 +329,14 @@ export namespace SessionAutobestObserver {
           const next = Autobest.buildCycleAdvanceEvent({
             sessionID: args.sessionID,
             cycle: {
-              iteration: iteration + 1,
-              stepKind: "d",
-              turnID: cycle?.turnID,
-              whatNextAsked: cycle?.whatNextAsked,
-            },
-            reason: decision.reason,
-          })
+                iteration: iteration + 1,
+                stepKind: "d",
+                turnID: cycle?.turnID,
+                whatNextAsked: cycle?.whatNextAsked,
+                whereIsPlanAsked: cycle?.whereIsPlanAsked,
+              },
+              reason: decision.reason,
+            })
           yield* Effect.promise(() => History.append(args.sessionID, next))
           state.iteration = iteration + 1
           return AdaptiveHooks.Continue

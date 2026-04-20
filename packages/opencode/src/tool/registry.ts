@@ -55,6 +55,18 @@ import { Permission } from "@/permission"
 import { SubagentRegistry } from "@/subagent/registry"
 import * as Hook from "@/hook"
 
+function defaultSessionContext(agent: string, agentLevel = 0): Hook.HookSessionContext {
+  if (agentLevel <= 0) return { source: "cli" }
+  return {
+    source: "sub_agent",
+    subagent: {
+      source: "thread_spawn",
+      agent_role: agent,
+      depth: agentLevel,
+    },
+  }
+}
+
 const log = Log.create({ service: "tool.registry" })
 
 type TaskDef = Tool.InferDef<typeof TaskTool>
@@ -373,25 +385,33 @@ export const layer: Layer.Layer<
     function wrapWithHooks(tool: Tool.Def): Tool.Def["execute"] {
       return (args, ctx) =>
         Effect.gen(function* () {
+          const agentLevel = Math.max(0, Number(ctx.extra?.agentLevel ?? 0))
+          const sessionContext = defaultSessionContext(ctx.agent, agentLevel)
+          const callID = ctx.callID ?? ""
+          const dispatchHook = (event: Hook.HookEvent) =>
+            hooks
+              .dispatch({
+                event,
+                sessionID: ctx.sessionID,
+                agentLevel,
+                sessionContext,
+              })
+              .pipe(
+                Effect.catchCause(() =>
+                  Effect.succeed<Hook.HookDispatchResult>({
+                    outcome: "continue",
+                    responses: [],
+                  }),
+                ),
+              )
+
           // ---- PreToolUse ----------------------------------------------
-          const pre = yield* hooks
-            .dispatch({
-              event: {
-                hook_event_name: "PreToolUse",
-                tool_name: tool.id,
-                tool_input: args,
-                tool_use_id: ctx.callID,
-              },
-              sessionID: ctx.sessionID,
-            })
-            .pipe(
-              Effect.catchCause(() =>
-                Effect.succeed<Hook.HookDispatchResult>({
-                  outcome: "continue",
-                  responses: [],
-                }),
-              ),
-            )
+          const pre = yield* dispatchHook({
+            hook_event_name: "PreToolUse",
+            tool_name: tool.id,
+            tool_input: args,
+            tool_use_id: ctx.callID,
+          })
 
           if (pre.outcome === "abort") {
             const err = new Error(pre.abortReason ?? `PreToolUse hook aborted '${tool.id}'`)
@@ -417,47 +437,77 @@ export const layer: Layer.Layer<
           // PreToolUse may replace the tool input.
           const effectiveArgs = pre.updatedInput !== undefined ? (pre.updatedInput as typeof args) : args
 
-          // ---- execute -------------------------------------------------
-          const result = yield* tool.execute(effectiveArgs, ctx).pipe(
-            Effect.tapDefect((cause) =>
-              evolution
-                .onToolComplete({
-                  toolName: tool.id,
-                  success: false,
-                  error: String(cause),
-                })
-                .pipe(Effect.ignore),
+          const exit = yield* Effect.exit(
+            tool.execute(effectiveArgs, ctx).pipe(
+              Effect.tapDefect((cause) =>
+                evolution
+                  .onToolComplete({
+                    toolName: tool.id,
+                    success: false,
+                    error: String(cause),
+                  })
+                  .pipe(Effect.ignore),
+              ),
             ),
           )
-          yield* evolution.onToolComplete({ toolName: tool.id, success: true }).pipe(Effect.ignore)
 
-          // ---- PostToolUse ---------------------------------------------
-          const callID = ctx.callID ?? ""
-          const post = yield* hooks
-            .dispatch({
-              event: {
-                hook_event_name: "PostToolUse",
-                tool_name: tool.id,
-                tool_input: effectiveArgs,
-                tool_response: result.output,
-                tool_use_id: callID,
-              },
-              sessionID: ctx.sessionID,
+          if (exit._tag === "Failure") {
+            const error = String(exit.cause)
+            yield* dispatchHook({
+              hook_event_name: "PostToolUseFailure",
+              tool_name: tool.id,
+              tool_input: effectiveArgs,
+              tool_use_id: callID,
+              error,
+              is_interrupt: false,
             })
-            .pipe(
-              Effect.catchCause(() =>
-                Effect.succeed<Hook.HookDispatchResult>({
-                  outcome: "continue",
-                  responses: [],
-                }),
-              ),
-            )
-
-          if (post.updatedOutput !== undefined && typeof post.updatedOutput === "string") {
-            return { ...result, output: post.updatedOutput }
+            yield* dispatchHook({
+              hook_event_name: "AfterToolUse",
+              turn_id: ctx.messageID,
+              call_id: callID,
+              tool_name: tool.id,
+              tool_kind: "function",
+              tool_input: effectiveArgs,
+              executed: true,
+              success: false,
+              duration_ms: 0,
+              mutating: false,
+              sandbox: "none",
+              sandbox_policy: "default",
+              output_preview: error,
+            })
+            return yield* Effect.failCause(exit.cause)
           }
 
-          return result
+          yield* evolution.onToolComplete({ toolName: tool.id, success: true }).pipe(Effect.ignore)
+          const post = yield* dispatchHook({
+            hook_event_name: "PostToolUse",
+            tool_name: tool.id,
+            tool_input: effectiveArgs,
+            tool_response: exit.value.output,
+            tool_use_id: callID,
+          })
+
+          const finalResult =
+            post.updatedOutput !== undefined && typeof post.updatedOutput === "string"
+              ? { ...exit.value, output: post.updatedOutput }
+              : exit.value
+          yield* dispatchHook({
+            hook_event_name: "AfterToolUse",
+            turn_id: ctx.messageID,
+            call_id: callID,
+            tool_name: tool.id,
+            tool_kind: "function",
+            tool_input: effectiveArgs,
+            executed: true,
+            success: true,
+            duration_ms: 0,
+            mutating: false,
+            sandbox: "none",
+            sandbox_policy: "default",
+            output_preview: finalResult.output,
+          })
+          return finalResult
         })
     }
 

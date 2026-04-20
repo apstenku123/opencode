@@ -30,6 +30,20 @@ test("history read preserves append order", async () => {
   expect(await read(sessionID)).toEqual(items)
 })
 
+test("history append preserves all concurrent events", async () => {
+  const sessionID = "s-history-concurrent"
+  await clean(sessionID)
+  const items: Event[] = Array.from({ length: 12 }, (_, index) => ({
+    ts: index + 1,
+    type: "session.summary.updated" as const,
+    sessionID,
+    summary: { files: index + 1 },
+  }))
+  await Promise.all(items.map((item) => append(sessionID, item)))
+  const stored = (await read(sessionID)).sort((a, b) => a.ts - b.ts)
+  expect(stored).toEqual(items)
+})
+
 test("history read returns empty for missing file", async () => {
   const sessionID = "s-history-missing"
   await clean(sessionID)

@@ -1,4 +1,5 @@
 import { describe, test, expect } from "bun:test"
+import { Effect } from "effect"
 import { DSL } from "../../src/permission/dsl"
 import { Permission } from "../../src/permission"
 

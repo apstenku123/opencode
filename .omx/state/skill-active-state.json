@@ -1,15 +1,15 @@
 {
   "version": 1,
   "active": true,
-  "skill": "ultrawork",
-  "keyword": "Parallel",
+  "skill": "cancel",
+  "keyword": "STOP",
   "phase": "planning",
-  "activated_at": "2026-04-16T17:29:49.802Z",
-  "updated_at": "2026-04-16T17:29:49.802Z",
+  "activated_at": "2026-04-20T19:51:37.438Z",
+  "updated_at": "2026-04-20T19:51:37.438Z",
   "source": "keyword-detector",
   "session_id": "",
-  "thread_id": "019d91e0-37eb-7063-9515-69b7517bd789",
-  "turn_id": "019d9751-b739-7800-ba4c-c0b17e424bba",
-  "iteration": 8,
-  "last_turn_at": "2026-04-16T20:56:04.596Z"
+  "thread_id": "019dab7c-d253-79a2-95c9-08e639cb72a8",
+  "turn_id": "019dac72-6ad0-7413-8702-c769604b1d8d",
+  "iteration": 7,
+  "last_turn_at": "2026-04-20T20:19:20.223Z"
 }

@@ -1,6 +1,6 @@
 """End-to-end tests for GitHub Copilot multi-account routing.
 
-Exercises the ``opencode-unify providers`` CLI + the running ``opencode serve``
+Exercises the ``opencode providers`` CLI + the running ``opencode serve``
 HTTP API against the user's *real* Copilot accounts:
 
     github-copilot            -> jeweldave   (enterprise)
@@ -16,7 +16,7 @@ Run with::
     python3 -m pytest test-e2e/test_copilot_multi_account.py -v
 
 Requires:
-    - ``opencode-unify`` on PATH (or ``OPENCODE_BINARY`` env var set).
+    - ``opencode`` on PATH (or ``OPENCODE_BINARY`` env var set).
     - Both Copilot accounts already logged in via ``providers login``.
 """
 
@@ -64,7 +64,7 @@ def _resolve_secondary_key(accounts: dict[str, Any]) -> str | None:
 
 
 def _run_cli(*args: str, timeout_s: float = 60.0, retries: int = 2) -> tuple[int, str, str]:
-    """Invoke ``opencode-unify <args...>`` and return (rc, stdout, stderr).
+    """Invoke ``opencode <args...>`` and return (rc, stdout, stderr).
 
     Stderr is captured for assertion on the ``wrote N accounts ...`` banner
     emitted by ``providers export``.
@@ -263,6 +263,52 @@ def test_route_debug_returns_sorted_candidates(
     for c in candidates[1:]:
         assert c["selected"] is False, (
             f"multiple candidates marked selected: {[x['key'] for x in candidates if x['selected']]}"
+        )
+
+
+def test_route_debug_selected_account_matches_discovery_api_base(
+    accounts: dict[str, dict[str, Any]]
+) -> None:
+    """Selected route-debug candidates must carry a stable per-account API base.
+
+    High-value wire check ported narrowly from the codex_git proxy
+    multi-account lane: once discovery has recorded ``status.discovery.api``
+    for an account, repeated ``providers route-debug`` calls for a Copilot
+    model must keep selecting an account whose discovery API base is present
+    and stable for that account.
+
+    This guards the per-account ``api_base`` map indirectly through the
+    existing JSON surfaces without widening the runtime response contract.
+    """
+    model = "gpt-5-mini"
+    selected_bases: list[tuple[str, str]] = []
+
+    for _ in range(2):
+        rc, stdout, _ = _run_cli("providers", "route-debug", model, "--json")
+        assert rc == 0, f"route-debug rc={rc}\n{stdout}"
+        data = _parse_cli_json(stdout)
+        selected = data["selected"]
+        assert isinstance(selected, str) and selected.startswith("github-copilot"), (
+            f"unexpected selected account: {selected!r}"
+        )
+
+        status = accounts.get(selected, {}).get("status", {})
+        discovery = status.get("discovery")
+        assert isinstance(discovery, dict), (
+            f"selected account {selected!r} missing discovery payload in providers accounts output"
+        )
+        api_base = discovery.get("api")
+        assert isinstance(api_base, str) and api_base.startswith("https://api."), (
+            f"selected account {selected!r} missing valid discovery.api base: {discovery!r}"
+        )
+        selected_bases.append((selected, api_base))
+
+    by_account: dict[str, set[str]] = {}
+    for key, api_base in selected_bases:
+        by_account.setdefault(key, set()).add(api_base)
+    for key, api_bases in by_account.items():
+        assert len(api_bases) == 1, (
+            f"selected account {key!r} changed discovery.api across route-debug calls: {sorted(api_bases)}"
         )
 
 

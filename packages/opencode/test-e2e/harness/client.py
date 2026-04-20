@@ -315,12 +315,18 @@ class OpencodeClient:
     def set_autobest(
         self,
         thread_id: str,
-        enabled: bool,
+        key: str,
         *,
+        source: Optional[str] = None,
+        score: Optional[float] = None,
         ts: Optional[float] = None,
     ) -> dict[str, Any]:
         """POST /thread/:id/autobest/setActive."""
-        body: dict[str, Any] = {"enabled": enabled}
+        body: dict[str, Any] = {"key": key}
+        if source is not None:
+            body["source"] = source
+        if score is not None:
+            body["score"] = score
         if ts is not None:
             body["ts"] = ts
         return self._post(f"/thread/{thread_id}/autobest/setActive", json=body)

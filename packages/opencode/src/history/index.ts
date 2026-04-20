@@ -1,3 +1,4 @@
+import { appendFile, mkdir } from "fs/promises"
 import path from "path"
 import * as Filesystem from "@/util/filesystem"
 import { Global } from "@/global"
@@ -199,6 +200,7 @@ export type Event =
       ts: number
       type: "autobest.result"
       sessionID: string
+      resultingAction?: string | null
       selected?: {
         key: string
         score: number
@@ -218,7 +220,9 @@ export type Event =
       stepKind: "a" | "b" | "c" | "d"
       turnID?: string
       whatNextAsked?: boolean
+      whereIsPlanAsked?: boolean
       iteration: number
+      stagnationCount?: number
       reason?: string
     }
   | {
@@ -247,9 +251,10 @@ export async function exists(sessionID: string) {
 }
 
 export async function append(sessionID: string, event: Event) {
+  const target = file(sessionID)
   const next = JSON.stringify(event) + "\n"
-  const prev = (await Filesystem.readText(file(sessionID)).catch(() => "")) + next
-  await Filesystem.write(file(sessionID), prev)
+  await mkdir(path.dirname(target), { recursive: true })
+  await appendFile(target, next, "utf8")
 }
 
 export async function read(sessionID: string) {

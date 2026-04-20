@@ -17,22 +17,23 @@ describe("timer service", () => {
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         const svc = yield* TimerSvc.Service
+        const sessionID = "session-a"
 
-        const created = yield* svc.create({ id: "loop", delay: 20, repeat: true })
+        const created = yield* svc.create(sessionID, { id: "loop", delay: 20, repeat: true })
         expect(created).toMatchObject({ id: "loop", delay: 20, repeat: true, active: true })
 
-        const listed = yield* svc.list()
+        const listed = yield* svc.list(sessionID)
         expect(listed).toMatchObject([{ id: "loop", delay: 20, repeat: true, active: true }])
 
-        const paused = yield* svc.pause("loop")
+        const paused = yield* svc.pause(sessionID, "loop")
         expect(paused).toMatchObject({ id: "loop", active: false, next: null })
 
-        const resumed = yield* svc.resume("loop")
+        const resumed = yield* svc.resume(sessionID, "loop")
         expect(resumed).toMatchObject({ id: "loop", active: true, repeat: true })
 
-        expect(yield* svc.drain()).toEqual([])
-        expect(yield* svc.delete("loop")).toBe(true)
-        expect(yield* svc.list()).toEqual([])
+        expect(yield* svc.drain(sessionID)).toEqual([])
+        expect(yield* svc.delete(sessionID, "loop")).toBe(true)
+        expect(yield* svc.list(sessionID)).toEqual([])
       }),
     ),
   )
@@ -41,28 +42,30 @@ describe("timer service", () => {
     Effect.gen(function* () {
       const a = yield* tmpdirScoped({ git: true })
       const b = yield* tmpdirScoped({ git: true })
+      const aSessionID = "session-a"
+      const bSessionID = "session-b"
 
       yield* provideInstance(a)(
         Effect.gen(function* () {
           const svc = yield* TimerSvc.Service
-          yield* svc.create({ id: "a", delay: 10 })
-          expect((yield* svc.list()).map((item) => item.id)).toEqual(["a"])
+          yield* svc.create(aSessionID, { id: "a", delay: 10 })
+          expect((yield* svc.list(aSessionID)).map((item) => item.id)).toEqual(["a"])
         }),
       )
 
       yield* provideInstance(b)(
         Effect.gen(function* () {
           const svc = yield* TimerSvc.Service
-          expect(yield* svc.list()).toEqual([])
-          yield* svc.create({ id: "b", delay: 15, repeat: true })
-          expect((yield* svc.list()).map((item) => item.id)).toEqual(["b"])
+          expect(yield* svc.list(bSessionID)).toEqual([])
+          yield* svc.create(bSessionID, { id: "b", delay: 15, repeat: true })
+          expect((yield* svc.list(bSessionID)).map((item) => item.id)).toEqual(["b"])
         }),
       )
 
       yield* provideInstance(a)(
         Effect.gen(function* () {
           const svc = yield* TimerSvc.Service
-          expect((yield* svc.list()).map((item) => item.id)).toEqual(["a"])
+          expect((yield* svc.list(aSessionID)).map((item) => item.id)).toEqual(["a"])
         }),
       )
     }),

@@ -216,7 +216,7 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
           return data.versions.stable
         }
 
-        if (detectedMethod === "npm" || detectedMethod === "bun" || detectedMethod === "pnpm") {
+        if (detectedMethod === "npm" || detectedMethod === "yarn" || detectedMethod === "bun" || detectedMethod === "pnpm") {
           const r = (yield* text(["npm", "config", "get", "registry"])).trim()
           const reg = r || "https://registry.npmjs.org"
           const registry = reg.endsWith("/") ? reg.slice(0, -1) : reg
@@ -267,6 +267,9 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient | ChildPro
             break
           case "npm":
             result = yield* run(["npm", "install", "-g", `opencode-ai@${target}`])
+            break
+          case "yarn":
+            result = yield* run(["yarn", "global", "add", `opencode-ai@${target}`])
             break
           case "pnpm":
             result = yield* run(["pnpm", "install", "-g", `opencode-ai@${target}`])

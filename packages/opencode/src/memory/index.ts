@@ -20,7 +20,11 @@
  */
 
 import { Context, Effect, Layer, Option } from "effect"
-import { EmbeddingService, mockLayer as mockEmbeddingLayerImpl } from "./embedding"
+import {
+  EmbeddingService,
+  autoEmbeddingLayer,
+} from "./embedding"
+import { EmbeddingService as SharedEmbeddingService } from "../embedding"
 import { layer as storageLayerImpl } from "./storage"
 import { layer as retrievalLayerImpl } from "./retrieval"
 import {
@@ -355,18 +359,19 @@ export const layer: Layer.Layer<Memory, never, MemoryStorage | MemoryRetrieval |
  * Bundles:
  *   - `MemoryStorage.layer` (SQLite-backed CRUD)
  *   - `MemoryRetrieval.layer` (cosine ranker)
- *   - `mockEmbeddingLayer` (deterministic hash embeddings — safe no-LLM default)
+ *   - `autoEmbeddingLayer` (provider-aware embeddings with local fallback)
  *   - `Memory.layer` (facade)
  *
- * The mock embedding layer is a deliberate default: round-3 keeps memories
- * OFF by default (`memories.enabled=false`) so the embedding backend is
- * effectively unused until a user opts in. When an embedding provider is
- * configured via `openAICompatLayer` it can be substituted by replacing
- * this layer at `AppLayer` composition time.
+ * The default embedding layer is provider-aware and falls back to local
+ * TF-IDF when no API embedding config is available. This preserves offline
+ * behavior while allowing real embedding providers to participate in live
+ * memory paths once configured.
  */
-export const defaultLayer: Layer.Layer<Memory | MemoryStorage | MemoryRetrieval | EmbeddingService> = Layer.suspend(
+export const defaultLayer: Layer.Layer<
+  Memory | MemoryStorage | MemoryRetrieval | EmbeddingService | SharedEmbeddingService
+> = Layer.suspend(
   () => {
-    const deps = Layer.mergeAll(storageLayerImpl, mockEmbeddingLayerImpl())
+    const deps = Layer.mergeAll(storageLayerImpl, autoEmbeddingLayer())
     const retrieval = Layer.provide(retrievalLayerImpl, storageLayerImpl)
     const facade = Layer.provide(layer, Layer.mergeAll(deps, retrieval))
     return Layer.mergeAll(deps, retrieval, facade)
@@ -374,7 +379,12 @@ export const defaultLayer: Layer.Layer<Memory | MemoryStorage | MemoryRetrieval 
 )
 
 // Re-exports so callers can `import { Memory, EmbeddingService, … } from "@/memory"`.
-export { EmbeddingService, mockLayer as mockEmbeddingLayer, openAICompatLayer } from "./embedding"
+export {
+  EmbeddingService,
+  autoEmbeddingLayer,
+  mockLayer as mockEmbeddingLayer,
+  openAICompatLayer,
+} from "./embedding"
 export { MemoryStorage, layer as memoryStorageLayer } from "./storage"
 export {
   MemoryRetrieval,

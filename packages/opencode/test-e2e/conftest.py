@@ -157,7 +157,7 @@ def _break_stale_lock_if_present() -> None:
     Reads ``E2E_LOCK_META_PATH``; if it exists and either:
 
       - ``pid`` no longer points to a live process, or
-      - ``started_at`` is more than ``E2E_LOCK_TIMEOUT_S`` old
+      - the meta file is corrupt / missing a usable pid
 
     the lock+meta files are unlinked so the next ``lock.acquire()``
     succeeds immediately. Covers the case where a prior pytest session
@@ -198,14 +198,6 @@ def _break_stale_lock_if_present() -> None:
     elif not _pid_is_alive(holder_pid):
         stale = True
         reason = f"holder pid {holder_pid} is dead"
-    elif started_at is not None and (now - started_at) > E2E_LOCK_TIMEOUT_S:
-        age_s = now - started_at
-        stale = True
-        reason = (
-            f"holder pid {holder_pid} has held for {age_s:.0f}s "
-            f"(> {E2E_LOCK_TIMEOUT_S}s cap)"
-        )
-
     if not stale:
         return
 
@@ -252,10 +244,9 @@ def _e2e_session_lock(request) -> Iterator[None]:
         pass
 
     # Pre-acquire stale-lock sweep: if a prior session died holding the
-    # lock (SIGKILL, zombie, 6h+ runaway), its meta file points at a dead
-    # pid or an over-aged started_at — in which case we unlink both files
-    # so lock.acquire() below returns immediately instead of blocking on
-    # a ghost.
+    # lock (SIGKILL, zombie), its meta file points at a dead pid (or is
+    # corrupt) — in which case we unlink both files so lock.acquire()
+    # below returns immediately instead of blocking on a ghost.
     _break_stale_lock_if_present()
 
     lock = FileLock(E2E_LOCK_PATH, timeout=E2E_LOCK_TIMEOUT_S)

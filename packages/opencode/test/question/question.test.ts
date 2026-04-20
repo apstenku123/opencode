@@ -1,10 +1,14 @@
 import { afterEach, test, expect } from "bun:test"
+import { Effect } from "effect"
 import { Question } from "../../src/question"
 import { Instance } from "../../src/project/instance"
 import { QuestionID } from "../../src/question/schema"
 import { tmpdir } from "../fixture/fixture"
-import { SessionID } from "../../src/session/schema"
+import { MessageID, SessionID } from "../../src/session/schema"
 import { AppRuntime } from "../../src/effect/app-runtime"
+import { Bus } from "../../src/bus"
+import * as Hook from "../../src/hook"
+import { HookResultSuccess } from "../../src/hook/types"
 
 const ask = (input: { sessionID: SessionID; questions: ReadonlyArray<Question.Info>; tool?: Question.Tool }) =>
   AppRuntime.runPromise(Question.Service.use((svc) => svc.ask(input)))
@@ -461,4 +465,112 @@ test("pending question rejects on instance reload", async () => {
   })
 
   expect(await result).toBeInstanceOf(Question.RejectedError)
+})
+
+test("hook allow publishes question.replied and clears pending", async () => {
+  await using tmp = await tmpdir({ git: true })
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const events: Array<{ type: string; properties: Record<string, unknown> }> = []
+      const offBus = await AppRuntime.runPromise(
+        Bus.Service.use((svc) =>
+          svc.subscribeAllCallback((event) => {
+            if (event.type === "question.asked" || event.type === "question.replied" || event.type === "question.rejected") {
+              events.push(event as { type: string; properties: Record<string, unknown> })
+            }
+          }),
+        ),
+      )
+      const offHook = await AppRuntime.runPromise(
+        Hook.Service.use((svc) =>
+          svc.register({
+            name: "allow-question",
+            run: () =>
+              Effect.succeed(
+                HookResultSuccess({
+                  decision_behavior: "allow",
+                }),
+              ),
+          }),
+        ),
+      )
+
+      try {
+        const answers = await ask({
+          sessionID: SessionID.make("ses_hook_allow"),
+          tool: { messageID: MessageID.make("msg_1"), callID: "call_1" },
+          questions: [
+            {
+              question: "Proceed?",
+              header: "Proceed",
+              options: [{ label: "Allow", description: "approve" }],
+            },
+          ],
+        })
+
+        expect(answers).toEqual([["Allow"]])
+        expect(await list()).toHaveLength(0)
+        expect(events.map((event) => event.type)).toEqual(["question.asked", "question.replied"])
+      } finally {
+        offHook()
+        offBus()
+      }
+    },
+  })
+})
+
+test("hook deny publishes question.rejected and clears pending", async () => {
+  await using tmp = await tmpdir({ git: true })
+  await Instance.provide({
+    directory: tmp.path,
+    fn: async () => {
+      const events: Array<{ type: string; properties: Record<string, unknown> }> = []
+      const offBus = await AppRuntime.runPromise(
+        Bus.Service.use((svc) =>
+          svc.subscribeAllCallback((event) => {
+            if (event.type === "question.asked" || event.type === "question.replied" || event.type === "question.rejected") {
+              events.push(event as { type: string; properties: Record<string, unknown> })
+            }
+          }),
+        ),
+      )
+      const offHook = await AppRuntime.runPromise(
+        Hook.Service.use((svc) =>
+          svc.register({
+            name: "deny-question",
+            run: () =>
+              Effect.succeed(
+                HookResultSuccess({
+                  decision_behavior: "deny",
+                  decision_message: "deny",
+                }),
+              ),
+          }),
+        ),
+      )
+
+      try {
+        await expect(
+          ask({
+            sessionID: SessionID.make("ses_hook_deny"),
+            tool: { messageID: MessageID.make("msg_2"), callID: "call_2" },
+            questions: [
+              {
+                question: "Proceed?",
+                header: "Proceed",
+                options: [{ label: "Allow", description: "approve" }],
+              },
+            ],
+          }),
+        ).rejects.toBeInstanceOf(Question.RejectedError)
+
+        expect(await list()).toHaveLength(0)
+        expect(events.map((event) => event.type)).toEqual(["question.asked", "question.rejected"])
+      } finally {
+        offHook()
+        offBus()
+      }
+    },
+  })
 })

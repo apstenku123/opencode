@@ -35,6 +35,7 @@ import { SessionAutosteerObserver } from "@/session/autosteer-observer"
 import { AdaptiveHooks } from "@/session/adaptive"
 import * as Hook from "@/hook"
 import { SubagentRegistry } from "@/subagent/registry"
+import { TimerSvc } from "@/server/instance/timer"
 import { SessionMemoryObserver } from "@/session/memory-observer"
 import { defaultLayer as MemoryDefaultLayer } from "@/memory"
 import { Instruction } from "@/session/instruction"
@@ -55,10 +56,14 @@ import { ShareNext } from "@/share"
 import { SessionShare } from "@/share"
 import { Npm } from "@opencode-ai/shared/npm"
 
+const SharedInteractionLayer = Layer.mergeAll(Bus.defaultLayer, Hook.defaultLayer)
+const QuestionAppLayer = Layer.provide(Question.layer, SharedInteractionLayer)
+const PermissionAppLayer = Layer.provide(Permission.layer, SharedInteractionLayer)
+
 export const AppLayer = Layer.mergeAll(
   Npm.defaultLayer,
   AppFileSystem.defaultLayer,
-  Bus.defaultLayer,
+  SharedInteractionLayer,
   Auth.defaultLayer,
   Account.defaultLayer,
   Config.defaultLayer,
@@ -75,8 +80,8 @@ export const AppLayer = Layer.mergeAll(
   Agent.defaultLayer,
   Skill.defaultLayer,
   Discovery.defaultLayer,
-  Question.defaultLayer,
-  Permission.defaultLayer,
+  QuestionAppLayer,
+  PermissionAppLayer,
   Todo.defaultLayer,
   Session.defaultLayer,
   SessionStatus.defaultLayer,
@@ -88,7 +93,7 @@ export const AppLayer = Layer.mergeAll(
   SessionPrompt.defaultLayer,
   SessionAutosteerObserver.defaultLayer,
   SubagentRegistry.defaultLayer,
-  Hook.defaultLayer,
+  TimerSvc.defaultLayer,
   SessionMemoryObserver.defaultLayer,
   MemoryDefaultLayer,
   Instruction.defaultLayer,

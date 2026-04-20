@@ -97,7 +97,7 @@ The R1 plan projected these as "🔴 entirely absent". The current `unify/copilo
 
 The original R1 roadmap's Phases 0-5 are therefore **largely complete** for the Copilot + adaptive + memory + skill axes. Phases 6 (full AccountPool + SQLite), 7 (async sub-agents + guardian + hooks), 8 (memory passive extraction + consolidation), 9 (foreign ingest), and 10 (polish) are the residuals.
 
-Concretely: of the original R1 Phase-7 triplet *{async sub-agents, guardian, hooks}*, the registry+guardian exist in stub form. **Hooks do not exist at all beyond `stopHooks`.** The `multi_agents` model-facing tool family exposing the registry also does not exist. These are the two biggest open items from R1-scope work.
+Concretely: of the original R1 Phase-7 triplet *{async sub-agents, guardian, hooks}*, the registry+guardian exist in partial form and the model-facing `task*` tool family now covers the core subagent lifecycle. Hook parity is still incomplete beyond the newer stop/pre/post tool surfaces, but it is no longer accurate to describe hooks as absent.
 
 ---
 

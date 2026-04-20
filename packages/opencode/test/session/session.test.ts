@@ -7,6 +7,7 @@ import { Instance } from "../../src/project/instance"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, type SessionID } from "../../src/session/schema"
 import { AppRuntime } from "../../src/effect/app-runtime"
+import { WorkspaceID } from "../../src/control-plane/schema"
 import { tmpdir } from "../fixture/fixture"
 
 const projectRoot = path.join(__dirname, "../..")
@@ -159,6 +160,20 @@ describe("step-finish token propagation via Bus event", () => {
 })
 
 describe("Session", () => {
+  test("create honors explicit workspaceID input", async () => {
+    await using tmp = await tmpdir({ git: true })
+
+    const info = await Instance.provide({
+      directory: tmp.path,
+      fn: () => create({ title: "explicit-workspace", workspaceID: WorkspaceID.make("ws-explicit") }),
+    })
+
+    expect(info.workspaceID).toBe(WorkspaceID.make("ws-explicit"))
+    expect((await get(info.id)).workspaceID).toBe(WorkspaceID.make("ws-explicit"))
+
+    await remove(info.id)
+  })
+
   test("remove works without an instance", async () => {
     await using tmp = await tmpdir({ git: true })
 

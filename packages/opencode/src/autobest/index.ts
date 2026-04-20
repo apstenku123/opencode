@@ -153,6 +153,7 @@ export function setActive(state: State, input: { key: string; source?: Pick["sou
     ts: input.ts ?? Date.now(),
   } satisfies Pick
   return {
+    ...state,
     active: next,
     picks: [...state.picks, next],
   } satisfies State

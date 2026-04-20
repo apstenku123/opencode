@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import re
+import contextlib
 import threading
 import time
 from typing import Any, Optional
@@ -185,6 +186,20 @@ def run_sgr_turn(
 
     turn_error: list[BaseException] = []
     turn_done = threading.Event()
+    baseline_assistant_ids = set[str]()
+    try:
+        existing = client.get_messages(thread_id)
+    except Exception:
+        existing = []
+    if isinstance(existing, list):
+        baseline_assistant_ids = {
+            str(message.get("id"))
+            for message in existing
+            if isinstance(message, dict)
+            and isinstance(message.get("info"), dict)
+            and message["info"].get("role") == "assistant"
+            and message.get("id") is not None
+        }
 
     # Dedicated client for the long-held driver connection.
     driver_client = OpencodeClient(
@@ -216,6 +231,23 @@ def run_sgr_turn(
     )
     worker.start()
 
+    def _scan_messages(messages: Any) -> tuple[Optional[Any], Optional[dict[str, Any]]]:
+        if not isinstance(messages, list):
+            return None, None
+        latest_assistant: Optional[dict[str, Any]] = None
+        for message in messages:
+            info = message.get("info") or {}
+            if not isinstance(info, dict) or info.get("role") != "assistant":
+                continue
+            latest_assistant = message
+            message_id = message.get("id")
+            if message_id is not None and str(message_id) in baseline_assistant_ids:
+                continue
+            structured = info.get("structured")
+            if structured is not None:
+                return structured, message
+        return None, latest_assistant
+
     deadline = time.monotonic() + poll_timeout_s
     last_assistant: Optional[dict[str, Any]] = None
     while time.monotonic() < deadline:
@@ -224,17 +256,11 @@ def run_sgr_turn(
         except (httpx.HTTPError, Exception):
             time.sleep(poll_interval_s)
             continue
-        if isinstance(messages, list):
-            for m in messages:
-                info = m.get("info") or {}
-                if not isinstance(info, dict):
-                    continue
-                if info.get("role") != "assistant":
-                    continue
-                last_assistant = m
-                structured = info.get("structured")
-                if structured is not None:
-                    return structured, m
+        structured, matching_message = _scan_messages(messages)
+        if matching_message is not None:
+            last_assistant = matching_message
+        if structured is not None and matching_message is not None:
+            return structured, matching_message
         if turn_done.is_set():
             # Final scan in case structured landed between the last
             # GET and the driver's final write.
@@ -242,19 +268,21 @@ def run_sgr_turn(
                 messages = client.get_messages(thread_id)
             except Exception:
                 messages = []
-            if isinstance(messages, list):
-                for m in messages:
-                    info = m.get("info") or {}
-                    if isinstance(info, dict) and info.get("role") == "assistant":
-                        last_assistant = m
-                        structured = info.get("structured")
-                        if structured is not None:
-                            return structured, m
+            structured, matching_message = _scan_messages(messages)
+            if matching_message is not None:
+                last_assistant = matching_message
+            if structured is not None and matching_message is not None:
+                return structured, matching_message
             if last_assistant is None and turn_error:
                 raise turn_error[0]
             return None, last_assistant
         time.sleep(poll_interval_s)
 
+    driver_client.close()
+    worker.join(timeout=5.0)
+    if worker.is_alive():
+        with contextlib.suppress(Exception):
+            worker.join(timeout=0.1)
     return None, last_assistant
 
 

@@ -301,6 +301,10 @@ export async function raceFetch<T>(
   const inFlight: InFlight[] = []
   const errors: Error[] = []
   let spawnedCount = 0
+  const isHealthy = (value: T) => {
+    if (value instanceof Response) return value.ok
+    return true
+  }
 
   const spawn = (index: number): InFlight => {
     const attempt = index + 1
@@ -418,6 +422,16 @@ export async function raceFetch<T>(
       // An in-flight attempt settled.
       if (outcome.r.kind === "ok") {
         const { attempt, value } = outcome.r
+        if (!isHealthy(value)) {
+          const error = new Error(
+            value instanceof Response
+              ? `retry-race unhealthy response: ${value.status}`
+              : "retry-race unhealthy response",
+          )
+          errors.push(error)
+          emit({ type: "failed", attempt, error })
+          continue
+        }
         emit({ type: "firstByte", attempt })
         emit({ type: "succeeded", attempt })
         cancelAll("raced-sibling-won", attempt)

@@ -88,4 +88,118 @@ describe("thread request compat", () => {
       },
     })
   })
+
+  test("request_user_input reply alias rejects malformed answers payload", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const app = Server.Default().app
+    const headers = { "content-type": "application/json", "x-opencode-directory": tmp.path }
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const pending = AppRuntime.runPromise(
+          Question.Service.use((svc) =>
+            svc.ask({
+              sessionID: SessionID.make("ses_q_bad"),
+              questions: [
+                {
+                  question: "Pick one",
+                  header: "Choice",
+                  options: [{ label: "A", description: "alpha" }],
+                },
+              ],
+            }),
+          ),
+        )
+
+        const list = await app.request(`/thread/${SessionID.make("ses_q_bad")}/request_user_input`, { headers })
+        expect(list.status).toBe(200)
+        const items = (await list.json()) as any[]
+        expect(items).toHaveLength(1)
+
+        const reply = await app.request(
+          `/thread/${SessionID.make("ses_q_bad")}/request_user_input/${items[0].id}/reply`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ answers: ["A"] }),
+          },
+        )
+        expect(reply.status).toBe(400)
+
+        const stillPending = await app.request(`/thread/${SessionID.make("ses_q_bad")}/request_user_input`, { headers })
+        expect(stillPending.status).toBe(200)
+        expect(await stillPending.json()).toHaveLength(1)
+
+        const cleanup = await app.request(
+          `/thread/${SessionID.make("ses_q_bad")}/request_user_input/${items[0].id}/reply`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ answers: [["A"]] }),
+          },
+        )
+        expect(cleanup.status).toBe(200)
+        expect(await pending).toEqual([["A"]])
+      },
+    })
+  })
+
+  test("request_user_input reply alias ignores mismatched thread path and unknown request id", async () => {
+    await using tmp = await tmpdir({ git: true })
+    const app = Server.Default().app
+    const headers = { "content-type": "application/json", "x-opencode-directory": tmp.path }
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const pending = AppRuntime.runPromise(
+          Question.Service.use((svc) =>
+            svc.ask({
+              sessionID: SessionID.make("ses_real"),
+              questions: [
+                {
+                  question: "Pick one",
+                  header: "Choice",
+                  options: [{ label: "A", description: "alpha" }],
+                },
+              ],
+            }),
+          ),
+        )
+
+        const list = await app.request(`/thread/${SessionID.make("ses_real")}/request_user_input`, { headers })
+        expect(list.status).toBe(200)
+        const items = (await list.json()) as any[]
+        expect(items).toHaveLength(1)
+
+        const miss = await app.request(
+          `/thread/${SessionID.make("ses_other")}/request_user_input/not-a-real-request/reply`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ answers: [["A"]] }),
+          },
+        )
+        expect(miss.status).toBe(200)
+        expect(await miss.json()).toBe(true)
+
+        const stillPending = await app.request(`/thread/${SessionID.make("ses_real")}/request_user_input`, { headers })
+        expect(stillPending.status).toBe(200)
+        expect(await stillPending.json()).toHaveLength(1)
+
+        const reply = await app.request(
+          `/thread/${SessionID.make("ses_other")}/request_user_input/${items[0].id}/reply`,
+          {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ answers: [["A"]] }),
+          },
+        )
+        expect(reply.status).toBe(200)
+        expect(await reply.json()).toBe(true)
+        expect(await pending).toEqual([["A"]])
+      },
+    })
+  })
 })

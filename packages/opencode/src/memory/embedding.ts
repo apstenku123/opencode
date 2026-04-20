@@ -22,7 +22,11 @@
  */
 
 import { Context, Effect, Layer } from "effect"
-import { hashEmbedding as sharedHashEmbedding } from "../embedding"
+import {
+  EmbeddingService as SharedEmbeddingService,
+  autoEmbeddingLayer as sharedAutoEmbeddingLayer,
+  hashEmbedding as sharedHashEmbedding,
+} from "../embedding"
 import { makeImpl as makeOpenAIImpl, type OpenAICompatConfig as SharedOpenAICompatConfig } from "../embedding/openai"
 import { MemoryEmbeddingError } from "./schema"
 
@@ -91,6 +95,33 @@ export function mockLayer(options?: {
     embedBatch: (texts) => Effect.sync(() => texts.map((t) => embed(t))),
   }
   return Layer.succeed(EmbeddingService, impl)
+}
+
+export function autoEmbeddingLayer(options?: {
+  apiConfig?: OpenAICompatConfig
+  localVocabSize?: number
+}): Layer.Layer<EmbeddingService | SharedEmbeddingService> {
+  const shared = sharedAutoEmbeddingLayer(options)
+  const adapted = Layer.provide(
+    Layer.effect(
+      EmbeddingService,
+      Effect.gen(function* () {
+        const service = yield* SharedEmbeddingService
+        return {
+          embed: (text) =>
+            service.embed(text).pipe(
+              Effect.mapError((e) => new MemoryEmbeddingError({ message: e.message, cause: e.cause })),
+            ),
+          embedBatch: (texts) =>
+            service.embedBatch(texts).pipe(
+              Effect.mapError((e) => new MemoryEmbeddingError({ message: e.message, cause: e.cause })),
+            ),
+        }
+      }),
+    ),
+    shared,
+  )
+  return Layer.mergeAll(shared, adapted)
 }
 
 /** Re-export so existing `import { hashEmbedding } from "…/memory/embedding"` keeps working. */

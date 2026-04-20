@@ -90,16 +90,10 @@ def _tool_parts(msg: dict[str, Any], name: str) -> list[dict[str, Any]]:
 # JSON object, and the server validates it before writing to
 # ``info.structured``.
 #
-# Limitation: SGR constrains the model to a single ``StructuredOutput``
-# tool call. It does NOT translate the structured payload into a
-# downstream ``task`` tool invocation — that would require a server
-# plumb from ``info.structured`` through the real tool dispatch, which
-# doesn't exist today. These SGR tests therefore validate the
-# *upstream* deterministic contract: we can reliably extract a
-# schema-valid ``{subagent_type, description, prompt, async}``
-# payload from the model. A follow-up PR could wire the dispatcher
-# to auto-invoke ``task`` when ``info.structured`` matches the
-# TaskInvocationPlan shape.
+# SGR dispatch in this suite already exercises the downstream ``task``
+# tool family. The remaining gaps are chained lifecycle assertions
+# (`task_wait` / `task_send_input` / `task_close`) and guardian-forward
+# observability, which these tests tighten below.
 #
 # These tests share the SGR server infrastructure pattern with
 # ``test_autobest.py`` (per-test isolated-home + github-copilot SGR
@@ -114,7 +108,7 @@ def _subagent_sgr_binary() -> str:
     name so these tests don't collide with those suites if run in
     parallel.
     """
-    src = os.environ.get("OPENCODE_BINARY") or "/Users/dave/.local/bin/opencode-unify"
+    src = os.environ.get("OPENCODE_BINARY") or "/Users/dave/.local/bin/opencode"
     dst = "/tmp/opencode-sgr-subagent"
     try:
         real_src = os.path.realpath(src)
@@ -572,10 +566,79 @@ def _spawn_child_via_sgr(
     if not children:
         pytest.skip(
             "SGR auto-dispatch produced no child session - check that "
-            "the opencode-unify binary on disk contains the auto-dispatch "
+            "the opencode binary on disk contains the auto-dispatch "
             "plumbing (commit 3830bf2ef or later)."
         )
     return children[0]["id"], plan, thread_id_out
+
+
+def _wait_for_child_status(
+    client: OpencodeClient,
+    parent_id: str,
+    child_id: str,
+    *,
+    statuses: tuple[str, ...],
+    timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        for child in client.get_session_children(parent_id):
+            if child.get("sessionID") == child_id or child.get("id") == child_id:
+                last = child
+                if child.get("status") in statuses:
+                    return child
+        time.sleep(0.25)
+    pytest.fail(
+        f"child {child_id} under parent {parent_id} never reached status {statuses}; last={last!r}"
+    )
+
+
+def _wait_for_child_removed(
+    client: OpencodeClient,
+    parent_id: str,
+    child_id: str,
+    *,
+    timeout_s: float = 15.0,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        rows = client.get_session_children(parent_id)
+        if not any((row.get("sessionID") or row.get("id")) == child_id for row in rows):
+            return
+        time.sleep(0.25)
+    pytest.fail(f"child {child_id} still present under parent {parent_id} after close")
+
+
+def _wait_for_synthetic_subagent_results(
+    client: OpencodeClient,
+    thread_id: str,
+    *,
+    contains: Optional[str] = None,
+    timeout_s: float = 45.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_s
+    last_user: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        for message in client.get_messages(thread_id):
+            info = message.get("info") or {}
+            if info.get("role") != "user":
+                continue
+            for part in message.get("parts") or []:
+                text = part.get("text") or ""
+                if part.get("type") != "text" or part.get("synthetic") is not True:
+                    continue
+                if not text.startswith("[Sub-agent results]"):
+                    continue
+                if contains and contains not in text:
+                    last_user = message
+                    continue
+                return message
+        time.sleep(0.25)
+    pytest.fail(
+        f"synthetic [Sub-agent results] message never landed on parent {thread_id}; "
+        f"last synthetic user={last_user!r}"
+    )
 
 
 def _assert_sgr_task_dispatch_not_prompt_ops_error(
@@ -697,7 +760,7 @@ def test_task_wait_blocks_until_complete_sgr(
     subagent_sgr_client: OpencodeClient,
     subagent_sgr_model: dict[str, str],
 ) -> None:
-    """4. After a spawn, the child session has its own message log + time record."""
+    """4. ``task_wait`` resolves once the spawned child records a completed summary."""
     child_id, _plan, thread_id = _spawn_child_via_sgr(
         subagent_sgr_client,
         subagent_sgr_model,
@@ -707,11 +770,46 @@ def test_task_wait_blocks_until_complete_sgr(
         ),
         async_=True,
     )
-    child = subagent_sgr_client.get_session(child_id)
-    assert child["id"] == child_id
-    assert child.get("parentID") == thread_id
+    wait_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "ids": {
+                "type": "array",
+                "items": {"type": "string", "enum": [child_id]},
+                "minItems": 1,
+                "maxItems": 1,
+            }
+        },
+        "required": ["ids"],
+        "additionalProperties": False,
+        "x-opencode-dispatch": {"tool": "task_wait"},
+    }
+
+    class _WaitPlan(BaseModel):
+        ids: list[str]
+
+    wait_plan, _msg, wait_thread_id = _run_sgr_with_retry(
+        attempts=1,
+        client=subagent_sgr_client,
+        model=subagent_sgr_model,
+        prompt=f"Plan a task_wait call for child {child_id} only.",
+        pydantic_model=_WaitPlan,
+        schema_overrides=wait_schema,
+        thread_id=thread_id,
+        poll_timeout_s=120.0,
+    )
+    assert wait_thread_id == thread_id
+    assert wait_plan.ids == [child_id]
+    row = _wait_for_child_status(
+        subagent_sgr_client,
+        thread_id,
+        child_id,
+        statuses=("completed",),
+        timeout_s=45.0,
+    )
+    assert row.get("result")
     msgs = subagent_sgr_client.get_messages(child_id)
-    assert isinstance(msgs, list)
+    assert isinstance(msgs, list) and msgs
 
 
 @pytest.mark.live
@@ -720,27 +818,7 @@ def test_task_send_input_injects_message_sgr(
     subagent_sgr_client: OpencodeClient,
     subagent_sgr_model: dict[str, str],
 ) -> None:
-    """5. After spawn, `task_send_input` auto-dispatch appends a user message.
-
-    ``task_send_input`` does NOT require ``promptOps`` (see
-    ``src/tool/task-send-input.ts``), so its SGR auto-dispatch can execute
-    cleanly. But there's a scope tension: ``task-send-input.ts:40`` looks
-    up the child via ``SubagentRegistry.active(ctx.sessionID)`` - which
-    requires the dispatch to run on the *same* session that spawned the
-    child. When we try that here we hit schema-context leakage - the
-    model's attention window still has the prior task-spawn plan, so the
-    second SGR turn re-emits the task schema shape and pydantic rejects it.
-
-    Conflict: same-thread -> schema leakage; fresh-thread -> "not
-    registered under this parent".
-
-    We drive the spawn via SGR (deterministic), then invoke
-    ``task_send_input`` through the dedicated HTTP path - the assertion
-    (a user text part lands on the child) is unaffected by which HTTP
-    entry point registered the dispatch. This preserves the test's
-    original intent while decoupling from the SGR-on-same-thread quirk
-    that makes chained tool-plans unreliable today.
-    """
+    """5. ``task_send_input`` appends a user message to the active child via SGR."""
     child_id, _plan, thread_id = _spawn_child_via_sgr(
         subagent_sgr_client,
         subagent_sgr_model,
@@ -751,28 +829,34 @@ def test_task_send_input_injects_message_sgr(
         async_=True,
     )
 
-    # Directly exercise task_send_input via its HTTP surface - no second
-    # SGR turn needed. This still validates the auto-dispatch primitive
-    # (spawn registered the child + dispatch machinery + registry lookup)
-    # plus the downstream session.appendUserText effect.
-    append_resp = subagent_sgr_client._http.post(
-        f"/session/{child_id}/message",
-        json={
-            "parts": [{"type": "text", "text": "SECRET_TOKEN continue"}],
-            "agent": "build",
-            "noReply": True,
+    send_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "enum": [child_id]},
+            "input": {"type": "string", "enum": ["SECRET_TOKEN continue"]},
         },
-        timeout=30.0,
+        "required": ["session_id", "input"],
+        "additionalProperties": False,
+        "x-opencode-dispatch": {"tool": "task_send_input"},
+    }
+
+    class _SendInputPlan(BaseModel):
+        session_id: str
+        input: str
+
+    send_plan, _msg, send_thread_id = _run_sgr_with_retry(
+        attempts=1,
+        client=subagent_sgr_client,
+        model=subagent_sgr_model,
+        prompt=f"Plan a task_send_input call for child {child_id} with SECRET_TOKEN continue.",
+        pydantic_model=_SendInputPlan,
+        schema_overrides=send_schema,
+        thread_id=thread_id,
+        poll_timeout_s=120.0,
     )
-    # POST /session/:id/message returns 200 + an assistant placeholder
-    # envelope; we only need to confirm the write landed.
-    if append_resp.status_code == 404:
-        pytest.skip(
-            f"child session {child_id} no longer addressable for send_input "
-            f"(status {append_resp.status_code}); likely cancelled by the "
-            "task tool's missing promptOps error path."
-        )
-    append_resp.raise_for_status()
+    assert send_thread_id == thread_id
+    assert send_plan.session_id == child_id
+    assert send_plan.input == "SECRET_TOKEN continue"
 
     deadline = time.monotonic() + 15.0
     seen = False
@@ -801,10 +885,7 @@ def test_task_close_cancels_child_sgr(
     subagent_sgr_client: OpencodeClient,
     subagent_sgr_model: dict[str, str],
 ) -> None:
-    """6. After spawn, `task_close` auto-dispatch drops the child's active state.
-
-    ``task_close`` does NOT require ``promptOps`` so it dispatches cleanly.
-    """
+    """6. ``task_close`` records a cancelled summary and removes the active child."""
     child_id, _plan, thread_id = _spawn_child_via_sgr(
         subagent_sgr_client,
         subagent_sgr_model,
@@ -843,8 +924,15 @@ def test_task_close_cancels_child_sgr(
         schema_overrides=close_schema,
         poll_timeout_s=60.0,
     )
-    child = subagent_sgr_client.get_session(child_id)
-    assert child["id"] == child_id
+    row = _wait_for_child_status(
+        subagent_sgr_client,
+        thread_id,
+        child_id,
+        statuses=("cancelled",),
+        timeout_s=30.0,
+    )
+    assert row.get("status") == "cancelled"
+    _wait_for_child_removed(subagent_sgr_client, thread_id, child_id, timeout_s=15.0)
 
 
 @pytest.mark.live
@@ -914,15 +1002,13 @@ def test_auto_wait_for_active_children_sgr(
     subagent_sgr_client: OpencodeClient,
     subagent_sgr_model: dict[str, str],
 ) -> None:
-    """9. SGR auto-dispatch task spawn registers child under parent.
+    """9. Parent pre-break auto-wait injects the real synthetic summary.
 
-    Legacy test observed the ``[Sub-agent results]`` synthetic user
-    message injected by the preBreak observer - that feature requires
-    the child's own prompt loop to land summaries, which in turn needs
-    ``promptOps`` in the auto-dispatch context (currently missing -
-    see module docstring). Until that wiring lands, we assert the
-    first half of the contract: ``task`` auto-dispatch creates the child
-    + registers it under the parent.
+    This closes the remaining narrow lifecycle gap after the promptOps
+    wiring fix: an async SGR-dispatched child should finish, the parent
+    turn should rendezvous at pre-break, and the real
+    ``subagent:auto-wait`` observer should append a synthetic user turn
+    starting with ``[Sub-agent results]``.
     """
     child_id, plan, thread_id = _spawn_child_via_sgr(
         subagent_sgr_client,
@@ -934,8 +1020,23 @@ def test_auto_wait_for_active_children_sgr(
         async_=True,
     )
     assert plan.async_ is True
-    children = subagent_sgr_client.get_session_children(thread_id)
-    assert any(c["id"] == child_id for c in children), children
+    row = _wait_for_child_status(
+        subagent_sgr_client,
+        thread_id,
+        child_id,
+        statuses=("completed",),
+        timeout_s=45.0,
+    )
+    assert row.get("result")
+    injected = _wait_for_synthetic_subagent_results(
+        subagent_sgr_client,
+        thread_id,
+        contains=child_id,
+        timeout_s=45.0,
+    )
+    parts = [p for p in injected.get("parts") or [] if p.get("type") == "text"]
+    assert any(p.get("synthetic") is True for p in parts), injected
+    assert any(child_id in (p.get("text") or "") for p in parts), injected
 
 
 @pytest.mark.live
@@ -1008,14 +1109,7 @@ def test_guardian_forwards_when_no_rule_sgr(
     subagent_sgr_client: OpencodeClient,
     subagent_sgr_model: dict[str, str],
 ) -> None:
-    """11. Parent with ``{task,pattern:'*',action:'ask'}`` makes spawn go through
-    permission ask - SGR still captures the payload regardless.
-
-    The legacy test drove a child bash call - reliably flaky. We assert
-    only the deterministic half: SGR captures the schema-valid payload
-    and the spawn attempt is recorded. The permission layer's downstream
-    behaviour (forward vs deny) is covered by unit tests.
-    """
+    """11. Guardian ask policy forwards the child permission request to the parent."""
     parent_resp = subagent_sgr_client._http.post(
         "/session",
         json={
@@ -1028,6 +1122,22 @@ def test_guardian_forwards_when_no_rule_sgr(
     parent_resp.raise_for_status()
     parent_id = parent_resp.json()["id"]
 
+    forwarded: list[dict[str, Any]] = []
+    stop_flag = threading.Event()
+
+    def _watch() -> None:
+        try:
+            with subagent_sgr_client.events(timeout_s=30.0) as stream:
+                for ev in stream:
+                    if "forwarded_to_parent" in ev.type:
+                        forwarded.append({"type": ev.type, "props": ev.properties})
+                    if stop_flag.is_set():
+                        return
+        except Exception:
+            return
+
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
     schema = _task_dispatch_schema(async_=False)
     # Retry only once because ``thread_id`` is pinned to the permission-
     # carrying parent session — replaying on a fresh thread would lose the
@@ -1046,6 +1156,15 @@ def test_guardian_forwards_when_no_rule_sgr(
         thread_id=parent_id,
         poll_timeout_s=180.0,
     )
-    assert plan.subagent_type == "general"
-    children = subagent_sgr_client.get_session_children(parent_id)
-    assert isinstance(children, list)
+    try:
+        assert plan.subagent_type == "general"
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and not forwarded:
+            time.sleep(0.25)
+    finally:
+        stop_flag.set()
+        watcher.join(timeout=2.0)
+    assert forwarded, "guardian ask policy did not emit forwarded_to_parent"
+    assert any(
+        parent_id in json.dumps(item.get("props") or {}) for item in forwarded
+    ), forwarded

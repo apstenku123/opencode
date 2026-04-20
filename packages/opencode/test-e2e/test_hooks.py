@@ -1748,9 +1748,10 @@ def test_permission_granted_source_hook(
 # service) and is out of scope for these tests.
 #
 # These SGR tests therefore validate the deterministic upstream
-# contract that a PreToolUse/PostToolUse rewrite path could rely on:
-# given a ``BashPlan`` schema, the server + pydantic reliably
-# produce a validated bash-command payload.
+# contract that the hook rewrite surfaces rely on today: given a
+# ``BashPlan`` or rewrite schema, the server + pydantic reliably
+# produce a validated payload that downstream hook/tool execution can
+# consume once dispatched.
 #
 # Documentation gap for opencode itself
 # -------------------------------------
@@ -1922,8 +1923,7 @@ def test_hooks_sgr_bash_plan_has_required_fields(
         3. ``instance.description.strip()`` is truthy.
 
     These three are the minimum preconditions that the bash tool
-    (and therefore PreToolUse/PostToolUse hooks, once tool
-    dispatch from ``info.structured`` exists) would need.
+    and the hook rewrite pipeline need before dispatch.
     """
     instance, _msg, _thread_id = run_sgr_or_skip(
         hooks_sgr_client,

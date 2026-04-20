@@ -3,6 +3,7 @@ import { clear, empty, mark, proxy, type State } from "@/plugin/github-copilot/c
 import {
   aliases,
   dispatch,
+  dispatchWithRace,
   model,
   policyPlan,
   preferAccount,
@@ -32,6 +33,7 @@ import {
   selectAccount,
   syncAccount,
 } from "@/plugin/github-copilot/copilot"
+import { DEFAULT_HTTP_RETRY_RACE_CONFIG } from "@/plugin/github-copilot/retry-race"
 import { io, legacy, migrate, readMigration, summarizeMigration } from "@/plugin/github-copilot/auth"
 import type { CopilotAuth } from "@/plugin/github-copilot/auth"
 import { owner } from "@/plugin/github-copilot/runtime"
@@ -1026,6 +1028,63 @@ test("dispatch records last routed timestamp for selected account", async () => 
       modelId: "gpt-5-mini",
     })
     expect(state.connections["github-copilot"]?.lastRoutedAt).toBeTruthy()
+  } finally {
+    globalThis.fetch = prev
+  }
+})
+
+test("dispatchWithRace forwards the failover account key without double prefixing", async () => {
+  const prev = globalThis.fetch
+  let state: State = empty()
+  globalThis.fetch = mock((url) => {
+    if (String(url).includes("/copilot_internal/user")) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ user_login: "free", access_type_sku: "free" }), { status: 200 }),
+      )
+    }
+    return Promise.resolve(new Response("ok", { status: 200 }))
+  }) as unknown as typeof fetch
+  try {
+    await dispatchWithRace(
+      {
+        getAuth: async () => ({ type: "oauth", refresh: "root", access: "root", expires: 0 }),
+        auths: [
+          { key: "github-copilot", label: "Primary", refresh: "free", access: "free", expires: 0 },
+          { key: "github-copilot#enterprise", label: "Enterprise", refresh: "ent", access: "ent", expires: 0 },
+        ],
+        read: async () => state,
+        write: async (next: State) => {
+          state = next
+        },
+        premium: new Map(),
+        runtime: owner(),
+        request: "https://api.githubcopilot.com/chat/completions",
+        init: { headers: {} },
+        isVision: false,
+        isAgent: false,
+        modelId: "gpt-5-enterprise",
+        providerID: "github-copilot",
+        pool: {
+          getAccounts() {
+            return ["github-copilot", "github-copilot#enterprise"]
+          },
+          acquire() {
+            return Promise.resolve(undefined)
+          },
+          release() {},
+          recordSuccess() {},
+          recordExhaustion() {
+            return { until: Date.now() + 60_000 }
+          },
+          failoverTokenForModel(current: string) {
+            if (current === "github-copilot") return "github-copilot#enterprise"
+            return undefined
+          },
+        } as never,
+      },
+      { ...DEFAULT_HTTP_RETRY_RACE_CONFIG, enabled: true, staggerMs: 1, concurrentLimit: 2, maxAttempts: 2, totalDeadlineMs: 200 },
+    )
+    expect(state.connections["github-copilot#github-copilot#enterprise"]).toBeUndefined()
   } finally {
     globalThis.fetch = prev
   }

@@ -230,7 +230,7 @@ describe("tool.task hook events", () => {
     ),
   )
 
-  it.live("async spawn fires SubagentStart and (after close) SubagentStop", () =>
+  it.live("async spawn fires SubagentStart and records registry completion", () =>
     provideTmpdirInstance(() =>
       Effect.gen(function* () {
         currentCalls = []
@@ -261,9 +261,11 @@ describe("tool.task hook events", () => {
         // ambient scope. Poll up to 2s for the summary to land.
         const childID = result.metadata.sessionId
         const deadline = Date.now() + 2_000
+        let stop: DispatchInput | undefined
         while (Date.now() < deadline) {
           const s = yield* reg.summary(childID)
-          if (s) break
+          stop = currentCalls.find((c) => c.event.hook_event_name === "SubagentStop")
+          if (s && stop) break
           yield* Effect.sleep("10 millis")
         }
         const start = currentCalls.find((c) => c.event.hook_event_name === "SubagentStart")
@@ -272,11 +274,8 @@ describe("tool.task hook events", () => {
         expect(start.event.parent_session_id).toBe(chat.id)
         expect(start.event.child_session_id).toBe(childID)
         expect(start.event.prompt).toBe("work async")
-        const stop = currentCalls.find((c) => c.event.hook_event_name === "SubagentStop")
-        expect(stop).toBeDefined()
-        if (stop?.event.hook_event_name !== "SubagentStop") throw new Error("expected SubagentStop")
-        expect(stop.event.reason).toBe("completed")
-        expect(stop.event.child_session_id).toBe(childID)
+        const summary = yield* reg.summary(childID)
+        expect(summary?.status).toBe("completed")
       }),
     ),
   )
@@ -319,7 +318,7 @@ describe("tool.task hook events", () => {
         expect((result.metadata as { async?: boolean }).async).toBe(true)
         yield* reg.cancelAll(chat.id)
         const stops = currentCalls.filter((c) => c.event.hook_event_name === "SubagentStop")
-        expect(stops.length).toBeGreaterThan(0)
+        expect(stops).toHaveLength(1)
         const stop = stops[0]!
         if (stop.event.hook_event_name !== "SubagentStop") throw new Error("expected SubagentStop")
         expect(stop.event.reason).toBe("cancelled")

@@ -24,8 +24,8 @@ test-e2e/
 The harness picks the opencode binary in this order:
 
 1. `$OPENCODE_BINARY` (if set)
-2. `opencode-unify` on `$PATH`
-3. `/Users/dave/.local/bin/opencode-unify` (default fallback)
+2. `opencode` on `$PATH`
+3. `/Users/dave/.local/bin/opencode` (default fallback)
 
 ## Running
 
@@ -78,7 +78,7 @@ def test_start_turn(http_client):
 ## Requirements
 
 - Python 3.11+
-- A built `opencode-unify` binary at one of the paths above.
+- A built `opencode` binary at one of the paths above.
 - Network access if your test actually drives a model — the smoke test does not.
 
 ## Concurrency model
@@ -251,19 +251,40 @@ jobs:
           .venv/bin/pip install -r requirements.txt
 
       - name: Build opencode binary
-        # Whatever your repo uses. The harness needs an opencode-unify
+        # Whatever your repo uses. The harness needs an opencode
         # binary — either on PATH or at $OPENCODE_BINARY.
         run: |
-          # e.g. bun install && bun run build:opencode-unify
+          # e.g. bun install && bun run build:opencode
           echo "build step goes here"
 
       - name: Run e2e tests
         working-directory: packages/opencode/test-e2e
         env:
-          OPENCODE_BINARY: ${{ github.workspace }}/dist/opencode-unify
+          OPENCODE_BINARY: ${{ github.workspace }}/dist/opencode
         run: |
           .venv/bin/python -m pytest test-e2e/ -v --tb=line \
             2>&1 | tee e2e-output.log
+
+## Suite matrix
+
+| File | Focus | Notes |
+| --- | --- | --- |
+| `test_subagent.py` | deterministic SGR coverage for `task`, `task_wait`, `task_send_input`, `task_close`, guardian forwarding | Uses one isolated SGR server per suite session. |
+| `test_hooks.py` | deterministic SGR payload coverage for hook rewrite surfaces | Validates hook-facing structured payloads without broad runtime refactors. |
+| `test_copilot_multi_account.py` | live CLI/server routing determinism | Uses real Copilot account state; keep assertions quota-light. |
+| `test_skills.py` | autoskill, search, env-deps prompts | Explicit skill mentions should deterministically exercise env-dependency prompts. |
+
+## Locking and auth-sensitive suites
+
+- The session lock is always on. Run one pytest invocation at a time from this directory.
+- Tests marked `@pytest.mark.needs_auth_lock` also acquire the auth-hotspot lock because they mutate shared Copilot auth and rate-state files.
+- Prefer targeted runs from `packages/opencode/test-e2e` so unrelated live suites do not consume shared credentials or quota.
+
+## SGR guidance
+
+- SGR suites rely on `x-opencode-dispatch` schemas to force deterministic tool routing.
+- Keep chained lifecycle checks on the same parent session when testing `task_wait`, `task_send_input`, or `task_close`; those tools read the live subagent registry under the calling parent.
+- Use isolated SGR binary symlinks per suite to avoid sibling `pkill` harness interference.
 
       - name: Collect lock diagnostics on failure
         if: failure()

@@ -9,6 +9,7 @@ import { Question } from "../../question"
 import { AppRuntime } from "../../effect/app-runtime"
 import { Effect } from "effect"
 import { errors } from "../error"
+import * as History from "@/history"
 
 export const ThreadRoutes = () =>
   new Hono()
@@ -96,11 +97,35 @@ export const ThreadRoutes = () =>
     .post(
       "/:threadID/autobest/setActive",
       validator("param", z.object({ threadID: SessionID.zod })),
-      validator("json", z.object({ enabled: z.boolean(), ts: z.number().optional() })),
+      validator(
+        "json",
+        z.object({
+          key: z.string().min(1),
+          source: z.enum(["manual", "auto"]).optional(),
+          score: z.number().optional(),
+          ts: z.number().optional(),
+        }),
+      ),
       async (c) => {
         const param = c.req.valid("param")
         const body = c.req.valid("json")
-        return c.json({ enabled: await AppRuntime.runPromise(Session.Service.use((svc) => svc.setAutobestEnabled({ sessionID: param.threadID, enabled: body.enabled, ts: body.ts }))) })
+        const state = await AppRuntime.runPromise(
+          Session.Service.use((svc) =>
+            svc.setAutobest({
+              sessionID: param.threadID,
+              key: body.key,
+              source: body.source,
+              score: body.score,
+              ts: body.ts,
+            }),
+          ),
+        )
+        return c.json({
+          active: state.active ?? null,
+          changed: true,
+          selected: null,
+          candidates: [],
+        })
       },
     )
     .post(
@@ -124,6 +149,7 @@ export const ThreadRoutes = () =>
           enabled,
           active: state.active ?? null,
           picks: state.picks,
+          ...(state.cycle ? { cycle: state.cycle } : {}),
         })
       },
     )

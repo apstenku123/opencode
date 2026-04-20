@@ -91,6 +91,8 @@ describe("SubagentRegistry hook dispatch", () => {
     expect(stop.event.parent_session_id).toBe("session_stop_parent_ok")
     expect(stop.event.child_session_id).toBe("session_stop_child_ok")
     expect(stop.event.last_assistant_message).toBe("all good")
+    expect(stop.agentLevel).toBe(1)
+    expect(stop.sessionContext?.source).toBe("sub_agent")
   })
 
   test("cancelChild() fires SubagentStop with reason=cancelled", async () => {

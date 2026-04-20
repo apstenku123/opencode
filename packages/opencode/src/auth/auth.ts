@@ -1,5 +1,5 @@
 import path from "path"
-import { Effect, Layer, Record, Result, Schema, Context } from "effect"
+import { Effect, Layer, Record, Result, Schema, Context, Ref } from "effect"
 import { zod } from "@/util/effect-zod"
 import { Global } from "../global"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
@@ -125,38 +125,51 @@ export const layer = Layer.effect(
     const fsys = yield* AppFileSystem.Service
     const decode = Schema.decodeUnknownOption(Info)
 
-    // Lazily resolved once — either real keytar or encrypted-file fallback.
-    // When keyringEnabled() is false, keyring is undefined and auth.ts
-    // behaves exactly like before (fully backwards compatible).
-    let keyring: Keyring.Interface | undefined
-    if (keyringEnabled()) {
-      keyring = yield* Keyring.make().pipe(Effect.provideService(AppFileSystem.Service, fsys))
-      const backend = yield* keyring.backend()
+    const keyringRef = yield* Ref.make<Keyring.Interface | undefined>(undefined)
+
+    const getKeyring = Effect.fn("Auth.getKeyring")(function* () {
+      if (!keyringEnabled()) return undefined
+      const cached = yield* Ref.get(keyringRef)
+      if (cached) return cached
+      const created = yield* Keyring.make().pipe(Effect.provideService(AppFileSystem.Service, fsys))
+      const backend = yield* created.backend()
       log.info("keyring.enabled", { backend })
-    }
+      yield* Ref.set(keyringRef, created)
+      return created
+    })
+
+    const envSnapshot = yield* Ref.make<Record<string, Info> | undefined>(undefined)
 
     const keyringGet = (provider: string, field: string): Effect.Effect<string | undefined, never> => {
-      if (!keyring) return Effect.succeed(undefined as string | undefined)
-      return keyring.get(KEYRING_SERVICE, secretAccount(provider, field)).pipe(
+      return Effect.gen(function* () {
+        const keyring = yield* getKeyring()
+        if (!keyring) return undefined as string | undefined
+        return yield* keyring.get(KEYRING_SERVICE, secretAccount(provider, field)).pipe(
         Effect.catch((err: Keyring.KeyringError) => {
           log.info("keyring.get.fallback", { provider, field, error: err.message })
           return Effect.succeed(undefined as string | undefined)
         }),
-      )
+        )
+      })
     }
 
-    const keyringSet = (provider: string, field: string, value: string): Effect.Effect<void, never> => {
-      if (!keyring) return Effect.void
-      return keyring.set(KEYRING_SERVICE, secretAccount(provider, field), value).pipe(
-        Effect.catch((err: Keyring.KeyringError) => {
-          log.info("keyring.set.fallback", { provider, field, error: err.message })
-          return Effect.void
-        }),
-      )
+    const keyringSet = (provider: string, field: string, value: string): Effect.Effect<boolean, never> => {
+      return Effect.gen(function* () {
+        const keyring = yield* getKeyring()
+        if (!keyring) return true
+        return yield* keyring.set(KEYRING_SERVICE, secretAccount(provider, field), value).pipe(
+          Effect.as(true),
+          Effect.catch((err: Keyring.KeyringError) => {
+            log.info("keyring.set.fallback", { provider, field, error: err.message })
+            return Effect.succeed(false)
+          }),
+        )
+      })
     }
 
     const keyringRemove = (provider: string, fields: ReadonlyArray<string>): Effect.Effect<void, never> =>
       Effect.gen(function* () {
+        const keyring = yield* getKeyring()
         if (!keyring) return
         for (const f of fields) {
           yield* keyring.remove(KEYRING_SERVICE, secretAccount(provider, f)).pipe(
@@ -168,17 +181,37 @@ export const layer = Layer.effect(
         }
       })
 
-    const all = Effect.fn("Auth.all")(function* () {
-      if (process.env.OPENCODE_AUTH_CONTENT) {
-        try {
-          return JSON.parse(process.env.OPENCODE_AUTH_CONTENT)
-        } catch (err) {}
+    const takeEnvSnapshot = Effect.fn("Auth.takeEnvSnapshot")(function* () {
+      const cached = yield* Ref.get(envSnapshot)
+      if (cached !== undefined) return cached
+      const raw = process.env.OPENCODE_AUTH_CONTENT
+      if (!raw) {
+        yield* Ref.set(envSnapshot, {})
+        return undefined
       }
+      const parsed = yield* Effect.sync(() => JSON.parse(raw) as Record<string, unknown>).pipe(Effect.option)
+      if (parsed._tag === "None") {
+        yield* Ref.set(envSnapshot, {})
+        return undefined
+      }
+      const decoded = Record.filterMap(parsed.value, (value) => Result.fromOption(decode(value), () => undefined))
+      yield* Ref.set(envSnapshot, decoded)
+      return decoded
+    })
 
+    const readPersisted = Effect.fn("Auth.readPersisted")(function* () {
       const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
-      const decoded = Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+      return Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+    })
 
-      if (!keyring) return decoded
+    const all = Effect.fn("Auth.all")(function* () {
+      const data = (yield* fsys.readJson(file).pipe(Effect.orElseSucceed(() => ({})))) as Record<string, unknown>
+      const bootstrapped = yield* takeEnvSnapshot()
+      const decoded = Object.keys(data).length
+        ? Record.filterMap(data, (value) => Result.fromOption(decode(value), () => undefined))
+        : (bootstrapped ?? {})
+
+      if (!(yield* getKeyring())) return decoded
 
       // Stitch secrets back from the keyring. Any missing values stay as
       // whatever was in the file (pre-migration compatibility).
@@ -201,15 +234,23 @@ export const layer = Layer.effect(
 
     const set = Effect.fn("Auth.set")(function* (key: string, info: Info) {
       const norm = key.replace(/\/+$/, "")
-      const data = yield* all()
+      const data = yield* readPersisted()
       if (norm !== key) delete data[key]
       delete data[norm + "/"]
+      delete data[norm]
 
       let toPersist: Info = info
-      if (keyring) {
+      if (yield* getKeyring()) {
         const { stripped, secrets } = splitSecrets(info)
-        for (const [f, v] of Object.entries(secrets)) {
-          yield* keyringSet(norm, f, v)
+        const writes = yield* Effect.forEach(
+          Object.entries(secrets),
+          ([field, value]) => keyringSet(norm, field, value).pipe(Effect.map((ok) => ({ field, ok }))),
+        )
+        const failed = writes.filter((item) => !item.ok).map((item) => item.field)
+        if (failed.length) {
+          return yield* new AuthError({
+            message: `Failed to persist auth secrets to keyring: ${failed.join(", ")}`,
+          })
         }
         toPersist = stripped
       }
@@ -217,20 +258,27 @@ export const layer = Layer.effect(
       yield* fsys
         .writeJson(file, { ...data, [norm]: toPersist }, 0o600)
         .pipe(Effect.mapError(fail("Failed to write auth data")))
+      if (process.env.OPENCODE_AUTH_CONTENT) {
+        yield* Ref.set(envSnapshot, { ...data, [norm]: info })
+      }
     })
 
     const remove = Effect.fn("Auth.remove")(function* (key: string) {
       const norm = key.replace(/\/+$/, "")
-      const data = yield* all()
-      const existing = data[norm] ?? data[key]
+      const existing = yield* get(norm)
+      const data = yield* readPersisted()
+      if (norm !== key) delete data[key]
       delete data[key]
       delete data[norm]
 
-      if (keyring && existing) {
+      if ((yield* getKeyring()) && existing) {
         yield* keyringRemove(norm, secretFieldsFor(existing))
       }
 
       yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
+      if (process.env.OPENCODE_AUTH_CONTENT) {
+        yield* Ref.set(envSnapshot, data)
+      }
     })
 
     return Service.of({ get, all, set, remove })

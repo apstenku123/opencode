@@ -95,6 +95,72 @@ describe("tool.registry hooks", () => {
     ),
   )
 
+  it.live("fires PostToolUseFailure and AfterToolUse on tool failure", () =>
+    provideTmpdirInstance((_dir) =>
+      Effect.gen(function* () {
+        const hooks = yield* Hook.Service
+        const seen: Array<HookEvent["hook_event_name"]> = []
+        yield* hooks.register({
+          name: "pre",
+          event: "PreToolUse",
+          run: () =>
+            Effect.sync(() => {
+              seen.push("PreToolUse")
+              return { kind: "success", decision_interrupt: false, suppress_output: false } as HookResult
+            }),
+        })
+        yield* hooks.register({
+          name: "fail",
+          event: "PostToolUseFailure",
+          run: () =>
+            Effect.sync(() => {
+              seen.push("PostToolUseFailure")
+              return { kind: "success", decision_interrupt: false, suppress_output: false } as HookResult
+            }),
+        })
+        yield* hooks.register({
+          name: "after",
+          event: "AfterToolUse",
+          run: () =>
+            Effect.sync(() => {
+              seen.push("AfterToolUse")
+              return { kind: "success", decision_interrupt: false, suppress_output: false } as HookResult
+            }),
+        })
+
+        const registry = yield* ToolRegistry.Service
+        const list = yield* registry.tools({
+          providerID: "opencode" as any,
+          modelID: "gpt-5" as any,
+          agent,
+        })
+        const todo = list.find((t) => t.id === TodoWriteTool.id)
+        if (!todo) throw new Error("todo tool not found")
+
+        const exit = yield* Effect.exit(
+          todo.execute(
+            {
+              todos: [
+                {
+                  id: "1",
+                  content: "broken",
+                  status: "pending",
+                  priority: "high",
+                },
+              ],
+            },
+            {
+              ...baseCtx,
+              ask: () => Effect.die(new Error("forced tool failure")),
+            },
+          ),
+        )
+        expect(exit._tag).toBe("Failure")
+        expect(seen).toEqual(["PreToolUse", "PostToolUseFailure", "AfterToolUse"])
+      }),
+    ),
+  )
+
   it.live("PreToolUse FailedAbort short-circuits execute (AbortError)", () =>
     provideTmpdirInstance((dir) =>
       Effect.gen(function* () {
@@ -315,6 +381,40 @@ describe("tool.registry hooks", () => {
 
         expect(all).toEqual(["read", "todowrite"])
         expect(seen).toEqual(["todowrite"])
+      }),
+    ),
+  )
+
+  it.live("threads subagent provenance into tool hook payloads", () =>
+    provideTmpdirInstance((_dir) =>
+      Effect.gen(function* () {
+        const hooks = yield* Hook.Service
+        const seen: Array<{ level: number; source: string }> = []
+        yield* hooks.register({
+          name: "capture-pre",
+          event: "PreToolUse",
+          run: (payload) =>
+            Effect.sync(() => {
+              seen.push({ level: payload.agent_level, source: payload.session_context.source })
+              return { kind: "success", decision_interrupt: false, suppress_output: false } as HookResult
+            }),
+        })
+
+        const registry = yield* ToolRegistry.Service
+        const list = yield* registry.tools({
+          providerID: "opencode" as any,
+          modelID: "gpt-5" as any,
+          agent,
+        })
+        const todo = list.find((t) => t.id === TodoWriteTool.id)
+        if (!todo) throw new Error("todo tool not found")
+
+        yield* todo.execute(
+          { todos: [] },
+          { ...baseCtx, ask: okAsk, agent: "review", extra: { agentLevel: 1 } },
+        )
+
+        expect(seen).toEqual([{ level: 1, source: "sub_agent" }])
       }),
     ),
   )

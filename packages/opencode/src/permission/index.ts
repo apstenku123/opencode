@@ -146,6 +146,51 @@ interface State {
   approved: Ruleset
 }
 
+function permissionHookContext(tool: string) {
+  const agentLevel = Math.max(0, Number((globalThis as { __opencode_agent_level?: number }).__opencode_agent_level ?? 0))
+  if (agentLevel <= 0) {
+    return {
+      agentLevel: 0,
+      sessionContext: { source: "cli" as const },
+    }
+  }
+  return {
+    agentLevel,
+    sessionContext: {
+      source: "sub_agent" as const,
+      subagent: {
+        source: "thread_spawn" as const,
+        depth: agentLevel,
+        agent_role: tool,
+      },
+    },
+  }
+}
+
+function requestInvocation(request: Omit<Request, "id"> | Request, pattern: string): ToolInvocation | undefined {
+  const metadata = request.metadata as Record<string, unknown>
+  const invocation = metadata.__execPolicyInvocation
+  if (invocation && typeof invocation === "object") return invocation as ToolInvocation
+  const cwd = typeof metadata.cwd === "string" ? metadata.cwd : undefined
+  if (request.permission === "bash") {
+    return { tool: "bash", command: pattern, cwd }
+  }
+  if (request.permission === "edit" || request.permission === "write" || request.permission === "apply_patch") {
+    return { tool: request.permission, path: pattern, cwd }
+  }
+  if (request.permission === "task") {
+    return { tool: "task", command: pattern, cwd }
+  }
+  return { tool: request.permission, cwd }
+}
+
+function requestPolicy(request: Omit<Request, "id"> | Request): CompiledPolicy | undefined {
+  const metadata = request.metadata as Record<string, unknown>
+  const policy = metadata.__execPolicy
+  if (policy && typeof policy === "object") return policy as CompiledPolicy
+  return undefined
+}
+
 export function evaluate(permission: string, pattern: string, ...rulesets: Ruleset[]): Rule {
   log.info("evaluate", { permission, pattern, ruleset: rulesets.flat() })
   return evalRule(permission, pattern, ...rulesets)
@@ -216,7 +261,14 @@ export const layer = Layer.effect(
       let needsAsk = false
 
       for (const pattern of request.patterns) {
-        const rule = evaluate(request.permission, pattern, ruleset, approved)
+        const rule = evaluateWithDSL(
+          request.permission,
+          pattern,
+          requestInvocation(request, pattern),
+          requestPolicy(request),
+          ruleset,
+          approved,
+        )
         log.info("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
           yield* hooks
@@ -228,6 +280,7 @@ export const layer = Layer.effect(
                 source: "rule",
               },
               sessionID: request.sessionID,
+              ...permissionHookContext(request.permission),
             })
             .pipe(Effect.ignore)
           return yield* new DeniedError({
@@ -248,6 +301,7 @@ export const layer = Layer.effect(
               source: "rule",
             },
             sessionID: request.sessionID,
+            ...permissionHookContext(request.permission),
           })
           .pipe(Effect.ignore)
         return
@@ -277,6 +331,7 @@ export const layer = Layer.effect(
           tool_input: request.metadata,
         },
         sessionID: request.sessionID,
+        ...permissionHookContext(request.permission),
       })
 
       if (hookResult && hookResult.outcome === "abort") {
@@ -291,6 +346,7 @@ export const layer = Layer.effect(
               reason: hookResult.abortReason,
             },
             sessionID: request.sessionID,
+            ...permissionHookContext(request.permission),
           })
           .pipe(Effect.ignore)
         return yield* new DeniedError({
@@ -309,6 +365,7 @@ export const layer = Layer.effect(
               source: "hook",
             },
             sessionID: request.sessionID,
+            ...permissionHookContext(request.permission),
           })
           .pipe(Effect.ignore)
         return
@@ -326,6 +383,7 @@ export const layer = Layer.effect(
               reason: hookResult.decisionMessage,
             },
             sessionID: request.sessionID,
+            ...permissionHookContext(request.permission),
           })
           .pipe(Effect.ignore)
         return yield* new DeniedError({
@@ -364,6 +422,7 @@ export const layer = Layer.effect(
               reason: input.message,
             },
             sessionID: existing.info.sessionID,
+            ...permissionHookContext(existing.info.permission),
           })
           .pipe(Effect.ignore)
 
@@ -389,6 +448,7 @@ export const layer = Layer.effect(
                 source: "reject",
               },
               sessionID: item.info.sessionID,
+              ...permissionHookContext(item.info.permission),
             })
             .pipe(Effect.ignore)
           yield* Deferred.fail(item.deferred, new RejectedError())
@@ -405,6 +465,7 @@ export const layer = Layer.effect(
             source: input.reply === "once" ? "once" : "always",
           },
           sessionID: existing.info.sessionID,
+          ...permissionHookContext(existing.info.permission),
         })
         .pipe(Effect.ignore)
 
@@ -422,7 +483,14 @@ export const layer = Layer.effect(
       for (const [id, item] of pending.entries()) {
         if (item.info.sessionID !== existing.info.sessionID) continue
         const ok = item.info.patterns.every(
-          (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
+          (pattern) =>
+            evaluateWithDSL(
+              item.info.permission,
+              pattern,
+              requestInvocation(item.info, pattern),
+              requestPolicy(item.info),
+              approved,
+            ).action === "allow",
         )
         if (!ok) continue
         pending.delete(id)
@@ -440,6 +508,7 @@ export const layer = Layer.effect(
               source: "always",
             },
             sessionID: item.info.sessionID,
+            ...permissionHookContext(item.info.permission),
           })
           .pipe(Effect.ignore)
         yield* Deferred.succeed(item.deferred, undefined)

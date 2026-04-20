@@ -417,5 +417,41 @@ export const ExperimentalRoutes = lazy(() =>
           ),
         )
       },
+    )
+    .get(
+      "/resource/read",
+      describeRoute({
+        summary: "Read an MCP resource",
+        description: "Read one MCP resource from a connected server.",
+        operationId: "experimental.resource.read",
+        responses: {
+          200: {
+            description: "MCP resource contents",
+            content: {
+              "application/json": {
+                schema: resolver(z.unknown()),
+              },
+            },
+          },
+        },
+      }),
+      validator(
+        "query",
+        z.object({
+          client: z.string(),
+          uri: z.string(),
+        }),
+      ),
+      async (c) => {
+        const query = c.req.valid("query")
+        return c.json(
+          await AppRuntime.runPromise(
+            Effect.gen(function* () {
+              const mcp = yield* MCP.Service
+              return yield* mcp.readResource(query.client, query.uri)
+            }),
+          ),
+        )
+      },
     ),
 )

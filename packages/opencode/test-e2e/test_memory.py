@@ -703,7 +703,85 @@ def test_memory_reset_clears_corpus() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 5 — cosine vs bm25 vs hybrid produce distinct rankings
+# Test 5 — memory list returns newest-first scoped detail rows
+# ---------------------------------------------------------------------------
+
+
+def test_memory_list_returns_scoped_newest_first_rows() -> None:
+    """`memory list --json` should expose bounded detail rows for the current
+    project only, ordered newest-first.
+    """
+    root = prepare_isolated_home(preserve_tokens=True)
+    scratch = Path(tempfile.mkdtemp(prefix="opencode-e2e-memory-cwd-"))
+    _write_config(root, {"memories": {"enabled": True}})
+    _print_markers(root, scratch)
+
+    try:
+        older = {
+            "keywords": ["older", "memory", "row"],
+            "problem": "older scoped memory row for newest-first ordering check",
+            "rootCause": "older root cause",
+            "solution": "older solution",
+        }
+        newer = {
+            "keywords": ["newer", "memory", "row"],
+            "problem": "newer scoped memory row for newest-first ordering check",
+            "rootCause": "newer root cause",
+            "solution": "newer solution",
+        }
+
+        rc, _, stderr = _run_memory_cli(
+            root, "seed", "--json", cwd=scratch, stdin=json.dumps(older)
+        )
+        assert rc == 0, f"older seed failed: {stderr}"
+        time.sleep(0.02)
+        rc, _, stderr = _run_memory_cli(
+            root, "seed", "--json", cwd=scratch, stdin=json.dumps(newer)
+        )
+        assert rc == 0, f"newer seed failed: {stderr}"
+
+        other_project = Path(tempfile.mkdtemp(prefix="opencode-e2e-memory-other-"))
+        try:
+            rc, _, stderr = _run_memory_cli(
+                root,
+                "seed",
+                "--json",
+                cwd=other_project,
+                stdin=json.dumps(
+                    {
+                        "keywords": ["other", "project"],
+                        "problem": "other project memory row that must stay hidden",
+                        "rootCause": "other project root cause",
+                        "solution": "other project solution",
+                    }
+                ),
+            )
+            assert rc == 0, f"other-project seed failed: {stderr}"
+        finally:
+            shutil.rmtree(other_project, ignore_errors=True)
+
+        rc, stdout, stderr = _run_memory_cli(
+            root, "list", "--limit", "10", "--json", cwd=scratch
+        )
+        assert rc == 0, f"memory list rc={rc}\nstderr={stderr}\nstdout={stdout}"
+        body = _parse_json_tail(stdout)
+        items = body["items"]
+        problems = [item["problem"] for item in items]
+
+        assert body["projectID"], f"expected scoped project id, got: {body}"
+        assert len(items) == 2, f"expected only scoped rows, got: {body}"
+        assert problems == [newer["problem"], older["problem"]], (
+            f"expected newest-first ordering, got: {problems}"
+        )
+        assert all(item["embedded"] is True for item in items), body
+        assert all(item["projectID"] == body["projectID"] for item in items), body
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — cosine vs bm25 vs hybrid produce distinct rankings
 # ---------------------------------------------------------------------------
 
 

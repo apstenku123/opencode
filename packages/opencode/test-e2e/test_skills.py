@@ -1082,18 +1082,12 @@ def test_env_deps_prompt_fires_for_missing_var(
                         timeout_s=40.0,
                     )
                     assert "FOO_TOKEN" in json.dumps(ev.properties)
-                except TimeoutError:
-                    # If the env-deps path doesn't fire in Hybrid router
-                    # mode (the router may not pick `foo-deploy` as one of
-                    # the top-3 auto-skill hints), we still consider the
-                    # test green so long as the skill itself was registered
-                    # and the dependency block was captured by the parser.
-                    # This matches the intent: the prompt fires when the
-                    # skill is *selected*; exercising selection requires
-                    # nondeterministic LLM routing.
-                    pytest.skip(
-                        "foo-deploy was not auto-selected by the hybrid router; "
-                        "env-deps prompt path not exercised on this roll."
+                except TimeoutError as exc:
+                    pytest.fail(
+                        "foo-deploy env dependency prompt did not fire; "
+                        "the explicit `$foo-deploy` selection path should emit "
+                        "`question.asked` for missing FOO_TOKEN. "
+                        f"Collector timed out: {exc}"
                     )
             finally:
                 collector.stop()

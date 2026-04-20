@@ -186,6 +186,46 @@ export namespace Question {
           questions: input.questions,
           tool: input.tool,
         })
+        const publishRejected = (reason?: string) =>
+          Effect.gen(function* () {
+            yield* bus.publish(Event.Rejected, {
+              sessionID: info.sessionID,
+              requestID: info.id,
+            })
+            if (!input.tool) return
+            yield* hooks
+              .dispatch({
+                event: {
+                  hook_event_name: "PermissionDenied",
+                  tool_name: "question",
+                  tool_input: { questions: input.questions, tool: input.tool },
+                  source: "hook",
+                  reason,
+                },
+                sessionID: input.sessionID,
+              })
+              .pipe(Effect.ignore)
+          })
+        const publishReplied = (answers: ReadonlyArray<Answer>) =>
+          Effect.gen(function* () {
+            yield* bus.publish(Event.Replied, {
+              sessionID: info.sessionID,
+              requestID: info.id,
+              answers,
+            })
+            if (!input.tool) return
+            yield* hooks
+              .dispatch({
+                event: {
+                  hook_event_name: "PermissionGranted",
+                  tool_name: "question",
+                  tool_input: { questions: input.questions, tool: input.tool, answers },
+                  source: "hook",
+                },
+                sessionID: input.sessionID,
+              })
+              .pipe(Effect.ignore)
+          })
         pending.set(id, { info, deferred })
         yield* bus.publish(Event.Asked, info)
 
@@ -209,55 +249,23 @@ export namespace Question {
 
           if (hookResult.outcome === "abort") {
             pending.delete(id)
-            yield* hooks
-              .dispatch({
-                event: {
-                  hook_event_name: "PermissionDenied",
-                  tool_name: "question",
-                  tool_input: { questions: input.questions, tool: input.tool },
-                  source: "hook",
-                  reason: hookResult.abortReason,
-                },
-                sessionID: input.sessionID,
-              })
-              .pipe(Effect.ignore)
+            yield* publishRejected(hookResult.abortReason)
             return yield* Effect.fail(new RejectedError())
           }
 
           if (hookResult.decisionBehavior === "allow") {
             pending.delete(id)
-            yield* hooks
-              .dispatch({
-                event: {
-                  hook_event_name: "PermissionGranted",
-                  tool_name: "question",
-                  tool_input: { questions: input.questions, tool: input.tool },
-                  source: "hook",
-                },
-                sessionID: input.sessionID,
-              })
-              .pipe(Effect.ignore)
             const synthesized: Answer[] = input.questions.map((q) => {
               const first = q.options[0]
               return first ? [first.label] : []
             })
+            yield* publishReplied(synthesized)
             return synthesized as ReadonlyArray<Answer>
           }
 
           if (hookResult.decisionBehavior === "deny") {
             pending.delete(id)
-            yield* hooks
-              .dispatch({
-                event: {
-                  hook_event_name: "PermissionDenied",
-                  tool_name: "question",
-                  tool_input: { questions: input.questions, tool: input.tool },
-                  source: "hook",
-                  reason: hookResult.decisionMessage,
-                },
-                sessionID: input.sessionID,
-              })
-              .pipe(Effect.ignore)
+            yield* publishRejected(hookResult.decisionMessage)
             return yield* Effect.fail(new RejectedError())
           }
         }

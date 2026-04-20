@@ -8,6 +8,12 @@ import * as Hook from "../../src/hook"
 import { Log } from "../../src/util"
 import { tmpdir } from "../fixture/fixture"
 
+type SessionSkillOverlay = {
+  skills?: {
+    paths?: string[]
+  }
+}
+
 void Log.init({ print: false })
 
 afterEach(async () => {
@@ -156,6 +162,114 @@ describe("session config overlay", () => {
         const globalRes = await app.request("/config")
         const scopedRes = await app.request(`/session/${session.id}/config`)
         expect(await scopedRes.json()).toEqual(await globalRes.json())
+      },
+    })
+  })
+
+  test("session skill injection/ejection is isolated and visible in config readback", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const app = Server.Default().app
+
+        const sessionA = (await (
+          await app.request("/session", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({}),
+          })
+        ).json()) as { id: string }
+
+        const sessionB = (await (
+          await app.request("/session", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({}),
+          })
+        ).json()) as { id: string }
+
+        const injectA = await app.request(`/session/${sessionA.id}/skill`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paths: ["./skills/a", "./skills/shared"] }),
+        })
+        expect(injectA.status).toBe(200)
+        expect(await injectA.json()).toEqual({ items: ["./skills/a", "./skills/shared"] })
+
+        const injectB = await app.request(`/session/${sessionB.id}/skill`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paths: ["./skills/b"] }),
+        })
+        expect(injectB.status).toBe(200)
+        expect(await injectB.json()).toEqual({ items: ["./skills/b"] })
+
+        const listA = await app.request(`/session/${sessionA.id}/skill`)
+        const listB = await app.request(`/session/${sessionB.id}/skill`)
+        expect(await listA.json()).toEqual({ items: ["./skills/a", "./skills/shared"] })
+        expect(await listB.json()).toEqual({ items: ["./skills/b"] })
+
+        const cfgA = (await (await app.request(`/session/${sessionA.id}/config`)).json()) as {
+          skills?: { paths?: string[] }
+        }
+        const cfgB = (await (await app.request(`/session/${sessionB.id}/config`)).json()) as {
+          skills?: { paths?: string[] }
+        }
+        expect(cfgA.skills?.paths).toEqual(["./skills/a", "./skills/shared"])
+        expect(cfgB.skills?.paths).toEqual(["./skills/b"])
+
+        const ejectA = await app.request(`/session/${sessionA.id}/skill`, {
+          method: "DELETE",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paths: ["./skills/a"] }),
+        })
+        expect(ejectA.status).toBe(200)
+        expect(await ejectA.json()).toEqual({ items: ["./skills/shared"] })
+
+        const cfgAAfter = (await (await app.request(`/session/${sessionA.id}/config`)).json()) as {
+          skills?: { paths?: string[] }
+        }
+        expect(cfgAAfter.skills?.paths).toEqual(["./skills/shared"])
+        expect((ConfigOverlay.get(sessionA.id) as SessionSkillOverlay | undefined)?.skills?.paths).toEqual([
+          "./skills/shared",
+        ])
+        expect((ConfigOverlay.get(sessionB.id) as SessionSkillOverlay | undefined)?.skills?.paths).toEqual([
+          "./skills/b",
+        ])
+      },
+    })
+  })
+
+  test("deleting a session clears injected skill paths", async () => {
+    await using tmp = await tmpdir({ git: true })
+    await Instance.provide({
+      directory: tmp.path,
+      fn: async () => {
+        const app = Server.Default().app
+        const session = (await (
+          await app.request("/session", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({}),
+          })
+        ).json()) as { id: string }
+
+        const inject = await app.request(`/session/${session.id}/skill`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paths: ["./skills/temp"] }),
+        })
+        expect(inject.status).toBe(200)
+        expect((ConfigOverlay.get(session.id) as SessionSkillOverlay | undefined)?.skills?.paths).toEqual([
+          "./skills/temp",
+        ])
+
+        const delRes = await app.request(`/session/${session.id}`, {
+          method: "DELETE",
+        })
+        expect(delRes.status).toBe(200)
+        expect(ConfigOverlay.get(session.id)).toBeUndefined()
       },
     })
   })

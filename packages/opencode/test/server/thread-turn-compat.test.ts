@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import * as Autobest from "../../src/autobest"
+import * as History from "../../src/history"
 import { Instance } from "../../src/project/instance"
 import { Server } from "../../src/server/server"
 import { Session as SessionNs } from "../../src/session"
@@ -56,10 +58,15 @@ describe("thread/turn compat aliases", () => {
         const toggled = await app.request(`/thread/${session.id}/autobest/setActive`, {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ enabled: true, ts: 1 }),
+          body: JSON.stringify({ key: "manual pick", source: "manual", score: 7, ts: 1 }),
         })
         expect(toggled.status).toBe(200)
-        expect(await toggled.json()).toEqual({ enabled: true })
+        expect(await toggled.json()).toEqual({
+          active: { key: "manual pick", source: "manual", score: 7, ts: 1 },
+          changed: true,
+          selected: null,
+          candidates: [],
+        })
 
         const extracted = await app.request(`/thread/${session.id}/autobest/extract`, {
           method: "POST",
@@ -68,6 +75,30 @@ describe("thread/turn compat aliases", () => {
         })
         expect(extracted.status).toBe(200)
         expect((await extracted.json() as any).selected.key).toBe("next move")
+
+        await History.append(
+          session.id,
+          Autobest.buildCycleAdvanceEvent({
+            sessionID: session.id,
+            ts: 3,
+            cycle: { iteration: 4, stepKind: "d" },
+            reason: "max-iterations-reached",
+          }),
+        )
+        const autobest = await app.request(`/thread/${session.id}/autobest`)
+        expect(autobest.status).toBe(200)
+        expect(await autobest.json()).toEqual({
+          enabled: false,
+          active: { key: "next move", source: "auto", score: 9, ts: 2 },
+          picks: [
+            { key: "manual pick", source: "manual", score: 7, ts: 1 },
+            { key: "next move", source: "auto", score: 9, ts: 2 },
+          ],
+          cycle: {
+            iteration: 4,
+            stepKind: "d",
+          },
+        })
 
         const forked = await app.request(`/thread/${session.id}/fork`, {
           method: "POST",

@@ -293,6 +293,34 @@ describe("raceFetch — parent-signal cancellation", () => {
   })
 })
 
+describe("raceFetch — unhealthy responses do not win", () => {
+  test("ignores a fast non-2xx Response and returns a later healthy Response", async () => {
+    const bus = new HttpAttemptBus(32)
+    const result = await raceFetch<Response>(
+      [
+        async ({ signal }) => {
+          await delay(5, signal)
+          return new Response("rate limited", { status: 429 })
+        },
+        async ({ signal }) => {
+          await delay(35, signal)
+          return new Response("ok", { status: 200 })
+        },
+      ],
+      FAST_CFG,
+      { bus },
+    )
+    expect(result.status).toBe(200)
+    const obs = collectObservations(bus)
+    const firstFailure = obs.find((o) => o.event.type === "failed" && o.event.attempt === 1)
+    expect(firstFailure).toBeDefined()
+    if (firstFailure?.event.type === "failed") {
+      expect(firstFailure.event.error.message).toContain("429")
+    }
+    expect(obs.some((o) => o.event.type === "succeeded" && o.event.attempt === 2)).toBe(true)
+  })
+})
+
 describe("httpRetryRaceConfig extractor", () => {
   test("returns defaults when nothing is configured", () => {
     const cfg = httpRetryRaceConfig({})

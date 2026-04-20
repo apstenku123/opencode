@@ -35,7 +35,7 @@ from .sgr import (
     run_sgr_turn,
 )
 
-DEFAULT_BINARY_PATH = "/Users/dave/.local/bin/opencode-unify"
+DEFAULT_BINARY_PATH = "/Users/dave/.local/bin/opencode"
 OPENCODE_BINARY_ENV_VAR = "OPENCODE_BINARY"
 
 
@@ -44,13 +44,13 @@ def resolve_opencode_binary() -> str:
 
     Precedence:
         1. ``OPENCODE_BINARY`` env var (if set).
-        2. ``opencode-unify`` on PATH.
-        3. ``/Users/dave/.local/bin/opencode-unify`` (fallback default).
+        2. ``opencode`` on PATH.
+        3. ``/Users/dave/.local/bin/opencode`` (fallback default).
     """
     override = os.environ.get(OPENCODE_BINARY_ENV_VAR)
     if override:
         return str(Path(override).expanduser())
-    on_path = shutil.which("opencode-unify")
+    on_path = shutil.which("opencode")
     if on_path:
         return on_path
     return DEFAULT_BINARY_PATH

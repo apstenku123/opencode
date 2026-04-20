@@ -140,6 +140,12 @@ def _iter_sse(response: httpx.Response) -> Iterator[SSEEvent]:
                 payload = payload[1:]
             buf.append(payload)
         # Other SSE fields (event:, id:, retry:) are ignored — opencode doesn't use them.
+    if not buf:
+        return
+    try:
+        yield SSEEvent.from_json("\n".join(buf))
+    except json.JSONDecodeError:
+        return
 
 
 def _safe_iter_lines(response: httpx.Response) -> Iterator[str]:

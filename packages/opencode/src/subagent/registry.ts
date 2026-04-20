@@ -49,6 +49,21 @@ import { InstanceState } from "@/effect"
 import * as Hook from "@/hook"
 import { Effect, Layer, Context, Deferred, Option } from "effect"
 
+function subagentHookContext(summary: SubagentRegistry.ChildSummary, agentType: string) {
+  return {
+    agentLevel: 1,
+    sessionContext: {
+      source: "sub_agent" as const,
+      subagent: {
+        source: "thread_spawn" as const,
+        parent_session_id: summary.parentID,
+        depth: 1,
+        agent_role: agentType,
+      },
+    },
+  }
+}
+
 export namespace SubagentRegistry {
   export interface ChildSummary {
     readonly sessionID: SessionID
@@ -241,6 +256,7 @@ export namespace SubagentRegistry {
                 last_assistant_message: summaryText.length > 0 ? summaryText : null,
               },
               sessionID: summary.parentID,
+              ...subagentHookContext(summary, agentType),
             })
             .pipe(Effect.ignore)
         })

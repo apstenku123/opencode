@@ -23,6 +23,9 @@ import time
 from pathlib import Path
 
 
+import conftest
+
+
 _HELPER_SCRIPT = """\
 import sys
 import time
@@ -155,3 +158,33 @@ def test_session_lock_meta_file_is_written_by_parent_fixture() -> None:
     )
     assert isinstance(meta.get("started_at"), (int, float))
     assert isinstance(meta.get("suite_names"), list)
+
+
+def test_break_stale_lock_does_not_evict_live_holder_based_on_age(tmp_path: Path) -> None:
+    """A live holder older than the timeout must still keep the lock path intact."""
+    lock_path = tmp_path / "live-holder.lock"
+    meta_path = tmp_path / "live-holder.lock.meta"
+
+    lock_path.write_text("held")
+    meta_path.write_text(
+        __import__("json").dumps(
+            {
+                "pid": os.getpid(),
+                "started_at": time.time() - (conftest.E2E_LOCK_TIMEOUT_S + 60),
+                "suite_names": ["test_break_stale_lock_does_not_evict_live_holder_based_on_age"],
+            }
+        )
+    )
+
+    original_lock = conftest.E2E_LOCK_PATH
+    original_meta = conftest.E2E_LOCK_META_PATH
+    try:
+        conftest.E2E_LOCK_PATH = str(lock_path)
+        conftest.E2E_LOCK_META_PATH = str(meta_path)
+        conftest._break_stale_lock_if_present()
+    finally:
+        conftest.E2E_LOCK_PATH = original_lock
+        conftest.E2E_LOCK_META_PATH = original_meta
+
+    assert lock_path.exists(), "live holder lock path was incorrectly removed"
+    assert meta_path.exists(), "live holder meta path was incorrectly removed"

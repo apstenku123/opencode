@@ -303,6 +303,13 @@ def _has_synthetic_text_part(msg: dict[str, Any]) -> bool:
     return False
 
 
+def _cycle_state(state: dict[str, Any]) -> dict[str, Any]:
+    cycle = state.get("cycle")
+    if isinstance(cycle, dict):
+        return cycle
+    return {}
+
+
 def _text_from_assistant(msg: dict[str, Any]) -> str:
     out: list[str] = []
     for part in msg.get("parts") or []:
@@ -358,6 +365,50 @@ def test_autobest_enable_roundtrip(
 
     state = http_client.get_autobest_by_thread(thread_id)
     assert state.get("enabled") is False
+
+
+def test_autobest_set_active_alias_sets_manual_pick(
+    http_client,
+    authenticated_copilot_session,
+) -> None:
+    thread_id = authenticated_copilot_session
+
+    out = http_client.set_autobest(thread_id, "manual follow-up", source="manual", score=4.5, ts=11)
+    assert out == {
+        "active": {"key": "manual follow-up", "source": "manual", "score": 4.5, "ts": 11},
+        "changed": True,
+        "selected": None,
+        "candidates": [],
+    }
+
+    state = http_client.get_autobest_by_thread(thread_id)
+    assert state.get("enabled") is False
+    assert (state.get("active") or {}).get("key") == "manual follow-up"
+
+
+def test_autobest_extract_result_includes_where_is_plan_resulting_action(
+    http_client,
+    authenticated_copilot_session,
+) -> None:
+    thread_id = authenticated_copilot_session
+
+    response = http_client._request(
+        "POST",
+        f"/session/{thread_id}/autobest/extract",
+        json={
+            "candidates": [
+                {"key": "Where is the plan?", "score": 100, "reason": ["ask_where_is_plan"]},
+            ],
+            "ts": 55,
+        },
+    )
+    response.raise_for_status()
+    body = response.json()
+    assert body["active"]["key"] == "Where is the plan?"
+    assert body["result"]["resultingAction"] == "Where is the plan?"
+
+    state = http_client.get_autobest_by_thread(thread_id)
+    assert state["result"]["resultingAction"] == "Where is the plan?"
 
 
 # ---------------------------------------------------------------------------
@@ -631,9 +682,14 @@ def test_autobest_max_iterations_caps_follow_ups(
     autobest_sgr_client: OpencodeClient,
     autobest_sgr_model: dict[str, str],
 ) -> None:
-    """With DEFAULT_MAX_ITERATIONS=3, no more than 3 synthetic turns ever
-    appear. SGR-driven so the bullet channel is deterministic."""
-    thread = autobest_sgr_client.create_thread()
+    """Step A stops at the real max-iteration cap and persists the terminal cycle."""
+    thread = autobest_sgr_client.create_thread(
+        configOverlay={
+            "autobest": {
+                "maxIterations": 1,
+            }
+        }
+    )
     thread_id = thread["id"]
 
     autobest_sgr_client.set_autobest_enabled(thread_id, True)
@@ -647,19 +703,27 @@ def test_autobest_max_iterations_caps_follow_ups(
         model=autobest_sgr_model,
     )
 
-    # Give the observer + any auto-continue follow-ups time to settle.
-    time.sleep(10.0)
+    deadline = time.monotonic() + 30.0
+    state: dict[str, Any] = {}
+    user_msgs: list[dict[str, Any]] = []
+    synthetic: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        state = autobest_sgr_client.get_autobest_by_thread(thread_id)
+        messages = autobest_sgr_client.get_messages(thread_id)
+        user_msgs = _user_messages(messages)
+        synthetic = [m for m in user_msgs if _has_synthetic_text_part(m)]
+        cycle = _cycle_state(state)
+        if cycle.get("iteration") == 2 and cycle.get("stepKind") == "d":
+            break
+        time.sleep(0.5)
 
-    messages = autobest_sgr_client.get_messages(thread_id)
-    user_msgs = _user_messages(messages)
-    synthetic = [m for m in user_msgs if _has_synthetic_text_part(m)]
-
-    assert len(synthetic) <= 3, (
-        f"autobest produced {len(synthetic)} synthetic turns, exceeding "
-        f"DEFAULT_MAX_ITERATIONS=3. user messages: {user_msgs!r}"
+    cycle = _cycle_state(state)
+    assert len(synthetic) == 1, (
+        f"autobest should stop after 1 synthetic Step A turn, got {len(synthetic)}: "
+        f"user messages={user_msgs!r}"
     )
-
-
+    assert cycle.get("iteration") == 2, f"expected terminal cycle iteration 2, got state={state!r}"
+    assert cycle.get("stepKind") == "d", f"expected Step D terminal state, got state={state!r}"
 # ---------------------------------------------------------------------------
 # Test 6 — fork-and-resume resets cycle (SGR-driven)
 # ---------------------------------------------------------------------------

@@ -504,8 +504,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             file=sys.stderr,
         )
         # Still print whatever rows landed so the operator can diagnose.
-        summary_off = summarize("race-off", off_latencies or [0.0])
-        summary_on = summarize("race-on", on_latencies or [0.0])
+        summary_off = summarize("race-off", off_latencies)
+        summary_on = summarize("race-on", on_latencies)
         print_summary(summary_off, summary_on, off_rows, on_rows)
         return 4
 

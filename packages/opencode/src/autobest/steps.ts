@@ -157,14 +157,15 @@ export function decideEmptyFollowup(input: {
   askWhereIsPlanOnEmpty?: boolean
 }): EmptyFollowupDecision {
   const whatNextAsked = input.cycle?.whatNextAsked === true
+  const whereIsPlanAsked = input.cycle?.whereIsPlanAsked === true
   if (input.iteration >= input.maxIterations) {
     return { kind: "d", resultingAction: null, reason: "max_iterations" }
   }
+  if (input.askWhereIsPlanOnEmpty === true && !whereIsPlanAsked) {
+    return { kind: "c", action: "Where is the plan?", reason: "ask_where_is_plan" }
+  }
   if (whatNextAsked) {
     return { kind: "d", resultingAction: null, reason: "what_next_already_asked" }
-  }
-  if (input.askWhereIsPlanOnEmpty === true) {
-    return { kind: "c", action: "Where is the plan?", reason: "ask_where_is_plan" }
   }
   return { kind: "c", action: "And what's next?", reason: "ask_what_next" }
 }

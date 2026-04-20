@@ -6,6 +6,7 @@ import { Effect } from "effect"
 import { DEFAULT_TFIDF_VOCAB_SIZE, LocalTfIdfCorpus, tfidfEmbed } from "../../src/embedding/tfidf"
 import { cosineSimilarity, EmbeddingService, localTfIdfLayer } from "../../src/embedding"
 import { autoEmbeddingLayer, resolveEmbeddingProvider } from "../../src/embedding"
+import { defaultLayer as MemoryDefaultLayer, Memory } from "../../src/memory"
 
 describe("local TF-IDF embedding", () => {
   test("non-empty input produces a unit-norm vector of `vocabSize` dims", () => {
@@ -274,6 +275,22 @@ describe("embedding provider resolver", () => {
     setProvider("api")
     try {
       expect(() => autoEmbeddingLayer()).toThrow(/requires an apiConfig/)
+    } finally {
+      setProvider(ORIGINAL)
+    }
+  })
+
+  test("MemoryDefaultLayer uses the provider-aware embedding layer", async () => {
+    setProvider("local")
+    try {
+      const name = await Effect.runPromise(
+        Effect.gen(function* () {
+          yield* Memory
+          const svc = yield* Effect.service(EmbeddingService)
+          return svc.providerName
+        }).pipe(Effect.provide(MemoryDefaultLayer)),
+      )
+      expect(name).toBe("tfidf")
     } finally {
       setProvider(ORIGINAL)
     }

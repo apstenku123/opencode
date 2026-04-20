@@ -165,6 +165,19 @@ function repliedEvent(requestID: string, sessionID = "ses_child"): GlobalEvent {
   }
 }
 
+function rejectedEvent(requestID: string, sessionID = "ses_child"): GlobalEvent {
+  return {
+    directory: "/tmp",
+    payload: {
+      type: "question.rejected",
+      properties: {
+        sessionID,
+        requestID,
+      },
+    },
+  }
+}
+
 describe("SyncProvider — forwarded question events", () => {
   test("question.forwarded_to_parent enqueues under parentID", async () => {
     const { app, sync, emit } = await mount()
@@ -205,6 +218,23 @@ describe("SyncProvider — forwarded question events", () => {
 
       const head = ForwardedQueue.head(sync.data.forwarded_question, "ses_parent")
       expect(head?.requestID).toBe("que_2")
+    } finally {
+      app.renderer.destroy()
+    }
+  })
+
+  test("question.rejected dismisses the matching forwarded entry", async () => {
+    const { app, sync, emit } = await mount()
+    try {
+      emit(forwardedEvent("que_1"))
+      emit(forwardedEvent("que_2"))
+      await wait(() => ForwardedQueue.list(sync.data.forwarded_question, "ses_parent").length === 2)
+
+      emit(rejectedEvent("que_2"))
+      await wait(() => ForwardedQueue.list(sync.data.forwarded_question, "ses_parent").length === 1)
+
+      const head = ForwardedQueue.head(sync.data.forwarded_question, "ses_parent")
+      expect(head?.requestID).toBe("que_1")
     } finally {
       app.renderer.destroy()
     }

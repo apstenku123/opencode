@@ -43,6 +43,30 @@ describe("autobest", () => {
     })
   })
 
+  test("setActive preserves cycle state", () => {
+    expect(
+      setActive(
+        {
+          ...empty(),
+          cycle: {
+            iteration: 2,
+            stepKind: "c",
+            whatNextAsked: true,
+          },
+        },
+        { key: "lane-b", ts: 7 },
+      ),
+    ).toEqual({
+      active: { key: "lane-b", source: "manual", ts: 7, score: undefined },
+      picks: [{ key: "lane-b", source: "manual", ts: 7, score: undefined }],
+      cycle: {
+        iteration: 2,
+        stepKind: "c",
+        whatNextAsked: true,
+      },
+    })
+  })
+
   test("decide keeps current active when top candidate is unchanged", () => {
     const state = setActive(empty(), { key: "lane-a", ts: 1, source: "manual", score: 4 })
     expect(

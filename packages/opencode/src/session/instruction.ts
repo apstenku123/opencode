@@ -53,6 +53,9 @@ function extract(messages: MessageV2.WithParts[]) {
 export namespace Instruction {
   export interface Interface {
     readonly clear: (messageID: MessageID) => Effect.Effect<void>
+    readonly listInjected: (sessionID: string) => Effect.Effect<string[]>
+    readonly inject: (sessionID: string, value: string) => Effect.Effect<string[]>
+    readonly eject: (sessionID: string, value: string) => Effect.Effect<string[]>
     readonly systemPaths: () => Effect.Effect<Set<string>, AppFileSystem.Error>
     readonly system: () => Effect.Effect<string[], AppFileSystem.Error>
     readonly find: (dir: string) => Effect.Effect<string | undefined, AppFileSystem.Error>
@@ -78,6 +81,7 @@ export namespace Instruction {
             Effect.succeed({
               // Track which instruction files have already been attached for a given assistant message.
               claims: new Map<MessageID, Set<string>>(),
+              injected: new Map<string, Set<string>>(),
             }),
           ),
         )
@@ -116,6 +120,34 @@ export namespace Instruction {
         const clear = Effect.fn("Instruction.clear")(function* (messageID: MessageID) {
           const s = yield* InstanceState.get(state)
           s.claims.delete(messageID)
+        })
+
+        const listInjected = Effect.fn("Instruction.listInjected")(function* (sessionID: string) {
+          const s = yield* InstanceState.get(state)
+          return Array.from(s.injected.get(sessionID) ?? [])
+        })
+
+        const inject = Effect.fn("Instruction.inject")(function* (sessionID: string, value: string) {
+          const trimmed = value.trim()
+          if (!trimmed) return yield* listInjected(sessionID)
+          const s = yield* InstanceState.get(state)
+          const next = s.injected.get(sessionID) ?? new Set<string>()
+          next.add(trimmed)
+          s.injected.set(sessionID, next)
+          return Array.from(next)
+        })
+
+        const eject = Effect.fn("Instruction.eject")(function* (sessionID: string, value: string) {
+          const trimmed = value.trim()
+          const s = yield* InstanceState.get(state)
+          const next = s.injected.get(sessionID)
+          if (!next) return []
+          next.delete(trimmed)
+          if (next.size === 0) {
+            s.injected.delete(sessionID)
+            return []
+          }
+          return Array.from(next)
         })
 
         const systemPaths = Effect.fn("Instruction.systemPaths")(function* () {
@@ -227,7 +259,7 @@ export namespace Instruction {
           return results
         })
 
-        return Service.of({ clear, systemPaths, system, find, resolve })
+        return Service.of({ clear, listInjected, inject, eject, systemPaths, system, find, resolve })
       }),
     )
 
