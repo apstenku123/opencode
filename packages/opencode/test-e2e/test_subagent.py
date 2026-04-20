@@ -280,7 +280,7 @@ def test_task_tool_sgr_sync_invocation_plan(
             "JSON object matching the schema."
         ),
         pydantic_model=TaskInvocationPlan,
-        poll_timeout_s=400.0,
+        poll_timeout_s=180.0,
     )
     assert isinstance(instance, TaskInvocationPlan)
     assert instance.subagent_type.strip(), instance.subagent_type
@@ -313,7 +313,7 @@ def test_task_tool_sgr_async_invocation_plan(
             "the plan as a JSON object matching the schema."
         ),
         pydantic_model=TaskInvocationPlan,
-        poll_timeout_s=400.0,
+        poll_timeout_s=180.0,
     )
     assert isinstance(instance, TaskInvocationPlan)
     assert instance.subagent_type.strip()
@@ -351,7 +351,7 @@ def test_task_list_sgr_produces_well_formed_request(
             "Keep the reason under 20 words."
         ),
         pydantic_model=TaskListRequest,
-        poll_timeout_s=400.0,
+        poll_timeout_s=180.0,
     )
     assert isinstance(instance, TaskListRequest)
     assert instance.reason.strip(), instance.reason
@@ -535,7 +535,7 @@ def _spawn_child_via_sgr(
     prompt: str,
     async_: bool,
     thread_id: Optional[str] = None,
-    poll_timeout_s: float = 400.0,
+    poll_timeout_s: float = 180.0,
 ) -> tuple[str, TaskInvocationPlan, str]:
     """Drive one SGR auto-dispatched `task` spawn. Return (child_id, plan, thread_id).
 
@@ -827,17 +827,20 @@ def test_task_close_cancels_child_sgr(
 
     # Fresh thread for the close dispatch to avoid task-schema context
     # leakage (the model would otherwise reuse the task plan it already
-    # produced on the spawn turn). Retry up to 3x — this turn occasionally
-    # hits Copilot's retry-race exhaustion after ~150s when upstream is
-    # throttled; with free-tier tokens a fresh attempt lands in <30s.
+    # produced on the spawn turn). Retries multiplied by poll_timeout have
+    # to fit inside the pytest @mark.timeout(600); 2 attempts × 180s =
+    # 360s leaves ~4 min of headroom for the earlier `_spawn_child_via_sgr`
+    # call above. Server-side retry-race already gives us 3× parallel
+    # attempts at the HTTP layer, so the per-test retry budget only needs
+    # to cover session-state flakes, not upstream model stalls.
     _run_sgr_with_retry(
-        attempts=3,
+        attempts=2,
         client=subagent_sgr_client,
         model=subagent_sgr_model,
         prompt=f"Plan a task_close call: session_id='{child_id}'.",
         pydantic_model=_ClosePlan,
         schema_overrides=close_schema,
-        poll_timeout_s=400.0,
+        poll_timeout_s=180.0,
     )
     child = subagent_sgr_client.get_session(child_id)
     assert child["id"] == child_id
@@ -869,7 +872,7 @@ def test_depth_limit_rejects_over_3_sgr(
         ),
         pydantic_model=TaskInvocationPlan,
         schema_overrides=_task_dispatch_schema(async_=True),
-        poll_timeout_s=400.0,
+        poll_timeout_s=180.0,
     )
     assert plan.async_ is True
     assert plan.subagent_type == "general"
@@ -899,7 +902,7 @@ def test_max_concurrent_limit_sgr(
         ),
         pydantic_model=TaskInvocationPlan,
         schema_overrides=_task_dispatch_schema(async_=True),
-        poll_timeout_s=400.0,
+        poll_timeout_s=180.0,
     )
     assert plan.async_ is True
 
@@ -1040,7 +1043,7 @@ def test_guardian_forwards_when_no_rule_sgr(
         pydantic_model=TaskInvocationPlan,
         schema_overrides=schema,
         thread_id=parent_id,
-        poll_timeout_s=400.0,
+        poll_timeout_s=180.0,
     )
     assert plan.subagent_type == "general"
     children = subagent_sgr_client.get_session_children(parent_id)
