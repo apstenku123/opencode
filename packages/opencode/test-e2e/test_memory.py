@@ -400,11 +400,12 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
         )
 
         # Retrieve + verify every required field is non-empty. Retries up
-        # to 5× with 2s backoff because the embedding index on disk can
-        # lag a few seconds behind the extraction fiber's sqlite write.
+        # to 12× with 5s backoff — the embedding fiber can lag 30-50s
+        # behind the extraction fiber's sqlite write on a cold path, and
+        # with free-tier tokens it's cheap to wait.
         body: dict[str, Any] = {}
         last_stderr = ""
-        for attempt in range(5):
+        for attempt in range(12):
             rc, stdout, last_stderr = _run_memory_cli(
                 root,
                 "retrieve",
@@ -421,9 +422,9 @@ def test_phase1_extracts_sextuples(copilot_model: dict[str, str]) -> None:
             body = _parse_json_tail(stdout)
             if body.get("hits"):
                 break
-            time.sleep(2.0)
+            time.sleep(5.0)
         assert body.get("hits"), (
-            f"no hits returned after 5× retries: {body}\n"
+            f"no hits returned after 12× retries (~60s of backoff): {body}\n"
             f"stderr tail:\n{last_stderr[-2000:]}"
         )
         top = body["hits"][0]

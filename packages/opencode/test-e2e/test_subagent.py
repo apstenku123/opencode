@@ -270,7 +270,7 @@ def test_task_tool_sgr_sync_invocation_plan(
         4. ``prompt`` is non-empty stripped.
     """
     instance, _msg, _thread_id = _run_sgr_with_retry(
-        attempts=3,
+        attempts=2,
         client=subagent_sgr_client,
         model=subagent_sgr_model,
         prompt=(
@@ -303,7 +303,7 @@ def test_task_tool_sgr_async_invocation_plan(
     validator would have already raised.
     """
     instance, _msg, _thread_id = _run_sgr_with_retry(
-        attempts=3,
+        attempts=2,
         client=subagent_sgr_client,
         model=subagent_sgr_model,
         prompt=(
@@ -342,7 +342,7 @@ def test_task_list_sgr_produces_well_formed_request(
     import json as _json
 
     instance, _msg, _thread_id = _run_sgr_with_retry(
-        attempts=3,
+        attempts=2,
         client=subagent_sgr_client,
         model=subagent_sgr_model,
         prompt=(
@@ -862,7 +862,7 @@ def test_depth_limit_rejects_over_3_sgr(
     regression if the plumbing breaks.
     """
     plan, _msg, _tid = _run_sgr_with_retry(
-        attempts=3,
+        attempts=2,
         client=subagent_sgr_client,
         model=subagent_sgr_model,
         prompt=(
@@ -892,7 +892,7 @@ def test_max_concurrent_limit_sgr(
     ``src/subagent/registry.test.ts``.
     """
     plan, _msg, _tid = _run_sgr_with_retry(
-        attempts=3,
+        attempts=2,
         client=subagent_sgr_client,
         model=subagent_sgr_model,
         prompt=(
